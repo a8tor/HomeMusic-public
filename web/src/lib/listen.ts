@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { api, errorMessage, isAbort, listenStreamUrl } from '../api/client';
+import { ApiError, api, errorMessage, isAbort, listenStreamUrl } from '../api/client';
 import type { LaunchOrigin, ListenOut } from '../api/types';
 import { startDownload } from './actions';
 import { hubEvents } from './events';
@@ -119,6 +119,9 @@ const subscribers = new Set<() => void>();
 
 function set(patch: Partial<ListenState>) {
   const shown = !!state.track;
+  if ((patch.queue !== undefined && patch.queue !== state.queue) || (patch.index !== undefined && patch.index !== state.index)) {
+    manualQueueRevision++;
+  }
   state = { ...state, ...patch };
   // Time updates are frequent; queue edits and controls must survive an immediate reload.
   persistListening(Object.keys(patch).some((key) => key !== 'position' && key !== 'duration'));
@@ -150,6 +153,10 @@ export const listenAudio = (): HTMLAudioElement | null => audio;
 let pendingSeek = 0;
 let resolving: AbortController | null = null;
 let prefetching: { ref: string; ctl: AbortController } | null = null;
+let streamRetry: { ref: string; count: number } = { ref: '', count: 0 };
+let manualQueueRevision = 0;
+const RESOLVE_RETRY_MS = [400, 1200] as const;
+const STREAM_RETRIES = 2;
 /** Seconds into a track after which ⏮ restarts it instead of going to the previous one. */
 const RESTART_AFTER_S = 3;
 /** Left after this share of a track: it counts as played to the end (`finish`), earlier — `skip`. */
@@ -341,7 +348,19 @@ function el(): HTMLAudioElement {
     else set({ phase: 'ended' });
   });
   a.addEventListener('error', () => {
-    if (a.getAttribute('src')) { reportEnd(false, true); set({ phase: 'error', error: state.error ?? 'Не удалось воспроизвести' }); }
+    const track = state.track;
+    if (!a.getAttribute('src') || !track) return;
+    const code = a.error?.code;
+    if (code === 2 && streamRetry.ref === track.ref && streamRetry.count < STREAM_RETRIES) {
+      streamRetry.count++;
+      set({ phase: 'loading', error: null });
+      a.src = listenStreamUrl(track.ref, streamRetry.count);
+      play(a);
+      return;
+    }
+    reportEnd(false, true);
+    const message = code === 3 ? 'Ошибка декодирования аудио' : code === 4 ? 'Формат аудио не поддерживается' : 'Поток прервался. Нажмите «Повторить»';
+    set({ phase: 'error', error: message });
   });
   // the app's player started: one player on screen, so this one closes (the app shows its own again)
   window.addEventListener(NATIVE_PLAYING_EVENT, stopListening);
@@ -363,6 +382,7 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   reportEnd();
   // a recommendation of the smart shuffle reports under its session, the playlist's own songs under their list
   played = { ref: track.ref, context: track.rec ? `smart:${track.rec.session}` : listContext, launch: listLaunch, started: false, playbackId: newEventId(), listenedMs: 0, anchor: null, account: listeningAccount() };
+  streamRetry = { ref: track.ref, count: 0 };
   resolving?.abort();
   const ctl = new AbortController();
   resolving = ctl;
@@ -375,7 +395,7 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   // the prefetch of this very track (it was next) is the request to wait for: don't abort it
   if (prefetching?.ref !== track.ref) prefetching?.ctl.abort();
   prefetching = null;
-  api.listen(track.ref, ctl.signal).then(
+  resolveListen(track.ref, ctl.signal).then(
     (info) => {
       if (resolving !== ctl) return;
       set({ info, duration: info.kind === 'preview' ? (info.duration_s ?? 30) : state.duration });
@@ -384,7 +404,7 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
     },
     (e: unknown) => {
       if (isAbort(e) || resolving !== ctl) return;
-      if (auto && hasNext(state)) return void start(state.queue, state.index + 1, true);
+      if (auto && e instanceof ApiError && e.status === 404 && hasNext(state)) return void start(state.queue, state.index + 1, true);
       set({ phase: 'error', error: errorMessage(e) });
       a.pause();
     },
@@ -393,12 +413,35 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
 
 /** The Hub opens the picked file only when the stream asks for it, and moves on to the next file if it doesn't
  * open: once sound plays, the source shown is asked for again (the Hub has it in memory). */
+async function resolveListen(ref: string, signal?: AbortSignal): Promise<ListenOut> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await api.listen(ref, signal);
+    } catch (e) {
+      const retryable = e instanceof ApiError && [0, 408, 429, 502, 503, 504].includes(e.status);
+      const delay = RESOLVE_RETRY_MS[attempt];
+      if (!retryable || delay === undefined || signal?.aborted) throw e;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', abort);
+          resolve();
+        }, delay);
+        const abort = () => {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        signal?.addEventListener('abort', abort, { once: true });
+      });
+    }
+  }
+}
+
 let refreshed: string | null = null;
 function refreshInfo() {
   const ref = state.track?.ref;
   if (!ref || refreshed === ref || state.info?.kind !== 'full') return;
   refreshed = ref;
-  api.listen(ref).then(
+  resolveListen(ref).then(
     (info) => state.track?.ref === ref && set({ info }),
     () => {},
   );
@@ -765,6 +808,10 @@ export function extendQueue(list: readonly ListenTrack[]) {
   if (!state.track || list.length <= q.length || q.some((t, i) => t.ref !== list[i].ref)) return;
   set({ queue: [...q, ...list.slice(q.length)] });
   if (state.phase !== 'error' && state.phase !== 'ended') prefetchNext();
+}
+
+export function getQueueRevision(): number {
+  return manualQueueRevision;
 }
 
 /** The tracks after the current one are replaced (the Hub picked «Моя волна» anew, `lib/wave.ts`). A queue that ran

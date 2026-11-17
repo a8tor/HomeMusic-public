@@ -185,6 +185,8 @@ class Settings(BaseSettings):
     email_daily_limit: int = 450
     email_code_minutes: int = 15
     log_level: str = "INFO"
+    provider_search_timeout_s: float = Field(default=15, ge=1, le=60)
+    light_encoders: int = Field(default=3, ge=1, le=8)
 
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_api_key: str = ""

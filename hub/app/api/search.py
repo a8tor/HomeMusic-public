@@ -169,13 +169,23 @@ async def search_providers(q: str = Query(min_length=1), provider: str | None = 
     ]
     out = ProviderSearchOut()
 
+    timeout_s = get_settings().provider_search_timeout_s
+
     async def one(name: str):
         p = svc.providers.get(name)
         if p is None:
             return []
         try:
-            raw = await p.search(TrackQuery(artist=tq.artist, title=tq.title or ""), limit=15)
+            raw = await asyncio.wait_for(
+                p.search(TrackQuery(artist=tq.artist, title=tq.title or ""), limit=15),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            log.info("provider search timed out: %s after %.1fs", name, timeout_s)
+            out.errors.append(f"{name}: таймаут поиска")
+            return []
         except Exception as e:
+            log.warning("provider search failed: %s: %r", name, e)
             out.errors.append(f"{name}: {e}")
             return []
         if title:

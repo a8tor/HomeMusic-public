@@ -89,6 +89,8 @@ services:
       YTDLP_POT_BASE_URL: http://youtube-pot:4416
       YTDLP_CACHE_DIR: /data/yt-dlp-cache
       EMBEDDER_URL: ${EMBEDDER_URL:-http://embedder:8090}
+      PROVIDER_SEARCH_TIMEOUT_S: ${PROVIDER_SEARCH_TIMEOUT_S:-15}
+      LIGHT_ENCODERS: ${LIGHT_ENCODERS:-3}
     volumes:
       - hub-data:/data
       - ${MUSIC_ROOT}:/music

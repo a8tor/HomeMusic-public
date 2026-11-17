@@ -410,7 +410,7 @@ export const api = {
 export const libraryCoverUrl = (albumId: number, size = 300, bust?: string | number) =>
   withQuery(`/api/library/albums/${albumId}/cover`, { size, v: bust });
 
-/** Audio of a catalog track for `<audio src>`; the Hub picks the file on the first request if needed. */
-export const listenStreamUrl = (ref: string) => withQuery('/api/listen/stream', { ref });
+/** Audio of a catalog track for `<audio src>`; retry adds a cache-busting query parameter. */
+export const listenStreamUrl = (ref: string, retry = 0) => withQuery('/api/listen/stream', { ref, retry: retry || undefined });
 
 export const uploadCoverUrl = (uploadId: number) => `/api/uploads/${uploadId}/cover`;

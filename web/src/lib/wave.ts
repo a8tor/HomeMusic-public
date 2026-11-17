@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { ApiError, api, errorMessage } from '../api/client';
 import type { PlayEventIn, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
 import { EMBEDDED } from './embedded';
-import { getListenState, listenAll, replaceUpcoming, type ListenTrack } from './listen';
+import { getListenState, getQueueRevision, listenAll, replaceUpcoming, type ListenTrack } from './listen';
 import { canPlayAll, canPlayWave, playWave } from './player';
 import { onPlayEvent } from './plays';
 import { toastError } from './ui';
@@ -183,10 +183,15 @@ async function ask() {
   s.inFlight = played;
   persistWave();
   const st = getListenState();
+  const queueRevision = getQueueRevision();
   const queued = st.queue.slice(st.index + 1).map((t) => t.ref);
   try {
     const w = await api.waveNext(s.id, { played, queued });
     if (session !== s || getListenState().context !== s.context) return;
+    if (getQueueRevision() !== queueRevision) {
+      s.pending.unshift(...played);
+      return;
+    }
     remember(s, w);
     if (w.tracks.length) replaceUpcoming(w.tracks.map(listenTrack));
     else if (w.pending) setTimeout(() => void ask(), RETRY_MS);
