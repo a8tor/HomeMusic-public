@@ -324,9 +324,24 @@ async def delete_item(item_id: int, user: User = Depends(current_user), s: Async
 
 @router.post("/clear")
 async def clear(user: User = Depends(current_user), s: AsyncSession = Depends(get_session, scope="function")):
-    res = await s.execute(
-        delete(DownloadItem).where(DownloadItem.user_id == user.id, DownloadItem.status.in_(("done", "cancelled")))
-        # Keep the anchors needed to put a reviewed song back in order. They can be cleared after it is resolved.
-        .where(~DownloadItem.id.in_(select(PendingPlaylistAdd.download_item_id)))
+    statuses = ("done", "cancelled", "failed", "needs_review")
+    removable = select(DownloadItem.id).where(
+        DownloadItem.user_id == user.id,
+        DownloadItem.status.in_(statuses),
+        # Keep anchors for unresolved playlist entries to preserve requested insertion order.
+        ~DownloadItem.id.in_(select(PendingPlaylistAdd.download_item_id)),
+        # A terminal item can still have a worker finishing its final transaction.
+        ~DownloadItem.id.in_(select(func.json_extract(Job.payload_json, "$.item_id")).where(
+            Job.kind == "download_item", Job.status == "running",
+        )),
     )
-    return {"removed": res.rowcount or 0}
+    ids = list((await s.execute(removable)).scalars())
+    if ids:
+        await s.execute(delete(Job).where(
+            Job.kind == "download_item", func.json_extract(Job.payload_json, "$.item_id").in_(ids),
+            Job.status != "running",
+        ))
+        await s.execute(delete(DownloadItem).where(DownloadItem.id.in_(ids)))
+        for item_id in ids:
+            bus.publish(user.id, "download_deleted", {"id": item_id})
+    return {"removed": len(ids), "removed_ids": ids}

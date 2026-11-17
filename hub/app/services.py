@@ -71,6 +71,9 @@ class Services:
 
         sources = get_settings().cfg.sources
         names = sources.ru if is_russian_query(q) else sources.default
+        hitmos_fm = self.providers.get("hitmos_fm")
+        if hitmos_fm is not None and getattr(hitmos_fm, "temporarily_blocked", False):
+            names = [name for name in names if name != "hitmos_fm"]
         if for_download:
             names = [*names, *sources.download_fallback]
         return [self.providers[n] for n in dict.fromkeys(names) if n in self.providers]

@@ -464,6 +464,7 @@ export interface RetryIn {
 
 export interface ClearOut {
   removed: number;
+  removed_ids: number[];
 }
 
 // --- uploads ----------------------------------------------------------------------------------

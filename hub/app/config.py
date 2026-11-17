@@ -14,8 +14,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class SourcesCfg(BaseModel):
     # Russian tracks: official YouTube Music copies are often edited since the 2026 law, so they come last,
-    # after SoundCloud and re-uploads by small channels
-    ru: list[str] = ["hitmoz", "hitmos_fm", "soundcloud", "yt_reupload", "ytdlp"]
+    # after SoundCloud and re-uploads by small channels. hitmos_fm is omitted by default because it can block VPS IPs.
+    ru: list[str] = ["hitmoz", "soundcloud", "yt_reupload", "ytdlp"]
     # hitmoz first: a YouTube file opens only after the ad before the video (`ytdlp.MAX_AD_WAIT_S`)
     default: list[str] = ["hitmoz", "ytdlp"]
     # Tried only by downloads, after regular sources fail; never part of page prefetch.

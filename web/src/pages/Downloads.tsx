@@ -47,6 +47,7 @@ export function DownloadsPage() {
       active: items.filter((x) => DOWNLOAD_ACTIVE.includes(x.status)).length,
       problems: items.filter((x) => x.status === 'failed' || x.status === 'needs_review').length,
       finished: items.filter((x) => x.status === 'done' || x.status === 'cancelled').length,
+      clearable: items.filter((x) => ['done', 'cancelled', 'failed', 'needs_review'].includes(x.status)).length,
     }),
     [items],
   );
@@ -60,7 +61,8 @@ export function DownloadsPage() {
     setClearing(false);
     if (r) {
       toast(r.removed ? `Убрано из списка: ${r.removed}` : 'Нечего очищать', 'success');
-      res.setData((prev) => prev?.filter((x) => x.status !== 'done' && x.status !== 'cancelled'));
+      const removed = new Set(r.removed_ids);
+      res.setData((prev) => prev?.filter((x) => !removed.has(x.id)));
     }
   };
 
@@ -90,8 +92,8 @@ export function DownloadsPage() {
           </span>
         }
         right={
-          <Button small variant="ghost" busy={clearing} disabled={!counts.finished} onClick={clear}>
-            Очистить готовые
+          <Button small variant="ghost" busy={clearing} disabled={!counts.clearable} onClick={clear}>
+            Очистить готовые и проблемные
           </Button>
         }
       />

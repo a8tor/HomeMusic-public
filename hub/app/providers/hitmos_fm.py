@@ -31,6 +31,7 @@ from app.providers.hitmoz import HEALTH_TTL_S, ProgressCb, abs_url, download_aud
 log = logging.getLogger(__name__)
 
 MAX_PARALLEL_DOWNLOADS = 2
+DOMAIN_FORBIDDEN_TTL_S = 60 * 60
 _PUSH_RE = re.compile(r"self\.__next_f\.push\(")
 _SONG_RE = re.compile(r"/song/(\d+)")
 _ARTIST_RE = re.compile(r"/artist/(\d+)")
@@ -158,23 +159,28 @@ class HitmosFmProvider:
         self.base_delay = 1.5
         self.health_ttl_s = HEALTH_TTL_S
         self._base_url: str | None = None
+        self._forbidden_until = 0.0
         self._checked_at = 0.0
         self._health: dict = {"provider": self.name, "domain": None, "ok": False, "latency_ms": None}
         self._base_lock = asyncio.Lock()
 
     async def _check_domains(self) -> str:
         errors: list[str] = []
+        forbidden = bool(self.cfg.domains)
         for domain in self.cfg.domains:
             url = domain if "://" in domain else f"https://{domain}/"
             t0 = time.monotonic()
             try:
                 resp = await request_with_backoff(self.client, "GET", url, limiter=self.limiter, retries=0)
             except httpx.HTTPError as e:
+                forbidden = False
                 errors.append(f"{domain}: {e!r}")
                 continue
             if resp.status_code != 200:
+                forbidden &= resp.status_code == 403
                 errors.append(f"{domain}: HTTP {resp.status_code}")
                 continue
+            self._forbidden_until = 0.0
             base = _origin(str(resp.url))
             self._health = {
                 "provider": self.name,
@@ -187,6 +193,7 @@ class HitmosFmProvider:
                 "error": None,
             }
             return base
+        self._forbidden_until = time.monotonic() + DOMAIN_FORBIDDEN_TTL_S if forbidden else 0.0
         self._health = {
             "provider": self.name,
             "domain": None,
@@ -198,8 +205,16 @@ class HitmosFmProvider:
         }
         raise ProviderUnavailable(f"hitmos.fm: ни один домен не отвечает ({'; '.join(errors)})")
 
+    @property
+    def temporarily_blocked(self) -> bool:
+        return time.monotonic() < self._forbidden_until
+
     async def base_url(self, force: bool = False) -> str:
         async with self._base_lock:
+            if not force and time.monotonic() < self._forbidden_until:
+                raise ProviderUnavailable(
+                    f"hitmos.fm: домен временно закеширован после HTTP 403 ({self._health['error']})"
+                )
             if self._base_url and not force and time.monotonic() - self._checked_at < self.health_ttl_s:
                 return self._base_url
             self._base_url = None

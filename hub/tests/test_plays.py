@@ -668,6 +668,30 @@ async def test_failed_download_can_be_deleted_but_active_download_cannot(env):
     assert (await c.get(f"/api/downloads/{active_id}")).status_code == 200
 
 
+async def test_clear_downloads_removes_finished_and_failed_but_keeps_active(env):
+    from app.db import session_scope
+    from app.models import DownloadBatch, DownloadItem, User
+
+    async with session_scope() as s:
+        user = (await s.execute(select(User).where(User.nd_username == "admin"))).scalar_one()
+        batch = DownloadBatch(user_id=user.id, origin="catalog")
+        s.add(batch)
+        await s.flush()
+        statuses = ["done", "cancelled", "failed", "needs_review", "queued"]
+        rows = [DownloadItem(user_id=user.id, batch_id=batch.id, status=status,
+                             query_json={"query": {"artist": "Artist", "title": status}}) for status in statuses]
+        s.add_all(rows)
+        await s.flush()
+        ids = [row.id for row in rows]
+
+    response = await env["client"].post("/api/downloads/clear")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["removed"] == 4 and set(body["removed_ids"]) == set(ids[:4])
+    listed = await env["client"].get("/api/downloads")
+    assert [row["id"] for row in listed.json()] == [ids[4]]
+
+
 async def test_launch_fields_are_stored_and_never_change_the_taste(env):
     from sqlalchemy import update
 

@@ -99,6 +99,36 @@ async def test_fetch_rejects_non_audio(provider, tmp_path):
 
 
 @respx.mock
+async def test_all_403_domains_are_cached_without_reprobing(provider):
+    root = respx.get(f"{BASE}/").mock(return_value=httpx.Response(403))
+    with pytest.raises(ProviderUnavailable, match="HTTP 403"):
+        await provider.search(TrackQuery(artist="Кино", title="Группа крови"))
+    assert root.call_count == 1
+    with pytest.raises(ProviderUnavailable, match="закеширован после HTTP 403"):
+        await provider.search(TrackQuery(artist="Кино", title="Группа крови"))
+    assert root.call_count == 1
+
+
+async def test_provider_order_skips_hitmos_fm_while_it_is_403_blocked(monkeypatch):
+    from types import SimpleNamespace
+
+    import app.services as services_module
+    from app.config import SourcesCfg
+    from app.services import Services
+
+    monkeypatch.setattr(services_module, "get_settings", lambda: SimpleNamespace(
+        cfg=SimpleNamespace(sources=SourcesCfg(ru=["hitmoz", "hitmos_fm", "ytdlp"],
+                                              default=["hitmoz"], download_fallback=[]))))
+    svc = Services()
+    svc.providers = {
+        "hitmoz": SimpleNamespace(name="hitmoz"),
+        "hitmos_fm": SimpleNamespace(name="hitmos_fm", temporarily_blocked=True),
+        "ytdlp": SimpleNamespace(name="ytdlp"),
+    }
+    assert [p.name for p in svc.provider_order(TrackQuery(artist="Кино", title="Песня"))] == ["hitmoz", "ytdlp"]
+
+
+@respx.mock
 async def test_unavailable(provider):
     respx.get(f"{BASE}/").mock(side_effect=httpx.ConnectError("down"))
     with pytest.raises(ProviderUnavailable):

@@ -740,7 +740,7 @@ async def _resolve_deezer(ref: str, id_: str, probe: bool, *, full_only: bool = 
 
 META_TIMEOUT_S = 1.5
 NAME_TIMEOUT_S = 3.0
-SEARCH_TIMEOUT_S = 6.0
+SEARCH_TIMEOUT_S = 15.0
 FALLBACK_TIMEOUT_S = 8.0
 # A YouTube file takes ~8 s to extract, then its URL may wait for an ad before the video (`ytdlp.MAX_AD_WAIT_S`)
 OPEN_TIMEOUT_S = 25.0
