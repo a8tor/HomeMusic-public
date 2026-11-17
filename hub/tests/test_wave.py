@@ -118,6 +118,37 @@ def test_disliked_since_it_came_in_is_not_picked() -> None:
     assert [c.track.ref for c in wave.pick(st, p, "discover", {}, n=3)] == ["dz:3"]
 
 
+def test_same_song_with_different_refs_is_only_picked_once() -> None:
+    catalog = cand(1, score=10)
+    library = build.Cand(
+        track=CatalogTrack(ref="nd:song-1", source="nd", id="song-1", title=catalog.track.title,
+                           artist=catalog.track.artist, artists=catalog.track.artists),
+        gens={"favorites": 0}, score=9,
+    )
+    st = state(catalog, library, cand(2, score=1))
+
+    got = wave.pick(st, profile(), "discover", {}, n=5)
+
+    same_song = [c for c in got if wave.fp_of(c) == wave.fp_of(catalog)]
+    assert len(same_song) == 1
+    assert len({wave.fp_of(c) for c in got}) == len(got)
+
+
+def test_queued_song_alternative_ref_is_not_picked_again() -> None:
+    queued = cand(1, score=10)
+    alternate = build.Cand(
+        track=CatalogTrack(ref="nd:song-1", source="nd", id="song-1", title=queued.track.title,
+                           artist=queued.track.artist, artists=queued.track.artists),
+        gens={"favorites": 0}, score=9,
+    )
+    st = wave.State()
+    st.out[queued.track.ref] = queued
+    st.pool[alternate.track.ref] = alternate
+
+    got = wave.pick(st, profile(), "discover", {}, n=5, queued={queued.track.ref})
+    assert got == []
+
+
 def test_a_queued_track_is_not_swapped_for_a_hair_better_one() -> None:
     st = state(cand(1, score=1.0), cand(2, score=1.1))
 

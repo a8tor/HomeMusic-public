@@ -555,10 +555,22 @@ function startList(track: ListenTrack, queue?: readonly ListenTrack[], context?:
   }
 }
 
-/** Replace the current list without restarting audio when its current track is the new list's first track. */
+/** The library's `nd:<id>` and the catalog's `dz:…` may represent the same song. */
+function sameSong(a: ListenTrack, b: ListenTrack): boolean {
+  if (a.ref === b.ref) return true;
+  const ids = (t: ListenTrack) => [t.nd_song_id, t.ref.startsWith('nd:') ? t.ref.slice(3) : null].filter(Boolean);
+  const bIds = new Set(ids(b));
+  return ids(a).some((id) => bIds.has(id));
+}
+
+/** Keep the playing song and its position when the new wave contains it. Make it first so picks play after it. */
 export function continueCurrentInList(list: readonly ListenTrack[], context: string, beforeStart: () => void): boolean {
   const current = state.track;
-  if (!current || current.ref !== list[0]?.ref || state.phase === 'error') return false;
+  if (!current || state.phase === 'error') return false;
+  const identity = { ...current, nd_song_id: current.nd_song_id ?? state.info?.nd_song_id ?? null };
+  const at = list.findIndex((t) => sameSong(identity, t));
+  if (at < 0) return false;
+  const queue = [list[at], ...list.filter((_, i) => i !== at)];
 
   reportEnd();
   listContext = context;
@@ -568,8 +580,7 @@ export function continueCurrentInList(list: readonly ListenTrack[], context: str
   played = { ref: current.ref, context, launch: listLaunch, started: false, playbackId: newEventId(),
     listenedMs: 0, anchor: null, account: listeningAccount() };
   beforeStart();
-  set({ queue: list, index: 0, context, smart: false, track: list[0] });
-  mediaSession(list[0]);
+  set({ queue, index: 0, context, smart: false, track: current });
   reportStart();
   prefetchNext();
   return true;
