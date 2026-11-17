@@ -300,6 +300,28 @@ async def cancel(item_id: int, user: User = Depends(current_user), s: AsyncSessi
     return out
 
 
+@router.delete("/items/{item_id}")
+async def delete_item(item_id: int, user: User = Depends(current_user), s: AsyncSession = Depends(get_session, scope="function")):
+    item = await _own_item(s, user, item_id)
+    if item.status not in ("failed", "needs_review", "cancelled"):
+        raise HTTPException(409, "Удалить можно только неудачную или отменённую загрузку")
+
+    job_id = (await s.execute(select(Job.id).where(
+        Job.kind == "download_item", func.json_extract(Job.payload_json, "$.item_id") == item.id,
+        Job.status == "running",
+    ).limit(1))).scalar_one_or_none()
+    if job_id is not None:
+        raise HTTPException(409, "Обработка загрузки ещё не завершилась")
+
+    await s.execute(delete(PendingPlaylistAdd).where(PendingPlaylistAdd.download_item_id == item.id))
+    await s.execute(delete(Job).where(
+        Job.kind == "download_item", func.json_extract(Job.payload_json, "$.item_id") == item.id,
+    ))
+    await s.delete(item)
+    bus.publish(user.id, "download_deleted", {"id": item_id})
+    return {"ok": True}
+
+
 @router.post("/clear")
 async def clear(user: User = Depends(current_user), s: AsyncSession = Depends(get_session, scope="function")):
     res = await s.execute(

@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { ApiError, api, errorMessage } from '../api/client';
 import type { PlayEventIn, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
 import { EMBEDDED } from './embedded';
-import { getListenState, getQueueRevision, listenAll, replaceUpcoming, type ListenTrack } from './listen';
+import { continueCurrentInList, getListenState, getQueueRevision, listenAll, replaceUpcoming, type ListenTrack } from './listen';
 import { canPlayAll, canPlayWave, playWave } from './player';
 import { onPlayEvent } from './plays';
 import { toastError } from './ui';
@@ -157,9 +157,16 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
     const s: Session = { id: w.session_id, title: w.title, context: `wave:${w.session_id}`, refs: new Set(), songs: new Set(), pending: [], inFlight: [], busy: false, again: false };
     remember(s, w);
     const tracks = w.tracks.map(listenTrack);
-    // A wave is a new list even when its seed is already playing; listen() would only toggle pause.
-    listenAll(tracks, { shuffle: false, context: s.context });
-    session = s;
+    // Keep the current playback position when the playing song is the wave seed.
+    const continued = continueCurrentInList(tracks, s.context, () => {
+      end();
+      session = s;
+    });
+    if (!continued) {
+      end();
+      listenAll(tracks, { shuffle: false, context: s.context });
+      session = s;
+    }
     return true;
   } catch (e) {
     toastError(errorMessage(e));

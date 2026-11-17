@@ -8,7 +8,7 @@ import { DOWNLOAD_ACTIVE, fmtWhen, providerLabel, warningText } from '../lib/for
 import { useAsync, useInterval } from '../lib/hooks';
 import { canPlay, playList } from '../lib/player';
 import { Link } from '../lib/router';
-import { attempt, toast } from '../lib/ui';
+import { attempt, confirmDialog, toast } from '../lib/ui';
 
 type Filter = 'all' | 'active' | 'problems';
 
@@ -29,6 +29,9 @@ export function DownloadsPage() {
       next[i] = { ...prev[i], ...d, candidates: prev[i].candidates };
       return next;
     });
+  });
+  useHubEvent('download_deleted', (d) => {
+    res.setData((prev) => prev?.filter((x) => x.id !== d.id));
   });
   useHubEvent('reconnect', () => res.reload(true));
 
@@ -66,6 +69,14 @@ export function DownloadsPage() {
     const r = await attempt(() => (kind === 'retry' ? api.retry(item.id) : api.cancel(item.id)));
     setBusyId(null);
     if (r) res.setData((prev) => prev?.map((x) => (x.id === r.id ? { ...x, ...r } : x)));
+  };
+
+  const remove = async (item: DownloadItemOut) => {
+    if (!await confirmDialog({ title: 'Удалить неудачную загрузку?', body: `${item.artist} — ${item.title}`, okLabel: 'Удалить', danger: true })) return;
+    setBusyId(item.id);
+    const result = await attempt(() => api.deleteDownload(item.id));
+    setBusyId(null);
+    if (result?.ok) res.setData((prev) => prev?.filter((x) => x.id !== item.id));
   };
 
   return (
@@ -130,6 +141,7 @@ export function DownloadsPage() {
               busy={busyId === item.id}
               onRetry={() => act(item, 'retry')}
               onCancel={() => act(item, 'cancel')}
+              onDelete={item.status === 'failed' || item.status === 'needs_review' || item.status === 'cancelled' ? () => remove(item) : undefined}
               onPlay={canPlay() && item.status === 'done' && item.nd_song_id ? () => playList(shown.filter((x) => x.status === 'done'), (x) => x.nd_song_id, item) : undefined}
             />
           ))}
@@ -144,12 +156,14 @@ function DownloadRow({
   busy,
   onRetry,
   onCancel,
+  onDelete,
   onPlay,
 }: {
   item: DownloadItemOut;
   busy: boolean;
   onRetry: () => void;
   onCancel: () => void;
+  onDelete?: () => void;
   /** Done and scanned by Navidrome: plays it (and the finished ones around it) in the app's player. */
   onPlay?: () => void;
 }) {
@@ -187,7 +201,10 @@ function DownloadRow({
         {active ? (
           <IconButton icon="x" label="Отменить" busy={busy} onClick={onCancel} className="text-muted" />
         ) : problem || item.status === 'cancelled' ? (
-          <IconButton icon="refresh" label="Повторить" busy={busy} onClick={onRetry} className="text-muted" />
+          <>
+            <IconButton icon="refresh" label="Повторить" busy={busy} onClick={onRetry} className="text-muted" />
+            {onDelete && <IconButton icon="trash" label="Удалить неудачную загрузку" busy={busy} onClick={onDelete} className="text-muted" />}
+          </>
         ) : onPlay ? (
           <IconButton icon="play" label={`Слушать «${item.title}»`} onClick={onPlay} className="!text-accent" />
         ) : item.status === 'done' ? (

@@ -643,6 +643,31 @@ async def test_late_accept_chain_has_separate_capability_and_preserves_original_
     assert subject["liked_since"].startswith("2026-10-26T12:00:00")
 
 
+async def test_failed_download_can_be_deleted_but_active_download_cannot(env):
+    from app.db import session_scope
+    from app.models import DownloadBatch, DownloadItem, User
+
+    async with session_scope() as s:
+        user = (await s.execute(select(User).where(User.nd_username == "admin"))).scalar_one()
+        batch = DownloadBatch(user_id=user.id, origin="catalog")
+        s.add(batch)
+        await s.flush()
+        failed = DownloadItem(user_id=user.id, batch_id=batch.id, status="needs_review",
+                              query_json={"query": {"artist": "Artist", "title": "Track"}})
+        active = DownloadItem(user_id=user.id, batch_id=batch.id, status="queued",
+                              query_json={"query": {"artist": "Artist", "title": "Active"}})
+        s.add_all([failed, active])
+        await s.flush()
+        failed_id, active_id = failed.id, active.id
+
+    c = env["client"]
+    assert (await c.delete(f"/api/downloads/items/{active_id}")).status_code == 409
+    removed = await c.delete(f"/api/downloads/items/{failed_id}")
+    assert removed.status_code == 200 and removed.json() == {"ok": True}
+    assert (await c.get(f"/api/downloads/{failed_id}")).status_code == 404
+    assert (await c.get(f"/api/downloads/{active_id}")).status_code == 200
+
+
 async def test_launch_fields_are_stored_and_never_change_the_taste(env):
     from sqlalchemy import update
 

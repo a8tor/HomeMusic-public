@@ -282,6 +282,7 @@ export const api = {
   retry: (id: number, body: RetryIn = {}) =>
     request<DownloadItemOut>('POST', `/api/downloads/items/${id}/retry`, { json: body }),
   cancel: (id: number) => request<DownloadItemOut>('POST', `/api/downloads/items/${id}/cancel`),
+  deleteDownload: (id: number) => request<{ ok: boolean }>('DELETE', `/api/downloads/items/${id}`),
   clearDownloads: () => request<ClearOut>('POST', '/api/downloads/clear'),
 
   // library

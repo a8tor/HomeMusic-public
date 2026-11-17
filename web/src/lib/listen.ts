@@ -555,6 +555,26 @@ function startList(track: ListenTrack, queue?: readonly ListenTrack[], context?:
   }
 }
 
+/** Replace the current list without restarting audio when its current track is the new list's first track. */
+export function continueCurrentInList(list: readonly ListenTrack[], context: string, beforeStart: () => void): boolean {
+  const current = state.track;
+  if (!current || current.ref !== list[0]?.ref || state.phase === 'error') return false;
+
+  reportEnd();
+  listContext = context;
+  listLaunch = newLaunch(context);
+  unshuffled = null;
+  smartHooks?.listStarted(context);
+  played = { ref: current.ref, context, launch: listLaunch, started: false, playbackId: newEventId(),
+    listenedMs: 0, anchor: null, account: listeningAccount() };
+  beforeStart();
+  set({ queue: list, index: 0, context, smart: false, track: list[0] });
+  mediaSession(list[0]);
+  reportStart();
+  prefetchNext();
+  return true;
+}
+
 /** «Слушать» of a whole list: from its first track (with shuffle on, a random one). `shuffle` sets the mode. */
 export function listenAll(list: readonly ListenTrack[], opts: { shuffle?: boolean; context?: string; origin?: LaunchOrigin } = {}) {
   if (!list.length) return;

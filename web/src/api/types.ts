@@ -871,6 +871,7 @@ export interface BatchEvent {
 
 export interface HubEventMap {
   download: DownloadItemOut;
+  download_deleted: { id: number };
   assistant: AssistantEvent;
   library: LibraryEvent;
   batch: BatchEvent;
