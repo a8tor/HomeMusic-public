@@ -62,6 +62,20 @@ API Хаба — [hub/API.md](hub/API.md).
    - **Хаб**: открыть `https://203.0.113.10:8445` в Chrome → меню → «Установить приложение». После этого Хаб есть
      в меню «Поделиться» Android: скриншот → ассистент, аудиофайл → загрузка в библиотеку.
 
+## Linux VPS без домашнего ПК
+
+Для автономного запуска на Ubuntu 24.04 без Windows-компьютера используйте production-стек [`docker-compose.prod.yml`](docker-compose.prod.yml), шаблон окружения [`.env.vps.example`](.env.vps.example), [`Caddyfile`](Caddyfile) и systemd unit [`homemusic.service`](homemusic.service).
+
+Быстрый интерактивный установщик для нового VPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/scripts/bootstrap-vps.sh -o /root/bootstrap-vps.sh
+chmod 700 /root/bootstrap-vps.sh
+/root/bootstrap-vps.sh
+```
+
+Перед запуском замените `OWNER/REPOSITORY` на fork, создайте DNS A-записи для двух имён на адрес VPS и ознакомьтесь с полной инструкцией: [`docs/DEPLOYMENT-LINUX.md`](docs/DEPLOYMENT-LINUX.md). Скрипт не меняет firewall, не перезаписывает существующий `.env` и не требует домашнего ПК. Для CPU-embedder рекомендуется минимум 8 ГБ RAM, 2 vCPU и 80 ГБ диска; на меньшем VPS можно оставить `EMBEDDER_URL` пустым и работать без звуковой похожести.
+
 ## Android-приложение HomeMusic (форк Tempus)
 
 Исходники — `android/` (отдельный git-репозиторий, ветка `homemusic`; в этот репозиторий не входит). Это Tempus с вкладкой

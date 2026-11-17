@@ -1,12 +1,12 @@
 # Install as /etc/caddy/Caddyfile on the VPS.
-# DNS A records must point music.a8tor.com and hub.a8tor.com to the VPS first.
+# Replace both example hostnames with DNS names pointing to this VPS.
 
-music.a8tor.com {
+music.example.com {
     encode zstd gzip
     reverse_proxy 127.0.0.1:4533
 }
 
-hub.a8tor.com {
+hub.example.com {
     encode zstd gzip
     reverse_proxy 127.0.0.1:8080 {
         flush_interval -1
