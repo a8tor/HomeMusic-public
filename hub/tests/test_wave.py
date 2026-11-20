@@ -33,7 +33,7 @@ def tr(n: int, artist: str | None = None) -> CatalogTrack:
 
 
 def cand(n: int, artist: str | None = None, *, score: float = 1.0, familiar: bool = False) -> build.Cand:
-    return build.Cand(track=tr(n, artist), gens={"lastfm_similar": 0}, familiar=familiar, score=score)
+    return build.Cand(track=tr(n, artist), gens={"ytm_radio": 0}, familiar=familiar, score=score)
 
 
 def state(*cands: build.Cand, played: list[str] = ()) -> wave.State:
@@ -169,36 +169,16 @@ def test_the_pool_comes_from_the_seed_or_the_mix_generators() -> None:
     p = profile()
     seed = tr(1)
 
-    # a seed track: its similar tracks (Last.fm, Yandex), and Deezer's radio of its artist
-    assert set(wave.generators(p, seed, None, [])) == {"lastfm_similar", "yandex_similar", "deezer_radio"}
-    assert set(wave.generators(p, None, {"ref": "dz:1", "name": "Кино"}, [])) == {"deezer_radio", "favorites"}
+    assert set(wave.generators(p, seed, None, [])) == {"ytm_radio", "lastfm_similar", "yandex_similar", "deezer_radio"}
+    assert set(wave.generators(p, None, {"ref": "dz:1", "name": "Кино"}, [])) == {"deezer_radio", "favorites",
+                                                                                   "ytm_radio"}
     songs = [tr(5, "Кино")]
     assert set(wave.generators(p, None, {"ref": "dz:1", "name": "Кино", "songs": songs}, [])) == {
-        "deezer_radio", "favorites", "artist_songs"}
+        "deezer_radio", "favorites", "artist_songs", "ytm_radio"}
     assert set(wave.generators(p, None, {"ref": None, "name": "Кино", "songs": songs}, [])) == {
-        "artist_songs"}  # no Deezer artist: the library songs only
+        "artist_songs", "ytm_radio"}  # no Deezer artist: the library songs and their radios
     own = wave.generators(p, None, None, [])
-    assert own.keys() == build.generators(p, []).keys() - {"ytm_radio"}  # the user's own: as a mix, without YouTube
-    assert "yandex_wave" in own and "ytm_radio" not in own
-
-
-def test_the_wave_has_no_youtube_generator() -> None:
-    """YouTube Music is not a source of «Моя волна»: neither a seed's radios nor the refill asks it."""
-    from app.mixes.taste import TasteTrack
-
-    p = profile()
-    p.tracks["dz:0"] = TasteTrack(key="dz:0", ref="dz:0", artist="Арт 0", title="Песня 0", score=5, last_event=NOW)
-    songs = [tr(5, "Кино")]
-    variants = [
-        wave.generators(p, tr(1), None, []),
-        wave.generators(p, None, {"ref": "dz:1", "name": "Кино"}, []),
-        wave.generators(p, None, {"ref": "dz:1", "name": "Кино", "songs": songs}, []),
-        wave.generators(p, None, {"ref": None, "name": "Кино", "songs": songs}, []),
-        wave.generators(p, None, None, []),  # the user's own taste
-    ]
-
-    assert all("ytm_radio" not in g for g in variants)
-    assert set(wave.refill_generators(p, wave.State())) == {"lastfm_similar"}
+    assert own.keys() == build.generators(p, []).keys() and "yandex_wave" in own  # the user's own: as a mix
 
 
 def test_a_refill_takes_the_next_seeds_round_and_round() -> None:
@@ -213,7 +193,7 @@ def test_a_refill_takes_the_next_seeds_round_and_round() -> None:
 
     rounds = [(wave.refill_generators(p, st), list(st.seeds_used)) for _ in range(3)]
 
-    assert set(rounds[0][0]) == {"lastfm_similar"}  # the refill asks Last.fm only: no YouTube radio
+    assert set(rounds[0][0]) == {"ytm_radio", "lastfm_similar"}
     assert [r[1] for r in rounds] == [["dz:0", "dz:1", "dz:2", "dz:3"], ["dz:0", "dz:1", "dz:2", "dz:3", "dz:4"],
                                       ["dz:0", "dz:1", "dz:2"]]  # three new seeds a time, then all anew
 
@@ -272,14 +252,7 @@ async def env(hub_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     prefetched: list[list[str]] = []
     warmed: list[list[str]] = []
-    excluded: list[frozenset[str]] = []  # the providers each prefetch was told not to use
-
-    def fake_prefetch(uid: int, refs: list[str], exclude_providers: frozenset[str] = frozenset()) -> int:
-        prefetched.append(list(refs))
-        excluded.append(exclude_providers)
-        return len(refs)
-
-    monkeypatch.setattr(listen, "prefetch", fake_prefetch)
+    monkeypatch.setattr(listen, "prefetch", lambda uid, refs: prefetched.append(list(refs)) or len(refs))
     monkeypatch.setattr(listen, "warm_light", lambda refs: warmed.append(list(refs)))
     nd = ND()
     app = create_app()
@@ -288,8 +261,7 @@ async def env(hub_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         with respx.mock(assert_all_called=False) as mock:
             mock.route(host="navidrome.test").mock(side_effect=nd.handler)
             async with app_client(app) as client:
-                yield {"client": client, "nd": nd, "admin": await user_id("admin"), "prefetched": prefetched,
-                       "warmed": warmed, "excluded": excluded}
+                yield {"client": client, "nd": nd, "admin": await user_id("admin"), "prefetched": prefetched, "warmed": warmed}
 
 
 def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
@@ -303,7 +275,7 @@ def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
         async def g():
             return list(tracks)
 
-        return {"lastfm_similar": g}
+        return {"ytm_radio": g}
 
     async def radio_of(t):
         seen["radio"].append(t.ref)
@@ -318,17 +290,6 @@ def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
 def ev(kind: str, ref: str, position: float | None = None) -> dict[str, Any]:
     return {"event_id": uuid.uuid4().hex, "ts": datetime.now(UTC).isoformat(), "kind": kind, "ref": ref,
             "position_s": position, "duration_s": 200, "client": "pwa"}
-
-
-def test_the_prefetch_worker_takes_the_excluded_providers_with_the_ref() -> None:
-    """The exclusions a prefetch is given reach the worker that picks the file (listen._worker → choose)."""
-    from app import listen
-
-    listen._wanted[42] = (["dz:1"], frozenset({"ytdlp", "yt_reupload"}))
-    try:
-        assert listen._next_wanted() == ("dz:1", frozenset({"ytdlp", "yt_reupload"}))
-    finally:
-        listen._wanted.clear()
 
 
 async def test_nothing_to_start_from(env) -> None:
@@ -353,8 +314,6 @@ async def test_a_wave_hands_out_five_and_learns_from_what_was_played(env, monkey
     assert w["title"] == "Моя волна" and len(tracks) == 5 and seen["seed"] == [None]
     assert len({t["artist"] for t in tracks}) == 5
     assert env["prefetched"][-1] == [t["ref"] for t in tracks if not t["owned"]]  # files picked ahead
-    # a wave does not play YouTube: its picks keep away from both YouTube providers
-    assert env["excluded"][-1] == frozenset({"ytdlp", "yt_reupload"})
     # their light copies (app.light) are made ahead too: a library song by its id, the others by their refs
     assert len(env["warmed"][-1]) == 5 and set(env["prefetched"][-1]) <= set(env["warmed"][-1])
 
@@ -770,10 +729,10 @@ async def test_handed_out_tracks_are_recorded_once_and_counted_again(env, monkey
 
     items = await wave_items(sid)
     assert [x.ref for x in items] == first and [x.position for x in items] == [0, 1, 2, 3, 4]
-    assert all(x.handed_count == 1 and x.generator == "lastfm_similar" and x.value is not None
-               and x.user_id == env["admin"] for x in items)
-    assert all(x.title == f"Песня {x.ref[3:]}" and x.key == x.ref
-               and x.gens == {"lastfm_similar": int(x.ref[3:]) - 5000} for x in items)
+    assert all(x.handed_count == 1 and x.generator == "ytm_radio" and x.value is not None and x.user_id == env["admin"]
+               for x in items)
+    assert all(x.title == f"Песня {x.ref[3:]}" and x.key == x.ref and x.gens == {"ytm_radio": int(x.ref[3:]) - 5000}
+               for x in items)
 
     r = await c.post(f"/api/wave/{sid}/next", json={"played": [ev("skip", first[0], 5)], "queued": first[1:]})
     assert r.status_code == 200, r.text
