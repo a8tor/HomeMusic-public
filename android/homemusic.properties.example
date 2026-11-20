@@ -1,0 +1,7 @@
+# Copy to homemusic.properties and enter your own deployment addresses.
+# All four addresses default to empty when no local configuration is present.
+# These values are embedded in the APK: never put passwords or tokens in URLs.
+hubUrl=https://hub.example.com
+hubLocalUrl=
+musicUrl=https://music.example.com
+musicLocalUrl=
