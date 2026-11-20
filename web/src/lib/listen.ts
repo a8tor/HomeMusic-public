@@ -846,13 +846,38 @@ export function getQueueRevision(): number {
 }
 
 /** The tracks after the current one are replaced (the Hub picked «Моя волна» anew, `lib/wave.ts`). A queue that ran
- * out meanwhile plays on. */
+ * out meanwhile plays on. The Hub's picks are already deduplicated by fingerprint, but one song can come back as a
+ * library copy next to its catalog one: the wave then keeps the first (`ref`) and drops a repeat by artist and
+ * title. Other lists keep their tracks as they are. */
 export function replaceUpcoming(list: readonly ListenTrack[]) {
   if (!state.track) return;
   const ended = state.phase === 'ended';
-  set({ queue: [...state.queue.slice(0, state.index + 1), ...list] });
+  const before = state.queue.slice(0, state.index + 1);
+  const fresh = onWave() ? dedupeUpcoming(before, list) : [...list];
+  set({ queue: [...before, ...fresh] });
   if (ended && hasNext(state)) start(state.queue, state.index + 1, true);
   else if (state.phase !== 'error') prefetchNext();
+}
+
+/** The upcoming tracks without a repeat of one already there or of an earlier one (a wave: `dz:` and `nd:` copies
+ * of one song differ in ref only). */
+function dedupeUpcoming(before: readonly ListenTrack[], list: readonly ListenTrack[]): ListenTrack[] {
+  const refs = new Set(before.map((t) => t.ref));
+  const songs = new Set(before.map(songKey));
+  const out: ListenTrack[] = [];
+  for (const t of list) {
+    const key = songKey(t);
+    if (refs.has(t.ref) || songs.has(key)) continue;
+    refs.add(t.ref);
+    songs.add(key);
+    out.push(t);
+  }
+  return out;
+}
+
+/** Artist with title as one song: the catalog's `dz:` copy and the library's `nd:` one share it. */
+function songKey(t: ListenTrack): string {
+  return `${t.artist ?? ''}|${t.title ?? ''}`.toLowerCase().replace(/\s+/g, ' ').trim() || t.ref;
 }
 
 export const hasNext = (s: ListenState) => s.index + 1 < s.queue.length;

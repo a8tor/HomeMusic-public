@@ -168,6 +168,11 @@ class State:
         st.pool = {c.track.ref: c for c in map(cand_of, d.get("pool") or [])}
         st.out = {c.track.ref: c for c in map(cand_of, d.get("out") or [])}
         st.played = [Played(**p) for p in d.get("played") or []]
+        if not d.get("handed"):
+            # A session started before `handed` existed: everything it hands out is new to the block, so a track
+            # flipped past now is protected at once instead of coming back as if it were a fresh candidate.
+            fresh = time.time()
+            st.handed = {ref: fresh for ref in st.out}
         return st
 
     def known_fps(self) -> set[str]:
@@ -608,13 +613,6 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
             continue
         seen.add(fp)
         pool.append(c)
-    if not pool and fresh:
-        # Nothing left but what was just flipped past: a repeat beats an empty wave.
-        for c in candidates:
-            fp = fp_of(c)
-            if fp and fp not in seen:
-                seen.add(fp)
-                pool.append(c)
     vals = {id(c): value(c, st, vectors, pos, neg, c.track.ref in queued) for c in pool}
     if values is not None:
         values.update((c.track.ref, vals[id(c)]) for c in pool)
@@ -1064,7 +1062,7 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
         if len(st.pool) < POOL_LOW:
             _refill(sid, rt)
         tracks = await _hand_out(sid, rt, {q for q in queued if q in st.out})
-        pending = bool(rt.tasks)
+        pending = bool(rt.tasks) or not tracks  # an empty answer means "ask again": the sources are refilling
     return Batch(sid, title_of(seed_json), rt.mode, seed_json, tracks, pending, recorded)
 
 
@@ -1086,6 +1084,13 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
     now = time.time()
     st.prune_handed(now)
     tracks = pick(st, rt.profile, rt.mode, await _vectors(rt), queued=queued, first=first, values=values)
+    if not tracks and first is None:
+        # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
+        # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
+        # would leave the next `queued` naming tracks this session no longer knows.
+        _refill(sid, rt)
+        await _save(sid, rt)
+        return tracks
     for ref in list(st.out):
         st.pool[ref] = st.out.pop(ref)
     for c in tracks:

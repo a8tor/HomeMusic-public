@@ -204,15 +204,56 @@ def test_a_started_track_drops_its_handout_block() -> None:
     assert "dz:1" not in st.handed and wave.fp_of(cand(1)) in st.heard
 
 
-def test_an_empty_pool_gives_way_to_a_repeat() -> None:
-    """Nothing but what was just flipped past is left: a repeat beats a wave that hands out nothing."""
+def test_nothing_left_but_a_flipped_past_track_is_no_batch() -> None:
+    """A repeat is what the wave is fixing: when only the tracks just flipped past are left, the answer is empty
+    and the client asks again later (the generators are refilling the pool meanwhile)."""
     import time as clock
 
     only = cand(1, score=1)
     st = state(only)
     st.handed[only.track.ref] = clock.time()
 
-    assert [c.track.ref for c in wave.pick(st, profile(), "discover", {}, n=5)] == ["dz:1"]
+    assert wave.pick(st, profile(), "discover", {}, n=5) == []
+
+
+def test_an_old_session_gets_the_handout_block_for_its_queue() -> None:
+    """A session saved before `handed` existed has no such key: its queue must get the block, else the very tracks
+    it holds come back as fresh candidates (a duplicate on the next answer)."""
+    import time as clock
+
+    queue = cand(1, score=10)
+    saved = wave.State()
+    saved.out = {queue.track.ref: queue}
+    saved.pool = {cand(2, score=1).track.ref: cand(2, score=1)}
+    old = saved.dump()
+    old.pop("handed")  # a session of an older build
+
+    back = wave.State.load(old)
+
+    assert set(back.handed) == {queue.track.ref}
+    assert abs(back.handed[queue.track.ref] - clock.time()) < 60
+    # the track it still holds queued stays; the one it dropped is not offered again
+    assert [c.track.ref for c in wave.pick(back, profile(), "discover", {}, n=5, queued={queue.track.ref})] == \
+           [queue.track.ref]
+    assert [c.track.ref for c in wave.pick(back, profile(), "discover", {}, n=5, queued={"dz:2"})] == ["dz:2"]
+
+
+async def test_an_empty_answer_keeps_the_queue_and_asks_again(env, monkeypatch) -> None:
+    """Nothing fresh is left: the answer is empty with `pending`, the session's queue is untouched (so the client's
+    next `queued` still names tracks it holds) and the pool is refilled instead of repeating the flipped ones."""
+    c = env["client"]
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(5000 + i) for i in range(5)])
+    w = (await c.post("/api/wave/start", json={})).json()
+    sid, refs = w["session_id"], [t["ref"] for t in w["tracks"]]
+    # every track of the answer is flipped past: the client dropped them all, nothing new is left
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": []})).json()
+
+    assert r["tracks"] == refs  # an empty `queued` is a lost queue: the best ones come again
+    # now it keeps the two it holds: those stay, and no fresh candidate repeats them
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": refs[:2]})).json()
+    assert [t["ref"] for t in r["tracks"]][:2] == refs[:2]
+    assert len({t["ref"] for t in r["tracks"]}) == len(r["tracks"])
 
 
 def test_state_survives_its_json() -> None:
