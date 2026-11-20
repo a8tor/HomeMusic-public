@@ -131,6 +131,7 @@ class State:
     out: dict[str, build.Cand] = field(default_factory=dict)  # handed out, not started (the client's queue)
     played: list[Played] = field(default_factory=list)
     heard: set[str] = field(default_factory=set)  # fingerprints of every track started: never again
+    nofile: set[str] = field(default_factory=set)  # refs no source had: a 30 s preview is no wave track
     handed: dict[str, float] = field(default_factory=dict)  # ref -> when it was handed out (no repeat for a while)
     skips: dict[str, int] = field(default_factory=dict)  # artist key -> early skips in the session
     pos: list[str] = field(default_factory=list)  # vector keys of the session's likes and finished tracks
@@ -148,7 +149,7 @@ class State:
                 "signals": self.signals, "positive_weights": self.positive_weights, "space": self.space,
                 "pool": [cand_json(c) for c in self.pool.values()], "out": [cand_json(c) for c in self.out.values()],
                 "played": [p.__dict__ for p in self.played], "heard": sorted(self.heard), "handed": self.handed,
-                "skips": self.skips,
+                "nofile": sorted(self.nofile), "skips": self.skips,
                 "pos": self.pos, "neg": self.neg, "radios": self.radios, "seeds_used": self.seeds_used,
                 "started": self.started, "started_familiar": self.started_familiar, "downloads": self.downloads,
                 "gens": self.gens, "seed_artist": self.seed_artist}
@@ -164,6 +165,7 @@ class State:
                  started=int(d.get("started") or 0), started_familiar=int(d.get("started_familiar") or 0),
                  downloads=list(d.get("downloads") or []), gens=dict(d.get("gens") or {}),
                  heard=set(d.get("heard") or []), seed_artist=d.get("seed_artist"),
+                 nofile=set(d.get("nofile") or []),
                  handed={k: float(v) for k, v in (d.get("handed") or {}).items()})
         st.pool = {c.track.ref: c for c in map(cand_of, d.get("pool") or [])}
         st.out = {c.track.ref: c for c in map(cand_of, d.get("out") or [])}
@@ -593,7 +595,8 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     `values` gets the `value` of every candidate ranked, by ref (the analytics of `wave_items`)."""
     pos = _weighted_center(st.positive_weights, vectors) if st.taste_model == "v2" else _center(st.pos, vectors)
     neg = None if st.taste_model == "v2" else _center(st.neg, vectors)
-    candidates = [c for c in [*st.out.values(), *st.pool.values()] if c is not first and not _disliked(c, p)]
+    candidates = [c for c in [*st.out.values(), *st.pool.values()]
+                  if c is not first and c.track.ref not in st.nofile and not _disliked(c, p)]
     # Catalog and library copies can have different refs for the same song. Never put both into one wave batch,
     # re-offer a song that has already started, or substitute another ref for one still queued by the client.
     seen = set(st.heard)
@@ -1140,6 +1143,21 @@ async def save_items(s: AsyncSession, sid: str, user_id: int, tracks: list[build
     await s.execute(q.on_conflict_do_update(index_elements=["session_id", "ref"], set_={
         "handed_count": WaveItem.handed_count + 1, "last_handed_at": q.excluded.last_handed_at,
         "score": q.excluded.score, "sim": q.excluded.sim, "value": q.excluded.value}))
+
+
+async def no_file(user: User, sid: str, ref: str) -> bool:
+    """A wave track no source has (the client got a 30 s preview): it leaves the session's queue and pool for good.
+    False — the session is not this user's or the track is not one it handed out."""
+    rt = await _runtime(sid, user)
+    async with rt.lock:
+        st = rt.state
+        c = st.out.pop(ref, None) or st.pool.pop(ref, None)
+        st.handed.pop(ref, None)
+        st.nofile.add(ref)
+        await _save(sid, rt)
+        if c is not None:
+            log.info("wave %s: no source has %s — %s", sid, c.track.artist, c.track.title)
+        return True
 
 
 async def settle(sid: str) -> None:

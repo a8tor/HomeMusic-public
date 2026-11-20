@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import PlayEventsOut, WaveNextIn, WaveOut, WaveStartIn, WaveTrackOut
+from app.api.schemas import PlayEventsOut, WaveNextIn, WaveNoFileIn, WaveOut, WaveStartIn, WaveTrackOut
 from app.auth import current_user
 from app.db import get_session
 from app.library.owned import annotate_tracks
@@ -53,6 +53,12 @@ async def start(body: WaveStartIn | None = None, user: User = Depends(current_us
     except wave.WaveError as e:
         raise HTTPException(e.status, str(e)) from e
     return await wave_out(s, b, user.id)
+
+
+@router.post("/{session_id}/no_file", response_model=dict[str, bool])
+async def no_file(session_id: str, body: WaveNoFileIn, user: User = Depends(current_user)):
+    """A track of the wave no source has (the client got a 30 s preview): it is not handed out again."""
+    return {"ok": await wave.no_file(user, session_id, body.ref)}
 
 
 @router.post("/{session_id}/next", response_model=WaveOut)

@@ -216,6 +216,37 @@ def test_nothing_left_but_a_flipped_past_track_is_no_batch() -> None:
     assert wave.pick(st, profile(), "discover", {}, n=5) == []
 
 
+def test_a_track_no_source_has_is_not_picked_again() -> None:
+    """A 30 s preview is no wave track: the client names it, and neither the queue nor the pool offers it again."""
+    st = state(cand(1, score=10), cand(2, score=1))
+    st.nofile.add("dz:1")
+
+    got = wave.pick(st, profile(), "discover", {}, n=5)
+
+    assert [c.track.ref for c in got] == ["dz:2"]
+
+
+async def test_no_file_drops_the_track_from_the_session_and_survives_a_restart(env, monkeypatch) -> None:
+    from app.db import session_scope
+    from app.mixes.wave import WaveSession
+
+    c = env["client"]
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(5000 + i) for i in range(10)])
+    w = (await c.post("/api/wave/start", json={})).json()
+    sid, first = w["session_id"], w["tracks"][0]["ref"]
+
+    r = await c.post(f"/api/wave/{sid}/no_file", json={"ref": first})
+
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    async with session_scope() as s:
+        row = await s.get(WaveSession, sid)
+    assert first in row.state_json["nofile"] and first not in [x["track"]["ref"] for x in row.state_json["out"]]
+    # the answer no longer offers it
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": []})).json()
+    assert first not in [t["ref"] for t in r["tracks"]]
+
+
 def test_an_old_session_gets_the_handout_block_for_its_queue() -> None:
     """A session saved before `handed` existed has no such key: its queue must get the block, else the very tracks
     it holds come back as fresh candidates (a duplicate on the next answer)."""

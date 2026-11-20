@@ -984,6 +984,11 @@ class WaveNextIn(BaseModel):
     queued: list[str] = Field(default_factory=list, max_length=50)
 
 
+class WaveNoFileIn(BaseModel):
+    """A track of the wave the client got only a 30 s preview of: no source has its file."""
+    ref: str = Field(max_length=200)
+
+
 class WaveTrackOut(TrackOut):
     """A track of the wave: the catalog track (`ref` "dz:…"; a song only the library has — `source` "nd", `ref`
     "nd:<song>") with the library state: `owned` + `nd_song_id` — play the library song, else stream `ref` from the

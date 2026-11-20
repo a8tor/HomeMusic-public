@@ -398,6 +398,11 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   resolveListen(track.ref, ctl.signal).then(
     (info) => {
       if (resolving !== ctl) return;
+      // A wave plays full tracks only: when no source has this one, it goes on instead of stopping at 30 seconds.
+      if (info.kind === 'preview' && auto && onWave() && hasNext(state)) {
+        skipNoFile(track.ref);
+        return void start(state.queue, state.index + 1, true);
+      }
       set({ info, duration: info.kind === 'preview' ? (info.duration_s ?? 30) : state.duration });
       reportStart();
       prefetchNext();
@@ -409,6 +414,16 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
       a.pause();
     },
   );
+}
+
+/** A wave track no source has (the Hub answered with a 30 s preview): tell it so it is not handed out again.
+ * Nothing is reported as a listen: a preview is no playback of the track. */
+function skipNoFile(ref: string) {
+  const sid = state.context.startsWith('wave:') ? state.context.slice(5) : null;
+  if (!sid) return;
+  void api.waveNoFile(sid, ref).catch(() => {
+    /* the next answer of the wave simply tries it again */
+  });
 }
 
 /** The Hub opens the picked file only when the stream asks for it, and moves on to the next file if it doesn't

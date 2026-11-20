@@ -330,6 +330,9 @@ export const api = {
     request<SmartAddOut>('POST', `/api/smart-shuffle/${encodeURIComponent(id)}/add`, { json: body }),
   waveStart: (body: WaveStartIn) => request<WaveOut>('POST', '/api/wave/start', { json: body }),
   waveNext: (id: string, body: WaveNextIn) => request<WaveOut>('POST', `/api/wave/${encodeURIComponent(id)}/next`, { json: body }),
+  /** A track of the wave was a 30 s preview only (no source has its file): the Hub stops handing it out. */
+  waveNoFile: (id: string, ref: string) =>
+    request<{ ok: boolean }>('POST', `/api/wave/${encodeURIComponent(id)}/no_file`, { json: { ref } }),
 
   // uploads
   uploads: (status = 'uploaded', signal?: AbortSignal) =>
