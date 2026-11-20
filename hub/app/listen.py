@@ -187,7 +187,8 @@ _fetching: dict[str, _Job] = {}  # ref -> download of a local copy (`_predownloa
 _copies: dict[str, _Copy] = {}  # ref -> server copy of its picked file
 _calm: asyncio.Event | None = None  # set while no copy of a played track downloads (`_stir`)
 _missed: dict[str, float] = {}  # ref -> monotonic time until which the prefetch skips it
-_wanted: dict[int, list[str]] = {}  # user id -> refs on their screen still to pick, top first
+# user id -> (refs on their screen still to pick, top first; providers the pick must not use)
+_wanted: dict[int, tuple[list[str], frozenset[str]]] = {}
 _wake: asyncio.Event | None = None
 _workers: list[asyncio.Task] = []
 _tasks: set[asyncio.Task] = set()  # fire-and-forget work (kept referenced until done)
@@ -198,7 +199,8 @@ _http: httpx.AsyncClient | None = None  # Deezer preview CDN
 _media: httpx.AsyncClient | None = None
 
 
-async def choose(ref: str, *, background: bool = False, stale: Choice | None = None, full_only: bool = False) -> Choice:
+async def choose(ref: str, *, background: bool = False, stale: Choice | None = None, full_only: bool = False,
+                 exclude_providers: frozenset[str] = frozenset()) -> Choice:
     """The pick for `ref`: in memory, remembered or found now. Concurrent callers share one resolution, which
     also survives the caller going away (the next tap finds it ready). `background`: a prefetch, which yields to
     user requests (a user request joining it lifts it). `stale`: this pick did not open, find another."""
@@ -209,7 +211,8 @@ async def choose(ref: str, *, background: bool = False, stale: Choice | None = N
     job = _inflight.get(ref)
     if job is None:
         prio = Priority(background)
-        coro = _resolve(ref, probe=background or stale is not None, remembered=stale is None, full_only=full_only)
+        coro = _resolve(ref, probe=background or stale is not None, remembered=stale is None, full_only=full_only,
+                        exclude_providers=exclude_providers)
         job = _Job(asyncio.create_task(coro, context=priority_context(prio)), prio)
         _inflight[ref] = job
 
@@ -224,7 +227,8 @@ async def choose(ref: str, *, background: bool = False, stale: Choice | None = N
     choice = await asyncio.shield(job.task)
     if full_only and choice.kind == "preview":
         # A foreground request may have joined an older browser/prefetch resolution.
-        return await choose(ref, background=background, stale=choice, full_only=True)
+        return await choose(ref, background=background, stale=choice, full_only=True,
+                            exclude_providers=exclude_providers)
     return choice
 
 
@@ -488,9 +492,10 @@ def _media_client() -> httpx.AsyncClient:
 # --- prefetch --------------------------------------------------------------------------------------------------
 
 
-def prefetch(user_id: int, refs: list[str]) -> int:
+def prefetch(user_id: int, refs: list[str], exclude_providers: frozenset[str] = frozenset()) -> int:
     """The catalog tracks on this user's screen, top first: their files are picked in the background. Replaces
-    the user's previous list (tracks that scrolled away are dropped). Returns how many are still to pick."""
+    the user's previous list (tracks that scrolled away are dropped). `exclude_providers`: sources the pick must
+    not use (a wave plays YouTube only through a download). Returns how many are still to pick."""
     global _wake
     if _wake is None:
         _wake = asyncio.Event()
@@ -499,7 +504,7 @@ def prefetch(user_id: int, refs: list[str]) -> int:
             _workers.append(asyncio.create_task(_worker(), context=priority_context(Priority(True))))
     todo = [r for r in dict.fromkeys(refs) if not _ready(r)][:PREFETCH_MAX]
     if todo:
-        _wanted[user_id] = todo
+        _wanted[user_id] = (todo, exclude_providers)
         _wake.set()
     else:
         _wanted.pop(user_id, None)
@@ -515,42 +520,43 @@ def _ready(ref: str) -> bool:
                 and (hit.kind != "full" or hit.source is not None or hit.local is not None))
 
 
-def _next_wanted() -> str | None:
-    """The next ref to pick; users take turns."""
+def _next_wanted() -> tuple[str, frozenset[str]] | None:
+    """The next ref to pick and the providers its pick must not use; users take turns."""
     while _wanted:
         uid = next(iter(_wanted))
-        refs = _wanted.pop(uid)
+        refs, excluded = _wanted.pop(uid)
         while refs:
             ref = refs.pop(0)
             if not _ready(ref):
                 if refs:
-                    _wanted[uid] = refs
-                return ref
+                    _wanted[uid] = (refs, excluded)
+                return ref, excluded
     return None
 
 
 async def _worker() -> None:
     assert _wake is not None
     while True:
-        ref = _next_wanted()
-        if ref is None:
+        nxt = _next_wanted()
+        if nxt is None:
             _wake.clear()
             await _wake.wait()
             continue
+        ref, excluded = nxt
         try:
-            await _warm(ref)
+            await _warm(ref, excluded)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("listen prefetch %s", ref)
 
 
-async def _warm(ref: str) -> None:
+async def _warm(ref: str, exclude_providers: frozenset[str] = frozenset()) -> None:
     """Pick the file and open it once, so a tap streams at once."""
     try:
-        c = await choose(ref, background=True)
+        c = await choose(ref, background=True, exclude_providers=exclude_providers)
         if c.kind == "full" and c.source is None and not await _opens(c):
-            await choose(ref, background=True, stale=c)
+            await choose(ref, background=True, stale=c, exclude_providers=exclude_providers)
     except ListenError as e:
         log.info("listen prefetch %s: %s", ref, e)
         _missed[ref] = time.monotonic() + (MISS_TTL_S if e.status == 404 else TRANSIENT_TTL_S)
@@ -600,7 +606,8 @@ def _spawn(coro: Coroutine[Any, Any, Any], *, background: bool = False, prio: Pr
 # --- resolution ------------------------------------------------------------------------------------------------
 
 
-async def _resolve(ref: str, *, probe: bool, remembered: bool, full_only: bool = False) -> Choice:
+async def _resolve(ref: str, *, probe: bool, remembered: bool, full_only: bool = False,
+                   exclude_providers: frozenset[str] = frozenset()) -> Choice:
     """`probe`: sources one by one, each pick opened before it is taken (background, or a pick that failed);
     otherwise all sources at once and nothing opened (the stream opens it). `remembered`: a remembered pick
     may be used."""
@@ -624,7 +631,9 @@ async def _resolve(ref: str, *, probe: bool, remembered: bool, full_only: bool =
     if choice is None:
         if not remembered:
             await cache_delete(_key(ref))
-        choice = await (_resolve_deezer(ref, id_, probe, full_only=full_only) if src == "dz" else _resolve_hitmoz(ref, id_, probe))
+        choice = await (_resolve_deezer(ref, id_, probe, full_only=full_only,
+                                         exclude_providers=exclude_providers)
+                        if src == "dz" else _resolve_hitmoz(ref, id_, probe))
         how = "probed" if probe else "searched"
         if full_only and choice.kind == "preview":
             raise ListenError(503, "Полная версия пока недоступна. Повторите позже или выберите другой источник.")
@@ -673,7 +682,8 @@ async def _resolve_song(ref: str, song_id: str) -> Choice:
     return choice
 
 
-async def _resolve_deezer(ref: str, id_: str, probe: bool, *, full_only: bool = False) -> Choice:
+async def _resolve_deezer(ref: str, id_: str, probe: bool, *, full_only: bool = False,
+                          exclude_providers: frozenset[str] = frozenset()) -> Choice:
     assert svc.deezer is not None
     try:
         t = await svc.deezer.get_track(id_)
@@ -698,7 +708,7 @@ async def _resolve_deezer(ref: str, id_: str, probe: bool, *, full_only: bool = 
     except TimeoutError:
         from app.catalog.yandex import cis_release
         pq = q.model_copy(update={"lang": "ru"}) if cis_release(meta.get("upc"), q.isrc) else q
-    providers = svc.provider_order(pq)
+    providers = [p for p in svc.provider_order(pq) if p.name not in exclude_providers]
 
     def full(cands: list[Candidate]) -> Choice:
         return Choice(ref, "full", q.artist, q.title, q.duration_s or cands[0].duration_s, candidate=cands[0],
@@ -718,6 +728,8 @@ async def _resolve_deezer(ref: str, id_: str, probe: bool, *, full_only: bool = 
     # A failed regular source must not silently turn a full-song request into a short preview.
     regular = {p.name for p in providers}
     for p in svc.provider_order(pq, for_download=True):
+        if p.name in exclude_providers:
+            continue
         if p.name in regular:
             continue
         if cands := await _search(ref, p, pq, trouble, timeout_s=FALLBACK_TIMEOUT_S):

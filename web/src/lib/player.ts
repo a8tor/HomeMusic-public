@@ -13,7 +13,10 @@ type Bridge = {
   playQueue?: (itemsJson: string, index: number) => void;
   playWave?: (waveJson: string) => void;
   pauseNative?: () => void;
+  /** The app exposes the show/hide call as `webPlayer`; some builds may also carry the older `webPlayerShown`
+   * name, so the page calls whichever is present (`webPlayerShown` below tries both). */
   webPlayer?: (visible: boolean) => void;
+  webPlayerShown?: (visible: boolean) => void;
 };
 
 /** The app's player started (sent by the app, and by `playSongs` right away): page listening stops. */
@@ -123,10 +126,12 @@ export function pauseNative() {
   if (typeof b?.pauseNative === 'function') b.pauseNative();
 }
 
-/** The page's mini player appeared or went away: the app hides its own player meanwhile (1.1.2+). */
+/** The page's mini player appeared or went away: the app hides its own player meanwhile (1.1.2+). The bridge
+ * calls it `webPlayer`; some builds exposed `webPlayerShown` earlier, so both names are tried — the first one
+ * that exists wins and the other is ignored. */
 export function webPlayerShown(visible: boolean) {
   const b = bridge();
-  if (typeof b?.webPlayer === 'function') b.webPlayer(visible);
+  (b?.webPlayer ?? b?.webPlayerShown)?.(visible);
 }
 
 /** Plays the songs in order, starting at `index`. Ids are Navidrome song ids (`nd_song_id`). */

@@ -8,11 +8,11 @@ after every action.
   artist (the app's «Радиостанции») adds the artist's library songs to its Deezer radios; its artist plays once in 3.
 - Every `next` brings the events since the previous one and picks again: an early skip (< 30 s) or «Не нравится»
   lowers the artist and what sounds like the track (the embedder's vectors); a ♥ or a track played to its end adds
-  its YouTube Music radio to the pool (`session_radio`) and raises what sounds like it. An artist plays at most once
+  Last.fm similar tracks to the pool (`session_radio`) and raises what sounds like it. An artist plays at most once
   in 8 tracks; the mode keeps the familiar share of a mix.
 - The tracks the client still has ahead (`queued`) are picked again with the rest: the answer replaces them.
 - Sources answer at their own pace: a request waits for them `wave_wait_s`, what comes later joins the pool in the
-  background (one lock per session). A pool running low is refilled from the radios of the next seeds.
+  background (one lock per session). A pool running low is refilled from non-YouTube similar-track sources.
 - Tracks play as a stream from the Hub (their files are prefetched); one played to its end is downloaded quietly,
   as an economy import downloads a track once listened to (a ♥ downloads it anyway: the clients' ♥).
 - For the admin's analytics (INSIGHTS.md 6.2–6.4) a session keeps where and by what client it was started, and every
@@ -243,8 +243,12 @@ async def artist_radio(artist_ref: str) -> list[CatalogTrack]:
 
 
 async def radio_of(t: CatalogTrack) -> list[CatalogTrack]:
-    """YouTube Music's radio of a track the user liked or played to its end in this session."""
-    return await build._by_seeds([taste_of(t)], lambda x: sources.ytm_radio(x.artist, x.title), "ytm")
+    """Similar tracks for a track the user liked or played to its end in this session (not YouTube)."""
+    return await build._by_seeds(
+        [taste_of(t)],
+        lambda x: sources.lastfm_similar_tracks(x.artist, x.title, limit=30),
+        "lastfm",
+    )
 
 
 def generators(p: Profile, seed: CatalogTrack | None, seed_artist: dict[str, Any] | None,
@@ -252,7 +256,7 @@ def generators(p: Profile, seed: CatalogTrack | None, seed_artist: dict[str, Any
     """The sources of a new session's pool: the seed's radios, or the mix's generators for the profile."""
     if seed is not None:
         gens = build.generators(p, [taste_of(seed)])
-        out = {k: gens[k] for k in ("ytm_radio", "lastfm_similar", "yandex_similar")}
+        out = {k: gens[k] for k in ("lastfm_similar", "yandex_similar")}
         if seed.artist_ref and seed.artist_ref.startswith("dz:"):
             out["deezer_radio"] = lambda: artist_radio(seed.artist_ref or "")
         return out
@@ -268,20 +272,15 @@ def generators(p: Profile, seed: CatalogTrack | None, seed_artist: dict[str, Any
         async def own() -> list[CatalogTrack]:
             return random.sample(songs, len(songs))
 
-        async def radios() -> list[CatalogTrack]:
-            tracks = (await top())[:2] if ref else random.sample(songs, min(2, len(songs)))
-            return await build._by_seeds([taste_of(t) for t in tracks],
-                                         lambda x: sources.ytm_radio(x.artist, x.title), "ytm")
-
         out = {"deezer_radio": lambda: artist_radio(ref), "favorites": top} if ref else {}
         if songs:
             out[ARTIST_SONGS] = own
-        return {**out, "ytm_radio": radios}
-    return build.generators(p, seeds)
+        return out
+    return {k: v for k, v in build.generators(p, seeds).items() if k != "ytm_radio"}
 
 
 def refill_generators(p: Profile, st: State) -> dict[str, build.Gen]:
-    """More of the pool: the radios of the next profile seeds the session has not used (round and round)."""
+    """Refill recommendations from non-YouTube generators for unused profile seeds."""
     cfg = get_settings().cfg.mixes
     pool = [t for t in p.seeds(cfg.seeds * 4) if t.key not in st.seeds_used]
     if not pool:
@@ -292,7 +291,7 @@ def refill_generators(p: Profile, st: State) -> dict[str, build.Gen]:
     if not seeds:
         return {}
     gens = build.generators(p, seeds)
-    return {k: gens[k] for k in ("ytm_radio", "lastfm_similar")}
+    return {"lastfm_similar": gens["lastfm_similar"]}
 
 
 # --- the pool -----------------------------------------------------------------------------------------------------
@@ -422,7 +421,7 @@ def _refill(sid: str, rt: Runtime) -> None:
                 from app.mixes.taste_select import enrich_selected
                 enriched = await enrich_selected(profile, chosen)
                 all_gens = build.generators(profile, enriched) if enriched else {}
-                current = {k: all_gens[k] for k in ("ytm_radio", "lastfm_similar") if k in all_gens}
+                current = {k: all_gens[k] for k in ("lastfm_similar",) if k in all_gens}
             results = await build.run_generators(current)
             async with rt.lock:
                 await absorb(rt, results)
@@ -1075,7 +1074,7 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
         log.exception("wave %s: handed out tracks not recorded", sid)
     stream = [c.track.ref for c in tracks if not c.nd_song_id and c.track.source != "nd"]
     if stream:
-        listen.prefetch(rt.user_id, stream)
+        listen.prefetch(rt.user_id, stream, exclude_providers=frozenset({"ytdlp", "yt_reupload"}))
     # the light copies for a metered network (app.light): library songs plain, the others after their files load
     listen.warm_light([f"nd:{c.nd_song_id}" if c.nd_song_id else c.track.ref for c in tracks
                        if c.nd_song_id or c.track.source != "nd"])
