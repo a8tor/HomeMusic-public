@@ -155,6 +155,66 @@ def test_a_queued_track_is_not_swapped_for_a_hair_better_one() -> None:
     assert [c.track.ref for c in wave.pick(st, profile(), "discover", {}, n=1, queued={"dz:1"})] == ["dz:1"]
 
 
+def test_a_track_flipped_past_is_not_offered_again() -> None:
+    """A track handed out but never started (flipped past) is not in `heard`: without the handout time it would
+    come back as if it were new — that is the duplicate a fast skimming produces."""
+    import time as clock
+
+    flipped = cand(1, score=10)
+    st = state(cand(2, score=1), cand(3, score=1))
+    st.pool[flipped.track.ref] = flipped  # it went back to the pool, its `start` never came
+    st.handed[flipped.track.ref] = clock.time()
+
+    got = wave.pick(st, profile(), "discover", {}, n=5)
+
+    assert flipped.track.ref not in [c.track.ref for c in got]
+    assert [c.track.ref for c in got] == ["dz:2", "dz:3"]
+
+
+def test_a_flipped_past_track_still_plays_when_the_client_has_it_queued() -> None:
+    import time as clock
+
+    kept = cand(1, score=10)
+    st = state(kept, cand(2, score=1))
+    st.handed[kept.track.ref] = clock.time()
+
+    got = wave.pick(st, profile(), "discover", {}, n=5, queued={kept.track.ref})
+
+    assert kept.track.ref in [c.track.ref for c in got]
+
+
+def test_a_track_handed_out_long_ago_may_come_again() -> None:
+    import time as clock
+
+    old = cand(1, score=10)
+    st = state(old, cand(2, score=1))
+    st.handed[old.track.ref] = clock.time() - wave.HANDED_TTL_S - 1
+
+    got = wave.pick(st, profile(), "discover", {}, n=5)
+
+    assert old.track.ref in [c.track.ref for c in got]
+
+
+def test_a_started_track_drops_its_handout_block() -> None:
+    st = state(cand(1))
+    st.handed["dz:1"] = 1.0
+
+    wave._start(st, cand(1))
+
+    assert "dz:1" not in st.handed and wave.fp_of(cand(1)) in st.heard
+
+
+def test_an_empty_pool_gives_way_to_a_repeat() -> None:
+    """Nothing but what was just flipped past is left: a repeat beats a wave that hands out nothing."""
+    import time as clock
+
+    only = cand(1, score=1)
+    st = state(only)
+    st.handed[only.track.ref] = clock.time()
+
+    assert [c.track.ref for c in wave.pick(st, profile(), "discover", {}, n=5)] == ["dz:1"]
+
+
 def test_state_survives_its_json() -> None:
     st = state(cand(1), played=["Арт A"])
     st.out["dz:2"] = cand(2)

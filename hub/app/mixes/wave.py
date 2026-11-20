@@ -62,6 +62,7 @@ SEED_ARTIST_GAP = 3  # ... the artist a wave started from: at most once in this 
 POOL_LOW = 25  # fewer candidates left: the pool is refilled in the background
 SIGNALS_MAX = 10  # the session's latest likes / skips its sound centers are made of
 SKIP_ARTIST_PENALTY = 0.6  # per early skip of the artist in this session
+HANDED_TTL_S = 3600.0  # a track handed out this long ago is not offered again unless the client still has it queued
 SOUND_WEIGHT = 1.0  # × (closeness to the session's likes − to its skips)
 QUEUED_BONUS = 0.3  # a track the client has queued already is not swapped for a hair better one
 SESSION_RADIO = "session_radio"
@@ -130,6 +131,7 @@ class State:
     out: dict[str, build.Cand] = field(default_factory=dict)  # handed out, not started (the client's queue)
     played: list[Played] = field(default_factory=list)
     heard: set[str] = field(default_factory=set)  # fingerprints of every track started: never again
+    handed: dict[str, float] = field(default_factory=dict)  # ref -> when it was handed out (no repeat for a while)
     skips: dict[str, int] = field(default_factory=dict)  # artist key -> early skips in the session
     pos: list[str] = field(default_factory=list)  # vector keys of the session's likes and finished tracks
     neg: list[str] = field(default_factory=list)  # ... of its early skips and dislikes
@@ -145,7 +147,8 @@ class State:
         return {"version": self.version, "taste_model": self.taste_model, "seen": sorted(self.seen),
                 "signals": self.signals, "positive_weights": self.positive_weights, "space": self.space,
                 "pool": [cand_json(c) for c in self.pool.values()], "out": [cand_json(c) for c in self.out.values()],
-                "played": [p.__dict__ for p in self.played], "heard": sorted(self.heard), "skips": self.skips,
+                "played": [p.__dict__ for p in self.played], "heard": sorted(self.heard), "handed": self.handed,
+                "skips": self.skips,
                 "pos": self.pos, "neg": self.neg, "radios": self.radios, "seeds_used": self.seeds_used,
                 "started": self.started, "started_familiar": self.started_familiar, "downloads": self.downloads,
                 "gens": self.gens, "seed_artist": self.seed_artist}
@@ -160,7 +163,8 @@ class State:
                  radios=list(d.get("radios") or []), seeds_used=list(d.get("seeds_used") or []),
                  started=int(d.get("started") or 0), started_familiar=int(d.get("started_familiar") or 0),
                  downloads=list(d.get("downloads") or []), gens=dict(d.get("gens") or {}),
-                 heard=set(d.get("heard") or []), seed_artist=d.get("seed_artist"))
+                 heard=set(d.get("heard") or []), seed_artist=d.get("seed_artist"),
+                 handed={k: float(v) for k, v in (d.get("handed") or {}).items()})
         st.pool = {c.track.ref: c for c in map(cand_of, d.get("pool") or [])}
         st.out = {c.track.ref: c for c in map(cand_of, d.get("out") or [])}
         st.played = [Played(**p) for p in d.get("played") or []]
@@ -168,6 +172,10 @@ class State:
 
     def known_fps(self) -> set[str]:
         return self.heard | {fp_of(c) for c in [*self.pool.values(), *self.out.values()]}
+
+    def prune_handed(self, now: float) -> None:
+        """Forget the handouts of long ago: the block only has to cover a track flipped past a moment ago."""
+        self.handed = {ref: at for ref, at in self.handed.items() if now - at < HANDED_TTL_S}
 
 
 @dataclass
@@ -587,13 +595,26 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     seen.update(fp_of(c) for ref, c in st.out.items() if ref in queued)
     if first is not None:
         seen.add(fp_of(first))
+    # A track flipped past before it started is not in `heard`: it comes back to the pool as if it were new. Keep
+    # everything handed out recently out of the batch — the client still having it queued is what keeps it alive.
+    # An empty `queued` is a client that lost its queue, not one that dropped these: it gets the best ones again.
+    now = time.time()  # wall clock: `handed` outlives the process (it is in the session's JSON)
+    fresh = {fp_of(c) for ref, c in [*st.pool.items(), *st.out.items()]
+             if queued and ref not in queued and now - st.handed.get(ref, -HANDED_TTL_S) < HANDED_TTL_S}
     pool: list[build.Cand] = []
     for c in candidates:
         fp = fp_of(c)
-        if not fp or fp in seen:
+        if not fp or fp in seen or fp in fresh:
             continue
         seen.add(fp)
         pool.append(c)
+    if not pool and fresh:
+        # Nothing left but what was just flipped past: a repeat beats an empty wave.
+        for c in candidates:
+            fp = fp_of(c)
+            if fp and fp not in seen:
+                seen.add(fp)
+                pool.append(c)
     vals = {id(c): value(c, st, vectors, pos, neg, c.track.ref in queued) for c in pool}
     if values is not None:
         values.update((c.track.ref, vals[id(c)]) for c in pool)
@@ -685,6 +706,7 @@ def _match(st: State, ref: str | None, nd: str | None) -> tuple[str, build.Cand 
 def _start(st: State, c: build.Cand) -> Played:
     st.out.pop(c.track.ref, None)
     st.pool.pop(c.track.ref, None)
+    st.handed.pop(c.track.ref, None)  # it is in `heard` now: the handout block is no longer needed
     x = _as_played(c)
     st.played = [*st.played, x][-HISTORY_MAX:]
     st.heard.add(fp_of(c))
@@ -1061,12 +1083,15 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
                     del pool[ref]
         _session_weights(st, rt.profile)
     values: dict[str, float] = {}
+    now = time.time()
+    st.prune_handed(now)
     tracks = pick(st, rt.profile, rt.mode, await _vectors(rt), queued=queued, first=first, values=values)
     for ref in list(st.out):
         st.pool[ref] = st.out.pop(ref)
     for c in tracks:
         st.pool.pop(c.track.ref, None)
         st.out[c.track.ref] = c
+        st.handed[c.track.ref] = now
     await _save(sid, rt)
     try:  # its own transaction after the state's: a failure here never costs the wave its answer or its state
         async with session_scope() as s:
