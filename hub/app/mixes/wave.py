@@ -13,8 +13,7 @@ after every action.
 - The tracks the client still has ahead (`queued`) are picked again with the rest: the answer replaces them.
 - Sources answer at their own pace: a request waits for them `wave_wait_s`, what comes later joins the pool in the
   background (one lock per session). A pool running low is refilled from the radios of the next seeds.
-- Tracks play as a stream from the Hub (their files are prefetched); one played to its end is downloaded quietly,
-  as an economy import downloads a track once listened to (a ♥ downloads it anyway: the clients' ♥).
+- Tracks play as a stream from the Hub (their files are prefetched); a ♥ is an explicit import request.
 - For the admin's analytics (INSIGHTS.md 6.2–6.4) a session keeps where and by what client it was started, and every
   track handed out goes to `wave_items`; a session not asked for `KEEP` has its heavy state cleared to a summary,
   the row stays. The wave itself never reads any of it.
@@ -778,7 +777,8 @@ async def _download(sid: str, rt: Runtime, x: Played) -> None:
     from app.jobs.downloads import query_from_track
 
     st = rt.state
-    if not rt.download_finished or x.nd_song_id or not x.track or x.ref in st.downloads or not x.ref.startswith("dz:"):
+    if (not get_settings().cfg.storage.autodownload_listened or not rt.download_finished or x.nd_song_id
+            or not x.track or x.ref in st.downloads or not x.ref.startswith("dz:")):
         return
     st.downloads.append(x.ref)
     t = CatalogTrack.model_validate(x.track)

@@ -161,6 +161,13 @@ class Track(Base):
     fingerprint: Mapped[str] = mapped_column(String(1024))  # normalized "artist|title"
     warnings: Mapped[list[Any]] = mapped_column(JSON, default=list)
     added_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # snapshot of who added the file: survives deletion of the user (`added_by` is SET NULL then)
+    added_by_username: Mapped[str | None] = mapped_column(String(128))
+    # how the file got into the library: download/upload/import/external
+    origin: Mapped[str | None] = mapped_column(String(16))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)  # the file size, filled by the importer / a backfill
+    play_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_played_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class CatalogCache(Base):

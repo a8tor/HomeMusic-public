@@ -24,15 +24,14 @@ async def events(body: PlayEventsIn, user: User = Depends(current_user),
     if body.expected_user_id is not None and body.expected_user_id != user.id:
         raise HTTPException(409, "Listening events belong to another account")
     r = await plays.record_events(s, user.id, body.events)
-    # a catalog track the app played from its precache never asked the stream as a listen: its `start` is one
-    # (a track of an economy import is downloaded once listened to)
-    refs = {e.get("ref") for e in body.events if isinstance(e, dict) and e.get("kind") == "start"}
-    if refs := sorted(r for r in refs if isinstance(r, str) and r and not r.startswith("nd:")):
-        from app.imports.core import listened
-
+    refs = sorted({ref for ref in r.accepted_starts if not ref.startswith("nd:")})
+    if refs:
         await s.commit()
+        from app.imports.core import listened
         for ref in refs:
             await listened(user.id, ref)
+        from app.listen import note_demand
+        await note_demand(refs)
     return PlayEventsOut(accepted=r.accepted, duplicates=r.duplicates,
                          rejected=[PlayEventRejected(**x) for x in r.rejected])
 

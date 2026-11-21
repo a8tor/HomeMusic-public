@@ -183,6 +183,8 @@ async def commit(payload: str = Form(...), cover: UploadFile | None = File(None)
             bitrate_kbps=info.bitrate_kbps if info else None,
             codec=info.codec if info else None,
             added_by=user.id,
+            added_by_username=user.nd_username,
+            origin="upload",
         )
         try:
             track = await import_file(s, src, spec)

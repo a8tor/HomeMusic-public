@@ -16,15 +16,18 @@ from app.api.schemas import (
     AlbumMergeIn,
     AlbumPatchIn,
     LibAlbumOut,
+    LibraryPolicyOut,
     LibTrackOut,
     StarIn,
     StarredOut,
     TrackPatchIn,
+    TracksDeletedOut,
     TracksMoveIn,
     TrackSourceOut,
 )
-from app.auth import current_user, user_navidrome
+from app.auth import admin_user, current_user, user_navidrome
 from app.catalog.models import split_ref
+from app.config import get_settings
 from app.db import get_session
 from app.events import bus
 from app.jobs.downloads import enqueue_scan
@@ -73,6 +76,19 @@ async def _after_edit(s: AsyncSession, user: User, album_id: int | None) -> None
     await s.commit()
     notify()
     bus.publish(user.id, "library", {"kind": "changed", "album_id": album_id})
+
+
+def _may_delete(user: User, track: Track) -> bool:
+    """Who may send a track to the trash: an admin, or the one who added the file. Tracks with no
+    author (`added_by IS NULL`, files just dropped into the library and picked up by the scan) are
+    admin-only. Callers turn `False` into a 403."""
+    return user.is_admin or (track.added_by is not None and track.added_by == user.id)
+
+
+@router.get("/api/library/policy", response_model=LibraryPolicyOut)
+async def library_policy(user: User = Depends(current_user)):
+    """The retention of deleted files the UI shows in its delete confirmations (no hardcoded 30 days)."""
+    return LibraryPolicyOut(trash_days=get_settings().cfg.library.trash_days)
 
 
 @router.get("/api/library/albums", response_model=list[LibAlbumOut])
@@ -169,6 +185,15 @@ def _resize(data: bytes, size: int) -> bytes:
     return buf.getvalue()
 
 
+@router.delete("/api/library/albums/{album_id}", response_model=TracksDeletedOut)
+async def delete_album(album_id: int, user: User = Depends(admin_user), s: AsyncSession = Depends(get_session, scope="function")):
+    # an album has no single owner (its tracks may come from different users), so this is admin-only
+    a = await _album(s, album_id)
+    n = await editor.trash_album(s, a)
+    await _after_edit(s, user, None)
+    return TracksDeletedOut(tracks_deleted=n)
+
+
 @router.post("/api/library/albums/merge", response_model=LibAlbumOut)
 async def merge(body: AlbumMergeIn, user: User = Depends(current_user), s: AsyncSession = Depends(get_session, scope="function")):
     target = await _album(s, body.target_id)
@@ -201,6 +226,8 @@ async def delete_track(track_id: int, user: User = Depends(current_user), s: Asy
     t = await s.get(Track, track_id)
     if t is None:
         raise HTTPException(404, "Трек не найден")
+    if not _may_delete(user, t):
+        raise HTTPException(403, "Этот трек добавил другой пользователь")
     album_id = t.album_id
     await editor.trash_track(s, t)
     await _after_edit(s, user, album_id)

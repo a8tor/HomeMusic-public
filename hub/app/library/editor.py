@@ -149,8 +149,8 @@ async def update_track(s: AsyncSession, track: Track, **fields) -> Track:
         return track
 
 
-async def trash_track(s: AsyncSession, track: Track) -> None:
-    """Move the file to MUSIC_ROOT/.trash/<date>/<path> (purged after N days) and delete the row."""
+async def trash_track(s: AsyncSession, track: Track, *, drop_empty_album: bool = True) -> None:
+    """Move the file to trash and delete its row. A caller deleting an album owns album-row cleanup."""
     async with library_lock:
         src = library_abs(track.path)
         if src.is_file():
@@ -160,12 +160,70 @@ async def trash_track(s: AsyncSession, track: Track) -> None:
         album_id = track.album_id
         await s.delete(track)
         await s.flush()
-        if album_id:
+        if drop_empty_album and album_id:
             n = (await s.execute(select(func.count(Track.id)).where(Track.album_id == album_id))).scalar_one()
             if n == 0:
                 a = await s.get(Album, album_id)
                 if a:
                     await s.delete(a)
+
+
+async def trash_album(s: AsyncSession, album: Album) -> int:
+    """Удалить альбом целиком: каждый трек уходит в корзину тем же `trash_track`, обложка альбома
+    тоже перемещается в `.trash/<date>/` (по той же схеме, что и файлы треков), а строка `Album`
+    удаляется. Возвращает число удалённых треков.
+
+    Обложку переносим ДО треков: `trash_track` после переноса файла вызывает `_remove_empty_dirs`,
+    который считает папку из одного `cover.jpg` пустой и сносит её вместе с обложкой — так что
+    иначе картинка пропала бы безвозвратно. Треки удаляются по одному, переиспользуя всю логику
+    `trash_track`; строку альбома удаляем явно, чтобы она исчезла, даже если треков уже не осталось.
+    """
+    async with library_lock:
+        row = await s.get(Album, album.id, populate_existing=True)
+        if row is None:
+            return 0
+        album_dir = library_abs(album_reldir(row))
+        rows = list((await s.execute(select(Track).where(Track.album_id == row.id))).scalars())
+        day = datetime.now().strftime("%Y-%m-%d")
+        trash_root = get_settings().trash_dir / day
+        cover_path = library_abs(row.cover_path) if row.cover_path else album_dir / "cover.jpg"
+        cover_backup = await asyncio.to_thread(cover_path.read_bytes) if cover_path.is_file() else None
+        cover_dest = trash_root / Path(*PurePosixPath(row.cover_path or
+                                                      (album_reldir(row) / "cover.jpg").as_posix()).parts)
+        files = [(library_abs(t.path), trash_root / Path(*PurePosixPath(t.path).parts)) for t in rows]
+        moved: list[tuple[Path, Path]] = []
+        try:
+            # The database goes first. A commit that fails after the files were moved would leave the library rows
+            # pointing at paths that are no longer there: the album would look present, and neither a re-download nor
+            # a scan could repair it. With the rows deleted first, a failed move is undone by the rollback below and
+            # the files are still where the (restored) rows say they are.
+            for track in rows:
+                await s.delete(track)
+            await s.delete(row)
+            await s.flush()
+            if cover_path.is_file():
+                await asyncio.to_thread(_move, cover_path, cover_dest)
+                moved.append((cover_dest, cover_path))
+            for src, dest in files:
+                if src.is_file():
+                    await asyncio.to_thread(_move, src, dest)
+                    moved.append((dest, src))
+        except Exception:
+            await s.rollback()
+            for dest, src in reversed(moved):
+                try:
+                    if dest.exists() and not src.exists():
+                        await asyncio.to_thread(_move, dest, src)
+                except OSError:
+                    log.exception("failed to restore %s after trash_album failure", src)
+            if cover_backup is not None and not cover_path.exists():
+                try:
+                    await asyncio.to_thread(_write_cover_file, cover_path.parent, cover_backup)
+                except OSError:
+                    log.exception("failed to restore album cover %s", cover_path)
+            raise
+        await asyncio.to_thread(_remove_empty_dirs, album_dir)
+        return len(rows)
 
 
 def purge_trash(days: int) -> int:

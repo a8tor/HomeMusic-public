@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import shutil
 import sqlite3
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from app.config import get_settings
+import shutil
+import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,6 +51,55 @@ def backup_hub_db() -> Path | None:
     for old in sorted(dest_dir.glob("hub-*.sqlite3"))[:-KEEP_BACKUPS]:
         old.unlink(missing_ok=True)
     return dest
+
+
+def prune_old_files(folder: Path, days: int, *, now: float | None = None) -> int:
+    """Deletes files under `folder` not modified for `days` days and then the folders left empty. Returns the number of
+    files removed. A missing folder is not an error: the cache may never have been used."""
+    if not folder.is_dir():
+        return 0
+    limit = (time.time() if now is None else now) - days * 86400
+    removed = 0
+    for dirpath, _dirnames, filenames in os.walk(folder, topdown=False):
+        for name in filenames:
+            f = Path(dirpath) / name
+            try:
+                if f.stat().st_mtime >= limit:
+                    continue
+                f.unlink()
+                removed += 1
+            except OSError as e:
+                log.warning("housekeeping: %s not removed: %s", f, e)
+        # bottom-up: a folder is empty only once its own subfolders are gone
+        if Path(dirpath) != folder:
+            try:
+                Path(dirpath).rmdir()
+            except OSError:
+                pass  # not empty
+    return removed
+
+
+def prune_assistant(days: int, *, now: float | None = None, protected: set[str] | None = None) -> int:
+    """Remove old task images only when no live task or saved assistant card references them."""
+    root = get_settings().data_dir / "assistant"
+    if not root.is_dir():
+        return 0
+    limit = (time.time() if now is None else now) - days * 86400
+    removed = 0
+    protected = protected or set()
+    for d in list(root.iterdir()):
+        if not d.is_dir() or d.is_symlink() or d.name in protected:
+            continue
+        try:
+            files = [f for f in d.rglob("*") if f.is_file() and not f.is_symlink()]
+            newest = max((f.stat().st_mtime for f in files), default=0.0)
+            if not files or newest >= limit:
+                continue
+            shutil.rmtree(d)
+            removed += 1
+        except OSError as e:
+            log.warning("housekeeping: assistant dir %s not removed: %s", d, e)
+    return removed
 
 
 async def smoke_test_providers() -> dict[str, str]:
@@ -80,6 +140,46 @@ async def run_daily() -> None:
         log.info("housekeeping: trash dirs %s, stale uploads %s, cache rows %s, email codes %s removed", n, m, c, e)
     except Exception:
         log.exception("housekeeping failed")
+    # The staging caches are pruned when a copy is made (and after an encode); while nobody listens or encodes they
+    # only grow. Each step is its own try: a stuck cache must not skip the rest.
+    try:
+        from app import listen
+
+        await listen.prune_cache()
+        log.info("housekeeping: shared staging cache pruned (soft limit %s MB)", cfg.storage.listen_max_mb)
+    except Exception:
+        log.exception("staging cache prune failed")
+    try:
+        # yt-dlp keeps its scripts, tokens and fragment indexes here (YTDLP_CACHE_DIR, set by Compose); the path is
+        # not in config.yaml, so it is read the way the provider reads it
+        cache_dir = os.environ.get("YTDLP_CACHE_DIR")
+        if cache_dir:
+            n = await asyncio.to_thread(prune_old_files, Path(cache_dir), cfg.storage.ytdlp_cache_days)
+            log.info("housekeeping: yt-dlp cache %s: %s files removed", cache_dir, n)
+    except Exception:
+        log.exception("yt-dlp cache prune failed")
+    try:
+        from sqlalchemy import select
+        from app.models import AssistantTask, AssistantChat
+        from app.db import session_scope
+        async with session_scope() as s:
+            active = set((await s.execute(select(AssistantTask.id).where(
+                AssistantTask.status.in_(("queued", "extracting", "resolving", "awaiting_confirmation"))))).scalars())
+            chat_rows = (await s.execute(select(AssistantChat.messages))).scalars()
+            image_refs: set[str] = set()
+            for messages in chat_rows:
+                for message in messages or []:
+                    images = message.get("images", []) if isinstance(message, dict) else []
+                    for image in images if isinstance(images, list) else []:
+                        # a raw string: `\d`, not `\\d`, or the reference to an existing image is never found
+                        match = re.search(r"/assistant/(\d+)(?:/|$)", str(image))
+                        if match:
+                            image_refs.add(match.group(1))
+        protected = {str(i) for i in active} | image_refs
+        n = await asyncio.to_thread(prune_assistant, cfg.storage.assistant_days, protected=protected)
+        log.info("housekeeping: assistant image dirs %s removed", n)
+    except Exception:
+        log.exception("assistant image prune failed")
     await smoke_test_providers()
 
 

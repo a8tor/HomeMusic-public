@@ -164,7 +164,45 @@ class AdminUserDetailOut(AdminUserOut):
     recent_downloads: list[AdminDownloadOut] = []
 
 
+class StorageAlbumOut(BaseModel):
+    """An album in the "top by size" list (`id` is the library album, its page is /library/album/:id)."""
+
+    id: int
+    title: str
+    album_artist: str = ""
+    size_bytes: int = 0
+    tracks: int = 0
+
+
+class StorageOut(BaseModel):
+    """Disk and library summary of the admin page (app.storage.overview)."""
+
+    disk_total: int = 0  # bytes of the filesystem holding music_root
+    disk_used: int = 0
+    disk_free: int = 0
+    cache_free: int = 0  # free bytes on the filesystem holding staging
+    cache_limit: int = 0  # shared listen + light cache soft ceiling
+    autodownload_listened: bool = False
+    library_bytes: int = 0  # the source files themselves
+    trash_bytes: int = 0  # deleted but not yet purged
+    uploads_bytes: int = 0  # staging/uploads
+    listen_bytes: int = 0  # staging/listen: the listening copies
+    listen_light_bytes: int = 0  # staging/listen-light: the Opus copies
+    backups_bytes: int = 0  # .backups
+    ytdlp_bytes: int = 0  # YTDLP_CACHE_DIR
+    assistant_bytes: int = 0  # DATA_DIR/assistant: the task images
+    tracks: int = 0
+    albums: int = 0
+    library_tracks_bytes: int = 0  # sum of the tracks' size_bytes
+    tracks_without_size: int = 0  # size_bytes is null: the backfill has not run
+    largest_albums: list[StorageAlbumOut] = []
+
+
 # --- library -----------------------------------------------------------------------------
+
+
+class LibraryPolicyOut(BaseModel):
+    trash_days: int
 
 
 class LibTrackOut(BaseModel):
@@ -208,6 +246,12 @@ class LibAlbumOut(BaseModel):
     has_cover: bool = False
     nd_album_id: str | None = None
     tracks: list[LibTrackOut] | None = None
+
+
+class TracksDeletedOut(BaseModel):
+    """How many tracks a bulk delete moved to the trash (`DELETE /api/library/albums/{id}`)."""
+
+    tracks_deleted: int
 
 
 class AlbumPatchIn(BaseModel):

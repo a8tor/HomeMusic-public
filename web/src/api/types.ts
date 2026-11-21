@@ -98,6 +98,40 @@ export interface AdminUserDetailOut extends AdminUserOut {
   recent_downloads: Array<{ artist: string; title: string; status: string; created_at: string }>;
 }
 
+export interface AdminStorageAlbumOut {
+  id: number;
+  title: string;
+  album_artist: string;
+  size_bytes: number;
+  tracks: number;
+}
+
+export interface AdminStorageOut {
+  disk_total: number;
+  disk_used: number;
+  disk_free: number;
+  cache_free: number;
+  cache_limit: number;
+  autodownload_listened: boolean;
+  library_bytes: number;
+  trash_bytes: number;
+  uploads_bytes: number;
+  listen_bytes: number;
+  listen_light_bytes: number;
+  backups_bytes: number;
+  ytdlp_bytes: number;
+  assistant_bytes: number;
+  tracks: number;
+  albums: number;
+  library_tracks_bytes: number;
+  tracks_without_size: number;
+  largest_albums: AdminStorageAlbumOut[];
+}
+
+export interface LibraryPolicyOut {
+  trash_days: number;
+}
+
 export interface OkOut {
   ok: boolean;
 }

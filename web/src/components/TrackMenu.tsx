@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useAsync } from '../lib/hooks';
 import { createPortal } from 'react-dom';
 import { api } from '../api/client';
 import { setDisliked, useDisliked, type DislikeTarget } from '../lib/dislikes';
@@ -6,7 +7,8 @@ import { STANDALONE } from '../lib/embedded';
 import { addToQueue, next, playNext, stopListening, useListen, type ListenTrack } from '../lib/listen';
 import { canPlayAll } from '../lib/player';
 import { enc, navigate } from '../lib/router';
-import { attempt } from '../lib/ui';
+import { useSession } from '../lib/session';
+import { attempt, confirmDialog } from '../lib/ui';
 import { artistSeed, canWave, startWave, trackSeed } from '../lib/wave';
 import { Icon, type IconName } from './Icon';
 import { PlaylistPicker, type PlaylistPick } from './pickers';
@@ -24,6 +26,9 @@ export interface MenuTrack {
   nd_artist_id?: string | null;
   /** the track for the page player's queue («Играть следующим», «В очередь»); none — not offered */
   listen?: ListenTrack;
+  /** the track is one of our library files (a Hub id, not just a Navidrome one): «Удалить из библиотеки» */
+  inLibrary?: boolean;
+  library_track_id?: number | null;
 }
 
 /** An action a screen adds to the menu (a playlist's «Убрать из плейлиста»). */
@@ -74,6 +79,9 @@ async function addToPlaylist(track: MenuTrack, pick: PlaylistPick): Promise<bool
 
 /** `inPlayer`: opened from a player (the mini player, `/player` and its queue): a wave started here is the player's. */
 function TrackMenu({ track, extra, inPlayer, onClose }: { track: MenuTrack; extra?: MenuExtra[]; inPlayer?: boolean; onClose: () => void }) {
+  const { me } = useSession();
+  const trashPolicy = useAsync((signal) => api.libraryPolicy(signal), []);
+  const trashDays = trashPolicy.data?.trash_days ?? 30;
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
   const trackWave = trackSeed(track);
@@ -98,6 +106,23 @@ function TrackMenu({ track, extra, inPlayer, onClose }: { track: MenuTrack; extr
     void setDisliked(t, !on).then((ok) => {
       if (ok && !on && playing && !next()) stopListening();
     });
+  };
+
+  // Deleting a library file is an admin-only action: the menu never learns who added the track
+  // (TrackOut/LibTrackOut don't carry `added_by`), so a regular user is not offered it here.
+  const libraryId = track.inLibrary ? track.library_track_id : null;
+  const canDelete = !!me.is_admin && libraryId != null;
+  const removeFromLibrary = async () => {
+    if (libraryId == null) return;
+    const ok = await confirmDialog({
+      title: 'Удалить из библиотеки?',
+      body: `«${track.title}» — ${track.artist}\nФайл переместится в корзину и будет удалён через ${trashDays} дней.`,
+      okLabel: 'Удалить',
+      danger: true,
+    });
+    if (!ok) return;
+    const r = await attempt(() => api.deleteTrack(libraryId), 'Удалено из библиотеки');
+    if (r) onClose();
   };
 
   if (picking)
@@ -197,6 +222,14 @@ function TrackMenu({ track, extra, inPlayer, onClose }: { track: MenuTrack; extr
             label={artistDisliked ? `Убрать «Не нравится» с исполнителя` : 'Не нравится исполнитель'}
             hint={track.artist}
             onClick={() => toggle(artist, artistDisliked)}
+          />
+        )}
+        {canDelete && (
+          <MenuItem
+            icon="trash"
+            label="Удалить из библиотеки"
+            hint={`Файл уйдёт в корзину на ${trashDays} дней`}
+            onClick={() => void removeFromLibrary()}
           />
         )}
       </div>

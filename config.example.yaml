@@ -89,3 +89,18 @@ mixes:
 
 analytics:
   exclude_users: []  # Hub user names left out of the admin's totals and taste matrix (a QA account)
+
+storage:
+  # время хранения неиспользуемых копий staging/listen и staging/listen-light; частые прослушивания продлевают
+  listen_keep_s: 10800   # 3 часа
+  # мягкий ОБЩИЙ потолок staging/listen + staging/listen-light, МБ; активные потоки могут временно его превышать
+  # 500 достаточно: Opus-копия вдвое легче источника, а 2500 (старое жёсткое значение) только занимали маленький SSD
+  listen_max_mb: 500
+  # минимальное свободное место на filesystem staging, МБ (если активные файлы не позволяют — лимит мягкий)
+  listen_min_free_mb: 1024
+  # прежнее автоскачивание завершённых wave/economy прослушиваний, выключено по умолчанию
+  autodownload_listened: false
+  # кеш yt-dlp (YTDLP_CACHE_DIR): записи, не тронутые столько дней, удаляются ежедневным обслуживанием
+  ytdlp_cache_days: 7
+  # картинки задач ассистента (DATA_DIR/assistant/<id>): каталоги старше стольких дней удаляются
+  assistant_days: 14

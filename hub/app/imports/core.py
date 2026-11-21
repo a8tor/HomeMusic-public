@@ -8,8 +8,8 @@ Job kinds (all below the user's work in the queue: `PRIORITY_IMPORT`):
 - `import_finish`    — when the downloads are over: the last rewrite, ★ albums and artists, the token goes
 
 Modes: `economy` — playlists and ♥ at once from what the library has, the rest is listened to from the sources
-(the Import page, `playQueue` in the app) and downloaded once listened to (`listened`); `full` — everything is
-downloaded in the background.
+(the Import page, `playQueue` in the app); a track is not persisted after a listen unless the legacy
+`storage.autodownload_listened` is on (`listened`); `full` — everything is downloaded in the background.
 """
 
 from __future__ import annotations
@@ -472,7 +472,10 @@ async def download_all(s: AsyncSession, imp: Import) -> int:
 
 
 async def listened(user_id: int, ref: str) -> None:
-    """A track of an economy import was listened to: download it (the user's own work, not background)."""
+    """An economy listen may queue a download only under the legacy opt-in policy."""
+    from app.config import get_settings
+    if not get_settings().cfg.storage.autodownload_listened:
+        return
     async with session_scope() as s:
         rows = (await s.execute(
             select(ImportItem, ImportCollection, Import)

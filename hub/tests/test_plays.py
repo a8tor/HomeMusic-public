@@ -518,6 +518,57 @@ async def test_dislikes_api_tracks_and_artists(env):
     assert [(e.kind, e.target_type) for e in await stored()][-2:] == [("undislike", "track"), ("undislike", "artist")]
 
 
+async def test_play_counters_are_atomic_and_last_played_at_is_monotonic(env):
+    """One atomic UPDATE per batch; `last_played_at` never goes back; duplicates add nothing."""
+    from app.db import session_scope
+    from app.models import Track
+
+    c = env["client"]
+    now = datetime.now(UTC)
+    earlier = now - timedelta(hours=3)
+    later = now - timedelta(minutes=5)
+    # an older event arrives after a newer one in the same batch: the counter adds 2, the timestamp is the newer one
+    assert (await post(c, ev("start", nd_song_id="ndK", at=later),
+                       ev("start", nd_song_id="ndK", at=earlier)))["accepted"] == 2
+    async with session_scope() as s:
+        t = (await s.execute(select(Track).where(Track.nd_song_id == "ndK"))).scalar_one()
+        assert t.play_count == 2
+        assert t.last_played_at == later.replace(tzinfo=None)
+        first = t.last_played_at
+    # a duplicate event_id is not counted again
+    dup = ev("start", nd_song_id="ndK", at=now)
+    assert (await post(c, dup))["accepted"] == 1
+    assert (await post(c, dup))["duplicates"] == 1
+    async with session_scope() as s:
+        t = (await s.execute(select(Track).where(Track.nd_song_id == "ndK"))).scalar_one()
+        assert t.play_count == 3 and t.last_played_at > first
+    # a listen of a much earlier time does not rewind `last_played_at`
+    async with session_scope() as s:
+        newest = (await s.execute(select(Track.last_played_at).where(Track.nd_song_id == "ndK"))).scalar_one()
+    assert (await post(c, ev("start", nd_song_id="ndK", at=now - timedelta(days=2))))["accepted"] == 1
+    async with session_scope() as s:
+        t = (await s.execute(select(Track).where(Track.nd_song_id == "ndK"))).scalar_one()
+        assert t.play_count == 4 and t.last_played_at == newest
+
+
+async def test_superseded_scrobble_does_not_lose_the_play(env):
+    """A scrobble counted at import and then replaced by the app's own finish counts exactly once."""
+    from app.db import session_scope
+    from app.models import Track
+    from app.plays import sync_navidrome
+
+    c, state = env["client"], env["state"]
+    now = datetime.now(UTC)
+    state["scrobbles"] = [{"id": 11, "mediaFileId": "ndK", "submissionTime": int((now - timedelta(minutes=10)).timestamp())}]
+    assert await sync_navidrome() == 1
+    async with session_scope() as s:
+        assert (await s.execute(select(Track.play_count).where(Track.nd_song_id == "ndK"))).scalar_one() == 1
+    # the app was offline and now sends the same listen: its finish supersedes the scrobble but still counts
+    await post(c, ev("finish", nd_song_id="ndK", at=now - timedelta(minutes=8), position_s=245, duration_s=245))
+    async with session_scope() as s:
+        assert (await s.execute(select(Track.play_count).where(Track.nd_song_id == "ndK"))).scalar_one() == 1
+
+
 async def test_navidrome_scrobbles_become_finishes_without_doubles(env):
     from app.plays import sync_navidrome
 

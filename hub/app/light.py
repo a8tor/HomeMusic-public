@@ -12,7 +12,8 @@ finished in the background, and that answer is flagged ("pending"). Bytes of the
 one cache entry of a client, so for `STICKY_S` after such an answer the same source keeps getting the original.
 
 ffmpeg runs a few at a time (`ENCODERS`), at a low CPU priority, and a background encode yields to one a user waits
-for (`app.net.PrioritySemaphore`). The copies are kept least recently used out, up to `MAX_BYTES`.
+for (`app.net.PrioritySemaphore`). The copies share the soft byte budget of the listening cache (`app.cache_policy`):
+they are evicted by demand and age together with `staging/listen`, never while an encode is writing them.
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ log = logging.getLogger(__name__)
 LIGHT_DIR = "listen-light"  # under staging
 LIGHT_KBPS = 160
 HEAVY_KBPS = 192  # a file above this is re-encoded
-MAX_BYTES = 2500 * 2**20
+# No separate ceiling: these copies and `staging/listen` share one soft budget (`storage.listen_max_mb`, a soft
+# limit an active stream may briefly exceed) through `app.cache_policy`.
 ENCODERS = get_settings().light_encoders  # configurable; background work leaves one slot for a waiting user request
 WAIT_S = 1.5  # a stream waits this long for a copy that is not ready, then serves the original
 WAIT_AHEAD_S = 25.0  # a track loaded ahead (nobody waits for its first byte) waits longer
@@ -188,7 +190,7 @@ async def _encode(src: Path, key: str) -> Path:
             raise
         log.info("light %s: %d → %d KB (%.1f s)", src.name, src.stat().st_size // 1024, dest.stat().st_size // 1024,
                  time.monotonic() - t0)
-    await asyncio.to_thread(prune, root(), MAX_BYTES, {k + SUFFIX for k in _jobs} | {dest.name})
+    await asyncio.to_thread(prune_shared, {k + SUFFIX for k in _jobs} | {dest.name})
     return dest
 
 
@@ -214,6 +216,13 @@ async def _ffmpeg(src: Path, out: Path) -> None:
         raise
     if proc.returncode != 0:
         raise RuntimeError(err.decode("utf-8", "replace").strip()[-300:] or f"ffmpeg exited with {proc.returncode}")
+
+
+def prune_shared(busy: set[str] | None = None) -> None:
+    """Prune both audio caches under the one shared soft budget; the encodes in flight stay."""
+    from app import cache_policy
+    protected = {root() / name for name in (busy or ())}
+    cache_policy.prune_roots([root(), root().parent / "listen"], protected)
 
 
 def prune(folder: Path, max_bytes: int, busy: set[str] | None = None) -> None:

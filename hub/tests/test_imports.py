@@ -288,10 +288,16 @@ async def test_economy_import_likes_and_playlists_in_order(env):
     assert len(stars["subjects"]) == 3 and all(x["provenance"] == "import" for x in stars["subjects"])
     assert await jobs("download_item") == []
 
-    # listened to: downloaded now (the user's own work), quietly, ♥ by the download. The app's `start` of it
-    # counts (it may play the file from its precache, which asked the stream as `X-HomeMusic-Prefetch`)
+    # A listen no longer fills the library by default: a small SSD keeps the catalog as a stream/cache, while an
+    # explicit download or a ♥ remains a persistent import. The legacy behavior is opt-in through config.
     r = await c.post("/api/plays/events", json={"events": [{
         "event_id": "s1", "ts": "2026-10-23T10:00:00Z", "kind": "start", "ref": "dz:100", "client": "app/1.6.0"}]})
+    assert r.json()["accepted"] == 1
+    assert await jobs("download_item") == []
+    from app.config import get_settings
+    get_settings().cfg.storage.autodownload_listened = True
+    r = await c.post("/api/plays/events", json={"events": [{
+        "event_id": "s2", "ts": "2026-10-23T10:01:00Z", "kind": "start", "ref": "dz:100", "client": "app/1.6.0"}]})
     assert r.json()["accepted"] == 1
     [job] = await jobs("download_item")
     assert job.priority == 0

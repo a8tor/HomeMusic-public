@@ -57,6 +57,8 @@ class ImportSpec(BaseModel):
     codec: str | None = None
     warnings: list[str] = []
     added_by: int | None = None
+    added_by_username: str | None = None  # snapshot of the author's name (survives the user's deletion)
+    origin: str | None = None  # how the file got in: download/upload/import/external
     force: bool = False  # explicit re-download: keep the old file, add a "[vN]" version next to it
 
 
@@ -201,6 +203,8 @@ async def import_file(s: AsyncSession, src: Path, spec: ImportSpec) -> Track:
             fingerprint=fingerprint(spec.artist, spec.title),
             warnings=list(spec.warnings),
             added_by=spec.added_by,
+            added_by_username=spec.added_by_username,
+            origin=spec.origin,
         )
 
         await asyncio.to_thread(
@@ -219,6 +223,10 @@ async def import_file(s: AsyncSession, src: Path, spec: ImportSpec) -> Track:
             album.cover_path = (album_dir_rel / "cover.jpg").as_posix()
 
         track.path = PurePosixPath(album_dir_rel, dest.name).as_posix()
+        # the file is in place now: record its size (reuse editor's helper; imported lazily — editor imports this module)
+        from app.library.editor import file_size
+
+        track.size_bytes = file_size(dest)
         s.add(track)
         await s.flush()
         log.info("imported %s", track.path, extra={"user_id": spec.added_by})

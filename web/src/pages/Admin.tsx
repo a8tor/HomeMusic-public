@@ -1,9 +1,9 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import { api } from '../api/client';
-import type { AdminUserOut, InviteOut } from '../api/types';
+import type { AdminStorageOut, AdminUserOut, InviteOut } from '../api/types';
 import { Icon } from '../components/Icon';
-import { Button, Empty, ErrorState, Field, IconButton, PageHeader, SectionTitle, Segmented, Sheet, SkeletonRows, cx } from '../components/ui';
-import { fmtDate, fmtUsd, fmtWhen, parseTime, plural } from '../lib/format';
+import { Button, Empty, ErrorState, Field, IconButton, Notice, PageHeader, ProgressBar, SectionTitle, Segmented, Sheet, SkeletonRows, cx } from '../components/ui';
+import { fmtDate, fmtSize, fmtUsd, fmtWhen, parseTime, plural, tracksWord } from '../lib/format';
 import { useAsync } from '../lib/hooks';
 import { Link } from '../lib/router';
 import { useSession } from '../lib/session';
@@ -20,6 +20,7 @@ const DAYS = [
 export function AdminPage() {
   const users = useAsync((s) => api.adminUsers(s), []);
   const invites = useAsync((s) => api.invites(s), []);
+  const storage = useAsync((s) => api.adminStorage(s), []);
   const [creating, setCreating] = useState(false);
   const [shown, setShown] = useState<InviteOut>();
 
@@ -43,7 +44,7 @@ export function AdminPage() {
   return (
     <div className="pb-6">
       {/* in the app the page is opened from its settings: the system back leaves it */}
-      <PageHeader title="Пользователи" back={EMBEDDED ? undefined : '/more'} right={<IconButton icon="refresh" label="Обновить" onClick={() => (users.reload(true), invites.reload(true))} />} />
+      <PageHeader title="Пользователи" back={EMBEDDED ? undefined : '/more'} right={<IconButton icon="refresh" label="Обновить" onClick={() => (users.reload(true), invites.reload(true), storage.reload(true))} />} />
 
       <ul className="mx-4 mb-3 overflow-hidden rounded-xl bg-surface">
         <InsightLink to="/admin/insights" icon="history" title="Аналитика пользователей" sub="прослушивания, миксы, волна по пользователям" />
@@ -57,6 +58,8 @@ export function AdminPage() {
           <Tile label="Песен всего" value={String(d.library_tracks)} />
         </div>
       )}
+
+      {storage.data && <StorageBlock s={storage.data} />}
 
       <SectionTitle
         right={
@@ -156,6 +159,72 @@ function Tile({ label, value }: { label: string; value: string }) {
       <div className="truncate text-lg font-bold">{value}</div>
       <div className="truncate text-[11px] text-muted">{label}</div>
     </div>
+  );
+}
+
+const ALBUM_WORD: [string, string, string] = ['альбом', 'альбома', 'альбомов'];
+
+/** Диск и библиотека: занятое место, разбивка по каталогам и топ альбомов по размеру. */
+function StorageBlock({ s }: { s: AdminStorageOut }) {
+  const used = s.disk_total ? s.disk_used / s.disk_total : 0;
+  const dirs: Array<[string, number]> = [
+    ['Библиотека', s.library_bytes],
+    ['Корзина', s.trash_bytes],
+    ['Кеш прослушивания', s.listen_bytes],
+    ['Opus-кеш', s.listen_light_bytes],
+    ['Загрузки (staging)', s.uploads_bytes],
+    ['Бэкапы', s.backups_bytes],
+    ['yt-dlp', s.ytdlp_bytes],
+    ['Ассистент', s.assistant_bytes],
+  ];
+  return (
+    <>
+      <SectionTitle>Диск и библиотека</SectionTitle>
+      <div className="mx-4 rounded-xl bg-surface p-4">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-sm font-semibold">Занято на диске</span>
+          <span className="text-sm text-muted">{Math.round(used * 100)}%</span>
+        </div>
+        <ProgressBar value={used} className="mt-2" />
+        <p className="mt-1.5 text-xs text-muted">
+          занято {fmtSize(s.disk_used)} из {fmtSize(s.disk_total)}, свободно {fmtSize(s.disk_free)}
+        </p>
+        <p className="mt-1 text-xs text-muted">Кеш на staging: {fmtSize(s.listen_bytes + s.listen_light_bytes)} / {fmtSize(s.cache_limit)} (мягкий лимит), свободно {fmtSize(s.cache_free)}</p>
+        <p className="mt-1 text-xs text-muted">Автоскачивание прослушанного: {s.autodownload_listened ? 'включено' : 'выключено'}</p>
+        <p className="mt-3 text-sm">
+          Библиотека: {tracksWord(s.tracks)}, {s.albums} {plural(s.albums, ALBUM_WORD)}, {fmtSize(s.library_tracks_bytes)}
+        </p>
+        {s.tracks_without_size > 0 && (
+          <Notice>У {tracksWord(s.tracks_without_size)} не известен размер (бэкфилл не прошёл)</Notice>
+        )}
+        <ul className="mt-3 divide-y divide-line/60 text-sm">
+          {dirs.map(([label, bytes]) => (
+            <li key={label} className="flex items-center justify-between py-1.5">
+              <span className="text-muted">{label}</span>
+              <span className="shrink-0 font-medium tabular-nums">{fmtSize(bytes)}</span>
+            </li>
+          ))}
+        </ul>
+        {s.largest_albums.length > 0 && (
+          <div className="mt-4">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted">Топ по размеру</div>
+            <ul className="mt-1">
+              {s.largest_albums.map((a) => (
+                <li key={a.id} className="border-b border-line/60 last:border-0">
+                  <Link to={`/library/album/${a.id}`} className="flex min-h-11 items-center justify-between gap-2 py-1.5 text-sm hover:bg-fg/5">
+                    <span className="min-w-0 truncate">
+                      <span className="font-medium">{a.title}</span>
+                      {a.album_artist ? <span className="text-muted"> — {a.album_artist}</span> : null}
+                    </span>
+                    <span className="shrink-0 tabular-nums text-muted">{fmtSize(a.size_bytes)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 

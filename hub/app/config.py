@@ -133,6 +133,27 @@ class AnalyticsCfg(BaseModel):
     exclude_users: list[str] = []
 
 
+class StorageCfg(BaseModel):
+    """Disk caches: how much of a small SSD the staging copies may take and how long they live.
+
+    One soft ceiling (`listen_max_mb`) covers both `listen` and `listen-light`: they are one cache of audio a user
+    listened to, not two independent budgets.
+    """
+
+    # a listening copy (staging/listen) lives this long since its last use
+    listen_keep_s: int = Field(default=3 * 3600, ge=0)
+    # soft ceiling of the combined audio caches; active streams can temporarily exceed it
+    listen_max_mb: int = Field(default=500, ge=0)
+    # keep at least this much free on the filesystem holding staging, unless active copies prevent it
+    listen_min_free_mb: int = Field(default=1024, ge=0)
+    # legacy behavior: persist a library download after a wave listen / economy import
+    autodownload_listened: bool = False
+    # yt-dlp's own cache (`YTDLP_CACHE_DIR`): entries untouched for this many days go
+    ytdlp_cache_days: int = Field(default=7, ge=1)
+    # the images of an assistant task (`DATA_DIR/assistant/<id>`): a task older than this many days is not opened again
+    assistant_days: int = Field(default=14, ge=1)
+
+
 class AppConfig(BaseModel):
     """Contents of config.yaml."""
 
@@ -149,6 +170,7 @@ class AppConfig(BaseModel):
     library: LibraryCfg = LibraryCfg()
     mixes: MixesCfg = MixesCfg()
     analytics: AnalyticsCfg = AnalyticsCfg()
+    storage: StorageCfg = StorageCfg()
 
 
 class Settings(BaseSettings):

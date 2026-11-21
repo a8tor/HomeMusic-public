@@ -1,4 +1,5 @@
 import type {
+  AdminStorageOut,
   AdminUserDetailOut,
   AdminUsersOut,
   AlbumCreateIn,
@@ -26,6 +27,7 @@ import type {
   InviteIn,
   InviteOut,
   LibAlbumOut,
+  LibraryPolicyOut,
   LibTrackOut,
   ListenOut,
   LoginIn,
@@ -245,6 +247,8 @@ export const api = {
   // admin
   adminUsers: (signal?: AbortSignal) => request<AdminUsersOut>('GET', '/api/admin/users', { signal }),
   adminUser: (id: number, signal?: AbortSignal) => request<AdminUserDetailOut>('GET', `/api/admin/users/${id}`, { signal }),
+  adminStorage: (signal?: AbortSignal) => request<AdminStorageOut>('GET', '/api/admin/storage', { signal }),
+  libraryPolicy: (signal?: AbortSignal) => request<LibraryPolicyOut>('GET', '/api/library/policy', { signal }),
   invites: (signal?: AbortSignal) => request<InviteOut[]>('GET', '/api/admin/invites', { signal }),
   createInvite: (body: InviteIn) => request<InviteOut>('POST', '/api/admin/invites', { json: body }),
   deleteInvite: (id: number) => request<OkOut>('DELETE', `/api/admin/invites/${id}`),
@@ -298,6 +302,8 @@ export const api = {
     return request<LibAlbumOut>('PUT', `/api/library/albums/${id}/cover`, { form });
   },
   mergeAlbums: (body: AlbumMergeIn) => request<LibAlbumOut>('POST', '/api/library/albums/merge', { json: body }),
+  /** admin only: every track of the album goes to the trash, the album itself disappears */
+  deleteAlbum: (id: number) => request<{ tracks_deleted: number }>('DELETE', `/api/library/albums/${id}`),
   moveTracks: (body: TracksMoveIn) => request<LibAlbumOut>('POST', '/api/library/tracks/move', { json: body }),
   patchTrack: (id: number, body: TrackPatchIn) =>
     request<LibTrackOut>('PATCH', `/api/library/tracks/${id}`, { json: body }),

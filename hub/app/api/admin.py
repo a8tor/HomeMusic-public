@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import accounts
+from app import accounts, storage
 from app.api.schemas import (
     AdminDownloadOut,
     AdminUserDetailOut,
@@ -22,6 +22,7 @@ from app.api.schemas import (
     AiUsageOut,
     InviteIn,
     InviteOut,
+    StorageOut,
 )
 from app.auth import admin_user, user_navidrome
 from app.db import get_session
@@ -138,6 +139,13 @@ async def users(_: User = Depends(admin_user), s: AsyncSession = Depends(get_ses
     tracks = (await s.execute(select(func.count(Track.id)))).scalar_one()
     return AdminUsersOut(users=out, ai_cost_usd=round(total or 0, 6), ai_cost_30d_usd=round(last30 or 0, 6),
                          library_tracks=tracks)
+
+
+@router.get("/storage", response_model=StorageOut)
+async def storage_summary(_: User = Depends(admin_user), s: AsyncSession = Depends(get_session, scope="function")):
+    # The DB aggregates go through the request's session; the directory walk runs in a thread and the whole answer is
+    # kept 60 s in memory (see app.storage): the walk costs seconds on a big library, the admin page opens often.
+    return StorageOut(**await storage.overview(s))
 
 
 @router.get("/users/{user_id}", response_model=AdminUserDetailOut)

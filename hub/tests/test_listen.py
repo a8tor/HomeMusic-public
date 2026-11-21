@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date
+from pathlib import Path
 
 import httpx
 import pytest
@@ -736,28 +738,65 @@ async def test_file_without_http_audio_plays_from_a_local_copy(env, tmp_path):
 
 
 def test_local_copies_are_pruned(tmp_path, monkeypatch):
+    """The shared budget prunes the oldest copies and never touches one that is in use."""
     import os
     import time
 
-    from app import listen
+    from app import cache_policy
 
     now = time.time()
 
-    def copy(name: str, age_s: float, size: int = 10) -> None:
+    def copy(name: str, age_s: float, size: int = 10) -> Path:
         d = tmp_path / name
         d.mkdir()
-        f = d / "a.m4a"
+        f = d / "stream"
         f.write_bytes(b"x" * size)
         os.utime(f, (now - age_s, now - age_s))
+        return f
 
-    copy("old", listen.LOCAL_KEEP_S + 1)
-    copy("busy", listen.LOCAL_KEEP_S + 1)  # being downloaded again
+    copy("old", 7200)  # past the retention: goes first whatever the budget
+    busy = copy("busy", 7200)  # in use: protected
     copy("b", 3)
     copy("c", 2)
     copy("d", 1)
-    monkeypatch.setattr(listen, "LOCAL_MAX_BYTES", 25)  # room for two copies
-    listen.prune_local(tmp_path, {"busy"}, now)
+
+    class Cfg:
+        # 50 bytes of copies, 30 of them may stay: `old` goes by age, `b` by the budget, the protected `busy`
+        # is counted but never removed
+        listen_max_mb = 30 / 2**20
+        listen_min_free_mb = 0
+        listen_keep_s = 3600
+
+    monkeypatch.setattr(cache_policy, "get_settings",
+                        lambda: type("S", (), {"cfg": type("C", (), {"storage": Cfg})(),
+                                               "staging_dir": tmp_path, "db_path": tmp_path / "none.db"})())
+    cache_policy.prune_roots([tmp_path], {busy})
     assert sorted(p.name for p in tmp_path.iterdir()) == ["busy", "c", "d"]
+
+
+def test_prune_skips_symlinks_outside_the_cache(tmp_path, monkeypatch):
+    """A symlink in the cache must not make the pruner delete a file of the library."""
+    from app import cache_policy
+
+    outside = tmp_path.parent / "library-file.mp3"
+    outside.write_bytes(b"x" * 100)
+    root = tmp_path / "staging" / "listen"
+    (root / "ref").mkdir(parents=True)
+    (root / "ref" / "stream").write_bytes(b"x" * 100)
+    os.symlink(outside, root / "ref" / "linked.mp3")
+
+    class Cfg:
+        listen_max_mb = 0
+        listen_min_free_mb = 0
+        listen_keep_s = 0
+
+    monkeypatch.setattr(cache_policy, "get_settings",
+                        lambda: type("S", (), {"cfg": type("C", (), {"storage": Cfg})(),
+                                               "staging_dir": tmp_path / "staging",
+                                               "db_path": tmp_path / "none.db"})())
+    cache_policy.prune_roots([root])
+    assert outside.is_file() and outside.read_bytes() == b"x" * 100
+    assert not (root / "ref" / "stream").exists()
 
 
 async def test_file_listened_to_is_downloaded_by_its_ref(env):

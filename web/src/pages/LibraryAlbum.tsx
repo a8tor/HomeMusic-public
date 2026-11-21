@@ -11,17 +11,22 @@ import { TrackMenuButton } from '../components/TrackMenu';
 import { listen, listenAll, type ListenTrack } from '../lib/listen';
 import { canPlay, playList } from '../lib/player';
 import { navigate } from '../lib/router';
+import { useSession } from '../lib/session';
 import { attempt, confirmDialog, toast } from '../lib/ui';
 import { ReleaseTypeSelect } from './Library';
 
 const RELEASE_TYPES: ReleaseType[] = ['album', 'single', 'ep', 'compilation'];
 
 export function LibraryAlbumPage({ id }: { id: number }) {
+  const { me } = useSession();
   const res = useAsync((s) => api.libAlbum(id, s), [id]);
+  const trashPolicy = useAsync((s) => api.libraryPolicy(s), []);
+  const trashDays = trashPolicy.data?.trash_days ?? 30;
   const [coverRev, setCoverRev] = useState(() => Date.now());
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [picker, setPicker] = useState<'move' | 'merge' | null>(null);
   const [pickBusy, setPickBusy] = useState(false);
+  const [delBusy, setDelBusy] = useState(false);
   const [editTrack, setEditTrack] = useState<LibTrackOut | null>(null);
 
   if (res.loading)
@@ -96,7 +101,7 @@ export function LibraryAlbumPage({ id }: { id: number }) {
   const deleteTrack = async (t: LibTrackOut) => {
     const ok = await confirmDialog({
       title: 'Удалить трек?',
-      body: `«${t.title}» — ${t.artist}\nФайл переместится в корзину и будет удалён через 30 дней.`,
+      body: `«${t.title}» — ${t.artist}\nФайл переместится в корзину и будет удалён через ${trashDays} дней.`,
       okLabel: 'Удалить',
       danger: true,
     });
@@ -106,6 +111,49 @@ export function LibraryAlbumPage({ id }: { id: number }) {
       res.setData((prev) => (prev ? { ...prev, track_count: prev.track_count - 1, tracks: (prev.tracks ?? []).filter((x) => x.id !== t.id) } : prev));
       toggle(t.id, false);
     }
+  };
+
+  // admin only: the whole album (all its tracks + cover) into the trash, then back to the library
+  const deleteAlbum = async () => {
+    const n = tracks.length;
+    const ok = await confirmDialog({
+      title: 'Удалить альбом?',
+      body: `Альбом «${album.title}» и все его ${tracksWord(n)} уйдут в корзину и будут удалены через ${trashDays} дней.`,
+      okLabel: 'Удалить',
+      danger: true,
+    });
+    if (!ok) return;
+    const r = await attempt(() => api.deleteAlbum(album.id), `Альбом удалён: ${tracksWord(n)}`);
+    if (r) navigate('/library');
+  };
+
+  // a user may only trash their own tracks: count the accepted and the rejected (403) calls
+  const deleteSelected = async () => {
+    const ids = [...selected];
+    const ok = await confirmDialog({
+      title: 'Удалить выбранные?',
+      body: `${tracksWord(ids.length)} уйдут в корзину и будут удалены через ${trashDays} дней.`,
+      okLabel: 'Удалить',
+      danger: true,
+    });
+    if (!ok) return;
+    setDelBusy(true);
+    let done = 0;
+    let denied = 0;
+    for (const tid of ids) {
+      try {
+        await api.deleteTrack(tid);
+        done += 1;
+      } catch {
+        denied += 1;
+      }
+    }
+    setDelBusy(false);
+    setSelected(new Set());
+    if (denied === 0) toast(`Удалено: ${tracksWord(done)}`, 'success');
+    else if (done === 0) toast(`Не удалось удалить: ${tracksWord(denied)} (их добавил другой пользователь)`, 'error');
+    else toast(`Удалено: ${tracksWord(done)}, отклонено: ${denied}`, 'info');
+    res.reload(true);
   };
 
   return (
@@ -120,6 +168,9 @@ export function LibraryAlbumPage({ id }: { id: number }) {
               refId={album.deezer_album_id ? `dz:${album.deezer_album_id}` : null}
               title={album.title} data={{ name: album.title, artist: album.album_artist }} />
             <IconButton icon="merge" label="Объединить с другим альбомом" onClick={() => setPicker('merge')} />
+            {me.is_admin && (
+              <IconButton icon="trash" label="Удалить альбом" className="text-dim hover:text-danger" onClick={() => void deleteAlbum()} />
+            )}
           </>
         }
       />
@@ -193,7 +244,7 @@ export function LibraryAlbumPage({ id }: { id: number }) {
                 <IconButton icon="play" label={`Слушать «${t.title}»`} className="!text-accent" size={20} onClick={() => playFrom(t)} />
               )}
               <IconButton icon="trash" label={`Удалить «${t.title}»`} className="text-dim hover:text-danger" size={20} onClick={() => deleteTrack(t)} />
-              {t.nd_song_id && <TrackMenuButton track={{ title: t.title, artist: t.artist, nd_song_id: t.nd_song_id }} className="-ml-2 w-8" />}
+              {t.nd_song_id && <TrackMenuButton track={{ title: t.title, artist: t.artist, nd_song_id: t.nd_song_id, inLibrary: true, library_track_id: t.id }} className="-ml-2 w-8" />}
             </li>
           ))}
         </ul>
@@ -205,6 +256,9 @@ export function LibraryAlbumPage({ id }: { id: number }) {
           <span className="flex-1 whitespace-nowrap text-sm">Выбрано {selected.size}</span>
           <Button small variant="primary" icon="move" className="whitespace-nowrap" onClick={() => setPicker('move')}>
             Перенести в альбом…
+          </Button>
+          <Button small variant="danger" icon="trash" className="whitespace-nowrap" busy={delBusy} onClick={() => void deleteSelected()}>
+            Удалить
           </Button>
         </div>
       )}

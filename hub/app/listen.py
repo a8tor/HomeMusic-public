@@ -47,6 +47,7 @@ import httpx
 from sqlalchemy import select
 
 from app import light
+from app import cache_policy
 from app.catalog.cache import cache_delete, cache_get, cache_set, cache_set_many
 from app.catalog.deezer import CatalogNotFound
 from app.catalog.models import split_ref
@@ -85,8 +86,10 @@ PREFETCH_WORKERS = 3
 PREFETCH_MAX = 40  # tracks per user
 _PLAYABLE_TYPES = ("audio/", "video/")  # googlevideo may label audio-only formats video/*
 LOCAL_DIR = "listen"  # under staging: server copies, and copies of files of sources without plain HTTP audio
-LOCAL_KEEP_S = MEM_TTL_S  # a copy, since its last use
-LOCAL_MAX_BYTES = 500 * 2**20
+# Both limits are tunables (config.yaml, `storage`): a dead copy takes the SSD for no reason, so the daily
+# housekeeping prunes by them too, and the names stay module constants so tests can monkeypatch them.
+# The limits are tunables (config.yaml, `storage`), applied by `app.cache_policy` over this folder and
+# `listen-light` together: a dead copy must not take the SSD for no reason.
 LOCAL_MEDIA_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".opus": "audio/ogg",
                      ".ogg": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac"}
 COPY_NAME = "stream"  # a server copy, in the folder of its ref under LOCAL_DIR
@@ -857,7 +860,7 @@ async def _predownload(c: Choice) -> Path:
     """The local copy of the file (downloaded now, or already). Concurrent callers share one download; a user
     request joining a background one lifts it."""
     if c.local is not None and c.local.is_file():
-        await asyncio.to_thread(os.utime, c.local)  # in use: pruned last
+        await asyncio.to_thread(os.utime, c.local)
         return c.local
     job = _fetching.get(c.ref)
     if job is None:
@@ -884,11 +887,15 @@ async def _fetch_local(ref: str, cand: Candidate) -> Path:
         raise ListenError(404, "Источник отключён")
     t0 = time.monotonic()
     root = get_settings().staging_dir / LOCAL_DIR
-    await asyncio.to_thread(prune_local, root, _busy_dirs() - {_local_name(ref)})
+    await prune_cache()
     dest = root / _local_name(ref)
     try:
         await asyncio.to_thread(dest.mkdir, parents=True, exist_ok=True)
         path = await provider.fetch(cand, dest)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ListenError(502, "Источник сохранил пустую копию")
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise ListenError(502, "Источник сохранил файл вне кеша")
     except Exception as e:
         await asyncio.to_thread(shutil.rmtree, dest, True)
         raise ListenError(502, f"{cand.provider}: {e}") from e
@@ -900,24 +907,54 @@ def _local_name(ref: str) -> str:
     return hashlib.sha1(ref.encode()).hexdigest()[:16]
 
 
-def prune_local(root: Path, busy: set[str], now: float | None = None) -> None:
-    """Copies unused for `LOCAL_KEEP_S` go, and the least recently used ones while all of them take more than
-    `LOCAL_MAX_BYTES`. Copies being downloaded (`busy` folder names) stay."""
-    if not root.is_dir():
-        return
-    now = time.time() if now is None else now
-    dirs: list[tuple[float, int, Path]] = []
-    for d in root.iterdir():
-        if d.name in busy or not d.is_dir():
-            continue
-        files = [f.stat() for f in d.iterdir() if f.is_file()]
-        dirs.append((max((st.st_mtime for st in files), default=0.0), sum(st.st_size for st in files), d))
-    total = sum(size for _, size, _ in dirs)
-    for used, size, d in sorted(dirs, key=lambda x: x[0]):
-        if now - used < LOCAL_KEEP_S and total <= LOCAL_MAX_BYTES:
-            break
-        shutil.rmtree(d, ignore_errors=True)
-        total -= size
+async def prune_cache() -> None:
+    """Prune the shared audio cache (`listen` + `listen-light`) from a stable snapshot of in-flight work.
+
+    Both asyncio dicts are snapshotted on the loop, then the blocking filesystem walk runs in a thread: a prune
+    never races a copy that is being written or read.
+    """
+    root = get_settings().staging_dir / LOCAL_DIR
+    copies = list(_copies.values())
+    fetching = list(_fetching)
+    encodes = list(light._jobs)
+    protected = cache_policy.protected_listen_paths(copies, fetching, root)
+    protected.update(light.copy_path(key) for key in encodes)
+    protected.update(light.copy_path(key).with_name(light.copy_path(key).name + ".part") for key in encodes)
+    await asyncio.to_thread(cache_policy.prune_roots,
+                            [root, get_settings().staging_dir / light.LIGHT_DIR], protected)
+
+
+async def note_demand(refs: list[str]) -> None:
+    """Atomically persist popularity without replacing a concurrently stored candidate snapshot."""
+    from sqlalchemy import func, select, update
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from app.models import CatalogCache, utcnow
+
+    now = utcnow()
+    async with session_scope() as s:
+        for ref in dict.fromkeys(refs):
+            key = _key(ref)
+            payload = func.json_set(
+                CatalogCache.payload_json,
+                "$.v.demand.count",
+                func.coalesce(func.json_extract(CatalogCache.payload_json, "$.v.demand.count"), 0) + 1,
+                "$.v.demand.at", now.isoformat(),
+            )
+            result = await s.execute(update(CatalogCache).where(CatalogCache.key == key).values(
+                payload_json=payload, fetched_at=now,
+                ttl_s=func.max(CatalogCache.ttl_s, KEEP_S)))
+            if not result.rowcount:
+                stmt = sqlite_insert(CatalogCache).values(
+                    key=key, payload_json={"v": {"demand": {"count": 1, "at": now.isoformat()}}},
+                    ttl_s=KEEP_S, fetched_at=now)
+                await s.execute(stmt.on_conflict_do_update(index_elements=[CatalogCache.key], set_={
+                    "payload_json": func.json_set(
+                        CatalogCache.payload_json, "$.v.demand.count",
+                        func.coalesce(func.json_extract(CatalogCache.payload_json, "$.v.demand.count"), 0) + 1,
+                        "$.v.demand.at", now.isoformat()),
+                    "fetched_at": now,
+                    "ttl_s": func.max(CatalogCache.ttl_s, KEEP_S),
+                }))
 
 
 # --- server copies ---------------------------------------------------------------------------------------------
@@ -989,9 +1026,12 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
     t0 = time.monotonic()
     f = None
     try:
-        await asyncio.to_thread(prune_local, cp.path.parent.parent, _busy_dirs())
+        await prune_cache()
         await asyncio.to_thread(cp.path.parent.mkdir, parents=True, exist_ok=True)
-        f = await asyncio.to_thread(open, cp.path, "wb", buffering=0)  # unbuffered: readers see every byte written
+        # Written straight to `path`, not to a `.part` file: streams read the copy while it grows, and on Windows
+        # a file open for reading cannot be renamed. A half-written copy (a crash, a failed download) is simply
+        # started over: a fresh `_Copy` reopens this path with "wb", and the pruner counts it by its mtime.
+        f = await asyncio.to_thread(open, cp.path, "wb", buffering=0)
         drops = 0
         while not cp.done:
             if not _same_file(c.candidate, cp.cand):
@@ -1013,6 +1053,8 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
                     await cp.changed()
                 async for chunk in resp.aiter_raw():
                     await _yield_to_played(cp)
+                    if cp.size is not None and cp.have + len(chunk) > cp.size:
+                        raise ListenError(502, "Источник вернул больше ожидаемого размера")
                     await asyncio.to_thread(_write_all, f, chunk)
                     cp.have += len(chunk)
                     drops = 0
@@ -1026,7 +1068,10 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
             finally:
                 await resp.aclose()
             if cp.size is None or cp.have >= cp.size:
+                if cp.have <= 0 or cp.size is not None and cp.have != cp.size:
+                    raise ListenError(502, "Источник вернул неполную копию")
                 cp.size = cp.have
+                f.flush()
                 cp.done = True
         log.info("listen %s: server copy %d KB (%.1f s%s)", c.ref, cp.have // 1024, time.monotonic() - t0,
                  ", ahead" if cp.prio.background else "")
@@ -1038,8 +1083,13 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
     finally:
         if f is not None:
             f.close()
-        if not cp.done and cp.failed is None:
-            cp.failed = ListenError(503, "Загрузка файла прервана")
+        if not cp.done:
+            try:
+                await asyncio.to_thread(cp.path.unlink, missing_ok=True)
+            except OSError:
+                pass  # open by a reader (Windows): the next download truncates it
+            if cp.failed is None:
+                cp.failed = ListenError(503, "Загрузка файла прервана")
         _stir()
         await asyncio.shield(cp.changed())
 
@@ -1082,8 +1132,11 @@ def _byte_range(header: str | None, size: int) -> tuple[int, int] | Literal[Fals
 async def _from_copy(c: Choice, cp: _Copy, range_header: str | None, *, foreground: bool) -> Media | None:
     """The answer from the server copy; None when the range lies far past what it has (the upstream serves it)."""
     if cp.done:
-        await asyncio.to_thread(os.utime, cp.path)  # in use: pruned last
-        return Media(c, path=cp.path, media_type=cp.media_type)
+        try:
+            await asyncio.to_thread(os.utime, cp.path)  # in use: pruned last
+            return Media(c, path=cp.path, media_type=cp.media_type)
+        except OSError:
+            return None  # pruned from disk: the upstream serves the file
     if cp.size is None:
         return None
     rng = _byte_range(range_header, cp.size)
@@ -1106,17 +1159,25 @@ async def _read_copy(c: Choice, cp: _Copy, first: int, last: int, *, foreground:
         cp.readers += 1
     f = None
     try:
-        f = await asyncio.to_thread(open, cp.path, "rb")
-        while pos <= last:
-            if pos >= cp.have:
-                await cp.until(lambda pos=pos: cp.have > pos or cp.settled())
+        try:
+            f = await asyncio.to_thread(open, cp.path, "rb")
+        except (FileNotFoundError, OSError):
+            f = None  # the copy failed and was removed before this stream opened it: the upstream serves the rest
+        if f is not None:
+            while pos <= last:
                 if pos >= cp.have:
+                    await cp.until(lambda pos=pos: cp.have > pos or cp.settled())
+                    if pos >= cp.have:
+                        break
+                try:
+                    data = await asyncio.to_thread(_read_at, f, pos,
+                                                  min(COPY_CHUNK, cp.have - pos, last + 1 - pos))
+                except (OSError, ValueError):
+                    break  # the file was torn down under the reader: the upstream serves the rest
+                if not data:
                     break
-            data = await asyncio.to_thread(_read_at, f, pos, min(COPY_CHUNK, cp.have - pos, last + 1 - pos))
-            if not data:
-                break
-            yield data
-            pos += len(data)
+                yield data
+                pos += len(data)
     finally:
         if f is not None:
             f.close()
@@ -1233,7 +1294,12 @@ def _key(ref: str) -> str:
 async def _save(c: Choice) -> None:
     if c.kind == "library" or c.transient:
         return
-    await cache_set(_key(c.ref), _payload(c), KEEP_S if c.kind == "full" else KEEP_PREVIEW_S)
+    previous = await cache_get(_key(c.ref))
+    demand = previous.get("demand") if isinstance(previous, dict) else None
+    payload = _payload(c)
+    if demand:
+        payload["demand"] = demand
+    await cache_set(_key(c.ref), payload, KEEP_S if c.kind == "full" else KEEP_PREVIEW_S)
 
 
 def _payload(c: Choice) -> dict:

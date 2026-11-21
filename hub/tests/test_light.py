@@ -197,7 +197,11 @@ async def test_background_job_joined_by_a_request_goes_first(env, fake_encoder):
     await task
 
 
-def test_least_recently_used_copies_go_first(tmp_path):
+def test_least_recently_used_copies_go_first(tmp_path, monkeypatch):
+    """The light copies live under the shared `listen` budget: least requested, oldest first; a `.part` of an encode
+    in flight stays."""
+    from app import cache_policy
+
     now = time.time()
     for i, name in enumerate(["old", "mid", "new"]):
         f = tmp_path / f"{name}.opus"
@@ -210,20 +214,55 @@ def test_least_recently_used_copies_go_first(tmp_path):
     writing.write_bytes(b"x")
     os.utime(writing, (now - 7200, now - 7200))
 
-    light.prune(tmp_path, 250, {"busy.opus.part"})
+    class Cfg:
+        listen_max_mb = 250 / 2**20  # room for two copies
+        listen_min_free_mb = 0
+        listen_keep_s = 3600
+
+    monkeypatch.setattr(cache_policy, "get_settings",
+                        lambda: type("S", (), {"cfg": type("C", (), {"storage": Cfg})(),
+                                               "staging_dir": tmp_path, "db_path": tmp_path / "none.db"})())
+    cache_policy.prune_roots([tmp_path], {writing})
     assert sorted(p.name for p in tmp_path.iterdir()) == ["busy.opus.part", "mid.opus", "new.opus"]
-    light.prune(tmp_path, 100, {"busy.opus.part"})
+
+    class Small(Cfg):
+        listen_max_mb = 100 / 2**20
+
+    monkeypatch.setattr(cache_policy, "get_settings",
+                        lambda: type("S", (), {"cfg": type("C", (), {"storage": Small})(),
+                                               "staging_dir": tmp_path, "db_path": tmp_path / "none.db"})())
+    cache_policy.prune_roots([tmp_path], {writing})
     assert sorted(p.name for p in tmp_path.iterdir()) == ["busy.opus.part", "new.opus"]
 
 
 async def test_copies_are_kept_within_the_limit_least_recently_used_out(env, fake_encoder, monkeypatch):
+    from app import cache_policy
+    from app.config import get_settings
+
     c = env["client"]
-    monkeypatch.setattr(light, "MAX_BYTES", 2 * (len(AUDIO) // 2 + 4) + 50)  # room for two copies
+    real_prune = light.prune_shared
+    monkeypatch.setattr(light, "prune_shared", lambda busy=None: None)  # collect three copies first
     for i in range(3):
         await song(env, f"heavy{i}.mp3", f"nd3{i}")
         r = await c.get("/api/listen/stream", params={"ref": f"nd:nd3{i}", "q": "mobile"})
         assert r.headers[VARIANT] == light.LIGHT
         await asyncio.sleep(0.05)  # distinct times of use
+    assert len([f for f in light.root().iterdir() if f.suffix == light.SUFFIX]) == 3
+
+    real = get_settings()
+
+    class Small:
+        listen_max_mb = (2 * (len(AUDIO) // 2 + 4) + 50) / 2**20  # room for two copies
+        listen_min_free_mb = 0
+        listen_keep_s = 3600
+
+    class S:
+        cfg = type("C", (), {"storage": Small})()
+        staging_dir = real.staging_dir
+        db_path = real.db_path
+
+    monkeypatch.setattr(cache_policy, "get_settings", lambda: S())
+    real_prune({key + light.SUFFIX for key in light._jobs})
     assert len([f for f in light.root().iterdir() if f.suffix == light.SUFFIX]) == 2
 
 

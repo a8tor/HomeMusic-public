@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -155,6 +155,7 @@ class Recorded:
     accepted: int = 0
     duplicates: int = 0
     rejected: list[dict[str, Any]] = field(default_factory=list)
+    accepted_starts: list[str] = field(default_factory=list)
 
 
 async def _track_length(s: AsyncSession, nd_song_id: str, duration_s: float | None) -> timedelta:
@@ -164,14 +165,60 @@ async def _track_length(s: AsyncSession, nd_song_id: str, duration_s: float | No
     return timedelta(seconds=min(float(duration_s or 0), 3600))
 
 
-async def _drop_scrobbles_near(s: AsyncSession, user_id: int, ev: PlayEvent) -> None:
-    """The app's own event of a song replaces a Navidrome scrobble of that very listen imported before it came."""
+async def _bump_play_counters(s: AsyncSession, events: Iterable[tuple[PlayEventIn, str | None, int]]) -> None:
+    """Apply newly inserted listens to library tracks in one atomic UPDATE.
+
+    `events` carries, per accepted event, how many earlier scrobbles it superseded: those were already counted at
+    import and `_drop_scrobbles_near` took them back, so the app's own `finish` counts once when it replaced one.
+    """
+    from app.insights.launches import test_traffic
+
+    counts: dict[str, int] = {}
+    last: dict[str, datetime] = {}
+    for e, nd, replaced in events:
+        is_scrobble = e.client == "navidrome" and e.kind == "finish"
+        # An app `finish` replaces a scrobble of the same listen only when it actually superseded one.
+        replaces_scrobble = e.kind == "finish" and e.client != "navidrome" and replaced > 0
+        if nd and e.target_type == "track" and (e.kind == "start" or is_scrobble or replaces_scrobble) \
+                and not test_traffic(e.client):
+            counts[nd] = counts.get(nd, 0) + 1
+            ts = event_time(e.ts)
+            last[nd] = max(last.get(nd, ts), ts)
+    if not counts:
+        return
+    increment = case(*[(Track.nd_song_id == nd, n) for nd, n in counts.items()], else_=0)
+    incoming = case(*[(Track.nd_song_id == nd, ts) for nd, ts in last.items()], else_=None)
+    latest = case(
+        (Track.last_played_at.is_(None), incoming),
+        (incoming.is_not(None) & (incoming > Track.last_played_at), incoming),
+        else_=Track.last_played_at,
+    )
+    await s.execute(update(Track).where(Track.nd_song_id.in_(list(counts)))
+                    .values(play_count=Track.play_count + increment, last_played_at=latest))
+
+
+async def _drop_scrobbles_near(s: AsyncSession, user_id: int, ev: PlayEvent) -> int:
+    """The app's own event of a song replaces a Navidrome scrobble of that very listen imported before it came.
+
+    Returns how many scrobbles were superseded, so their already-counted plays can be settled by the caller.
+    """
     assert ev.nd_song_id
     w = DEDUP_WINDOW + await _track_length(s, ev.nd_song_id, ev.duration_s)
-    await s.execute(update(PlayEvent).where(
+    rows = list((await s.execute(select(PlayEvent).where(
         PlayEvent.user_id == user_id, PlayEvent.client == "navidrome", PlayEvent.kind == "finish",
-        PlayEvent.nd_song_id == ev.nd_song_id,
-        PlayEvent.ts.between(ev.ts - w, ev.ts + w)).values(superseded_scrobble=True))
+        PlayEvent.nd_song_id == ev.nd_song_id, PlayEvent.superseded_scrobble.is_(False),
+        PlayEvent.ts.between(ev.ts - w, ev.ts + w)))).scalars())
+    if not rows:
+        return 0
+    # Only rows this statement actually flipped are taken back from the counter: a concurrent request that won the
+    # same scrobble must not make its count drop twice.
+    applied = (await s.execute(update(PlayEvent).where(
+        PlayEvent.id.in_([row.id for row in rows]), PlayEvent.superseded_scrobble.is_(False)
+    ).values(superseded_scrobble=True))).rowcount or 0
+    if applied:
+        await s.execute(update(Track).where(Track.nd_song_id == ev.nd_song_id).values(
+            play_count=func.max(Track.play_count - applied, 0)))
+    return applied
 
 
 async def _listening_metadata(s: AsyncSession, e: PlayEventIn, nd: str | None) -> dict[str, Any] | None:
@@ -241,6 +288,7 @@ async def record_events(s: AsyncSession, user_id: int, raw: Iterable[Any], now: 
     now = now or utcnow()
     out = Recorded()
     events: list[PlayEventIn] = []
+    accepted: list[tuple[PlayEventIn, str | None, int]] = []  # (event, nd_song_id, scrobbles it superseded)
     for i, item in enumerate(raw):
         try:
             events.append(PlayEventIn.model_validate(item))
@@ -278,6 +326,9 @@ async def record_events(s: AsyncSession, user_id: int, raw: Iterable[Any], now: 
             out.duplicates += 1
             continue
         out.accepted += 1
+        accepted.append((e, nd, 0))
+        if e.kind == "start" and e.target_type == "track" and ref:
+            out.accepted_starts.append(ref)
         if e.kind in ("like", "unlike"):
             from app.favorites import remember
             from app.api.schemas import FavoriteTarget
@@ -286,7 +337,9 @@ async def record_events(s: AsyncSession, user_id: int, raw: Iterable[Any], now: 
                                              nd_album_id=e.nd_album_id, nd_artist_id=e.nd_artist_id,
                                              target_data=e.target_data))
         if e.kind in PLAY_KINDS and nd and e.client != "navidrome":
-            await _drop_scrobbles_near(s, user_id, PlayEvent(**values))
+            replaced = await _drop_scrobbles_near(s, user_id, PlayEvent(**values))
+            if replaced:
+                accepted[-1] = (e, nd, replaced)
         if e.kind == "dislike":
             await add_dislike(s, user_id, ref=ref if e.target_type == "track" else None, nd_song_id=nd,
                               artist_ref=(ref or f"nd:{e.nd_artist_id}") if e.target_type == "artist" else None,
@@ -308,6 +361,7 @@ async def record_events(s: AsyncSession, user_id: int, raw: Iterable[Any], now: 
             if key not in after_favorites and previous.liked and previous.target_type == "track" and previous.ref:
                 from app.favorites import clear_pending
                 await clear_pending(s, user_id, previous.ref)
+    await _bump_play_counters(s, accepted)
     return out
 
 
@@ -408,6 +462,7 @@ async def import_scrobbles(user: User) -> int:
     async with NavidromeHistory(user.nd_username, decrypt(user.nd_password_enc)) as nd:
         rows = await nd.scrobbles_after(last)
     added = 0
+    counted: list[tuple[PlayEventIn, str | None, int]] = []
     async with session_scope() as s:
         fill = Ids(s)
         for x in rows:
@@ -425,7 +480,13 @@ async def import_scrobbles(user: User) -> int:
                 duration_s=length.total_seconds() or None,
                 client="navidrome", received_at=utcnow(), track_metadata=metadata,
                 superseded_scrobble=superseded).on_conflict_do_nothing())
-            added += (res.rowcount or 0) if not superseded else 0
+            if res.rowcount:
+                added += 1 if not superseded else 0
+                if not superseded:
+                    counted.append((PlayEventIn(event_id=f"nd:{sid}", ts=ts, kind="finish", ref=ref,
+                                                 nd_song_id=song, duration_s=length.total_seconds() or None,
+                                                 client="navidrome"), song, 0))
+        await _bump_play_counters(s, counted)
         sync = await s.get(NavidromeSync, user.id)
         if sync is None:
             sync = NavidromeSync(user_id=user.id, last_scrobble_id=0)

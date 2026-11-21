@@ -528,10 +528,14 @@ async def import_downloaded(item_id: int, user_id: int, q: TrackQuery, meta: dic
         codec=check.info.codec if check.info else None,
         warnings=list(check.warnings or []) + ([warning] if warning else []),
         added_by=user_id,
+        origin="download",
         force=force,
     )
     await update_item(item_id, status="importing")
     async with session_scope() as s:
+        # snapshot the author's name once (added_by is SET NULL if the user is deleted later)
+        spec.added_by_username = (
+            await s.execute(select(User.nd_username).where(User.id == user_id))).scalar_one_or_none()
         track = await import_file(s, path, spec)
         track_id = track.id
     await update_item(item_id, track_id=track_id, warnings=spec.warnings, error=None)
