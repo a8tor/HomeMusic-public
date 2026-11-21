@@ -328,7 +328,7 @@ export function NdAlbumPage({ id }: { id: string }) {
         back="/library"
         right={
           <>
-            <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+            <IconButton icon="share" label="Поделиться" onClick={() => void shareOrCopy(
               shareLines(`${a.title} — ${a.artist}`, shareLink(
                 `/lib/album/${enc(a.id)}`, me.public_hub_url || window.location.origin,
               )),

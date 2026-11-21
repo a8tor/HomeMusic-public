@@ -8,7 +8,7 @@ import { useAsync } from '../lib/hooks';
 import { Link } from '../lib/router';
 import { useSession } from '../lib/session';
 import { EMBEDDED } from '../lib/embedded';
-import { canShare, copyText, shareText } from '../lib/share';
+import { canShare, copyText, shareOrCopy } from '../lib/share';
 import { attempt, confirmDialog, toast } from '../lib/ui';
 
 const DAYS = [
@@ -401,7 +401,7 @@ function InviteSheet({ invite, onClose }: { invite?: InviteOut; onClose: () => v
         <pre className="whitespace-pre-wrap rounded-lg bg-bg p-3 text-left text-xs text-muted">{text}</pre>
         <div className="flex gap-2">
           {canShare() && (
-            <Button variant="primary" icon="send" block onClick={() => void shareText(text)}>
+            <Button variant="primary" icon="share" block onClick={() => void shareOrCopy(text, 'Сообщение скопировано')}>
               Отправить
             </Button>
           )}

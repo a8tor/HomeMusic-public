@@ -84,7 +84,7 @@ export function PlayerPage() {
       <div className="flex min-h-14 items-center gap-1 px-2">
         <IconButton icon="down" label="Свернуть" onClick={() => goBack('/home')} />
         <div className="min-w-0 flex-1 text-center text-xs uppercase tracking-wide text-muted">{contextLabel(context)}</div>
-        <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+        <IconButton icon="share" label="Поделиться" onClick={() => void shareOrCopy(
           shareLines(
             `${track.title} — ${track.artist}${track.year ? ` (${track.year})` : ''}`,
             track.album ? `Альбом: ${track.album}` : null,

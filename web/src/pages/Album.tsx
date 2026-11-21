@@ -138,7 +138,7 @@ export function AlbumPage({ refId }: { refId: string }) {
           {album.cover_url && <img src={album.cover_small_url || album.cover_url} alt="" className="h-full w-full scale-125 object-cover opacity-40 blur-3xl" referrerPolicy="no-referrer" />}
           <div className="absolute inset-0 bg-gradient-to-b from-transparent via-bg/50 to-bg" />
         </div>
-        <Bar overlay right={<IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+        <Bar overlay right={<IconButton icon="share" label="Поделиться" onClick={() => void shareOrCopy(
           shareLines(`${album.title} — ${album.artist}`, shareLink(
             `/album/${enc(album.ref)}`, me.public_hub_url || window.location.origin,
           )),

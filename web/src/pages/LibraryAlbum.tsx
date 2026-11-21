@@ -165,7 +165,7 @@ export function LibraryAlbumPage({ id }: { id: number }) {
         back="/library"
         right={
           <>
-            <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+            <IconButton icon="share" label="Поделиться" onClick={() => void shareOrCopy(
               shareLines(`${album.title} — ${album.album_artist}`, shareLink(
                 `/library/album/${enc(album.id)}`, me.public_hub_url || window.location.origin,
               )),

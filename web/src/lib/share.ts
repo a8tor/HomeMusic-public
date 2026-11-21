@@ -10,22 +10,32 @@ function bridge(): ShareBridge | undefined {
   return (window as unknown as { HomeMusicAndroid?: ShareBridge }).HomeMusicAndroid;
 }
 
-export function canShare(): boolean {
-  return typeof bridge()?.shareText === 'function' || typeof navigator.share === 'function';
+function supportsWebShare(): boolean {
+  if (typeof navigator === 'undefined' || typeof navigator.share !== 'function') return false;
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    return window.matchMedia('(pointer: coarse)').matches;
+  }
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 }
 
-/** Resolves false when the person closed the share sheet. */
+export function canShare(): boolean {
+  return typeof bridge()?.shareText === 'function' || supportsWebShare();
+}
+
+/** Resolves false when the person closed the share sheet; other errors reach the copy fallback. */
 export async function shareText(text: string): Promise<boolean> {
   const b = bridge();
   if (typeof b?.shareText === 'function') {
     b.shareText(text);
     return true;
   }
+  if (!supportsWebShare()) return false;
   try {
     await navigator.share({ text });
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return false;
+    throw error;
   }
 }
 
@@ -68,8 +78,12 @@ export function shareLines(...lines: Array<string | null | undefined>): string {
 
 export async function shareOrCopy(text: string, copiedMessage: string) {
   if (canShare()) {
-    await shareText(text);
-    return;
+    try {
+      if (await shareText(text)) return;
+      return;
+    } catch {
+      // Fall back to copying when the share provider fails for a reason other than cancellation.
+    }
   }
   const copied = await copyText(text);
   toast(copied ? copiedMessage : 'Не удалось скопировать', copied ? 'success' : 'error');

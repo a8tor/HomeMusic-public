@@ -49,6 +49,7 @@ const PATHS = {
   lock: 'M7 11V8a5 5 0 0 1 10 0v3M5 11h14v9H5v-9Z',
   clear: 'M4 7h16M7 12h10M10 17h4',
   paste: 'M9 4h6v3H9V4ZM7 5H5v15h14V5h-2',
+  share: 'M16.3 6.1 7.7 10.9m0 2.2 8.6 4.8M20 5a2 2 0 1 1-4 0 2 2 0 0 1 4 0ZM8 12a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm12 7a2 2 0 1 1-4 0 2 2 0 0 1 4 0Z',
   send: 'M4 12 20 4l-5 16-3.5-6.5L4 12Zm7.5 1.5L20 4',
   transfer: 'M4 8h13m0 0-4-4m4 4-4 4M20 16H7m0 0 4-4m-4 4 4 4',
 } as const;
