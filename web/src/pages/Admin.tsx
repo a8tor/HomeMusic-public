@@ -237,7 +237,15 @@ function ConfigBlock({ value, onSaved }: { value: AdminConfigOut; onSaved: (next
   const save = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
-    const { restart_required: _, ...body } = form;
+    const body = {
+      trash_days: form.trash_days,
+      listen_keep_s: form.listen_keep_s,
+      listen_max_mb: form.listen_max_mb,
+      listen_min_free_mb: form.listen_min_free_mb,
+      ytdlp_cache_days: form.ytdlp_cache_days,
+      assistant_days: form.assistant_days,
+      autodownload_listened: form.autodownload_listened,
+    };
     const next = await attempt(() => api.updateAdminConfig(body), 'Настройки сохранены');
     setBusy(false);
     if (next) onSaved(next);

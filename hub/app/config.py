@@ -306,9 +306,10 @@ def editable_config(s: Settings) -> dict[str, int | bool]:
 
 
 def write_editable_config(path: Path, values: dict[str, int | bool]) -> None:
-    """Atomically update only the admin-editable YAML keys and validate the whole config first."""
+    """Обновляет только разрешённые ключи, проверяя всю конфигурацию до записи."""
     with _CONFIG_WRITE_LOCK:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        data = yaml.safe_load(original) if original is not None else {}
         if not isinstance(data, dict):
             data = {}
         data = dict(data)
@@ -319,19 +320,43 @@ def write_editable_config(path: Path, values: dict[str, int | bool]) -> None:
                 "autodownload_listened",
             )}}
         AppConfig.model_validate(data)
+        text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        tmp_name = None
         try:
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
             with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-                yaml.safe_dump(data, tmp, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                tmp.write(text)
                 tmp.flush()
                 os.fsync(tmp.fileno())
             os.replace(tmp_name, path)
+            tmp_name = None
+            return
+        except OSError:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+        # Rename точки bind-mount запрещён; записываем в смонтированный файл на месте.
+        previous = original
+        if previous is None and path.is_file():
+            previous = path.read_text(encoding="utf-8")
+        try:
+            with path.open("w", encoding="utf-8") as target:
+                target.write(text)
+                target.flush()
+                os.fsync(target.fileno())
         except Exception:
-            try:
-                os.unlink(tmp_name)
-            except FileNotFoundError:
-                pass
+            if previous is not None:
+                try:
+                    with path.open("w", encoding="utf-8") as target:
+                        target.write(previous)
+                        target.flush()
+                        os.fsync(target.fileno())
+                except OSError:
+                    pass
             raise
 
 

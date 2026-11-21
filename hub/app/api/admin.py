@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
@@ -159,8 +160,18 @@ async def config_summary(_: User = Depends(admin_user)):
 @router.put("/config", response_model=AdminConfigOut)
 async def update_config(body: AdminConfigIn, _: User = Depends(admin_user)):
     s = get_settings()
+    path = s.config_file
+    if not path.parent.is_dir():
+        raise HTTPException(500, "Каталог config.yaml недоступен; проверьте mount и права")
+    if path.exists() and not os.access(path, os.W_OK):
+        raise HTTPException(500, "Нет прав на запись config.yaml; проверьте права файла и mount")
     values = body.model_dump()
-    await asyncio.to_thread(write_editable_config, s.config_file, values)
+    try:
+        await asyncio.to_thread(write_editable_config, path, values)
+    except OSError as e:
+        log.exception("Не удалось записать config.yaml")
+        reason = str(e).splitlines()[0][:120] or type(e).__name__
+        raise HTTPException(500, f"Не удалось записать config.yaml: {reason}") from e
     return AdminConfigOut(**values)
 
 
