@@ -9,6 +9,8 @@ import { fmtLength, tracksWord } from '../lib/format';
 import { useHubEvent } from '../lib/events';
 import { useAsync, useRememberScrollX } from '../lib/hooks';
 import { Link, enc, navigate } from '../lib/router';
+import { shareLink, shareLines, shareOrCopy } from '../lib/share';
+import { useSession } from '../lib/session';
 import { attempt, confirmDialog } from '../lib/ui';
 import { useSmartForPage, useSmartPage } from '../lib/smartShuffle';
 import { canWave, seedKey, startWave, useWave } from '../lib/wave';
@@ -312,6 +314,7 @@ export function NdArtistPage({ id }: { id: string }) {
 }
 
 export function NdAlbumPage({ id }: { id: string }) {
+  const { me } = useSession();
   const res = useAsync((s) => api.ndAlbum(id, s), [id]);
   if (res.loading) return (<><PageHeader title="Альбом" back="/library" /><SkeletonRows /></>);
   if (!res.data) return (<><PageHeader title="Альбом" back="/library" /><ErrorState text={res.error ?? 'Альбом не найден'} onRetry={() => res.reload()} /></>);
@@ -323,7 +326,17 @@ export function NdAlbumPage({ id }: { id: string }) {
         title={a.title}
         sub={a.artist}
         back="/library"
-        right={<LikeButton targetType="album" ndId={a.id} title={a.title} data={{ name: a.title, artist: a.artist }} />}
+        right={
+          <>
+            <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+              shareLines(`${a.title} — ${a.artist}`, shareLink(
+                `/lib/album/${enc(a.id)}`, me.public_hub_url || window.location.origin,
+              )),
+              'Ссылка скопирована',
+            )} />
+            <LikeButton targetType="album" ndId={a.id} title={a.title} data={{ name: a.title, artist: a.artist }} />
+          </>
+        }
       />
       <Hero
         cover={a.cover_url?.replace(/size=\d+/, 'size=600')}

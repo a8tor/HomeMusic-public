@@ -1,5 +1,6 @@
 // Handing text to another app (an invite code to a messenger): the Android app's share sheet (bridge
 // `shareText`, app 1.3.0+), the browser's Web Share, or the clipboard.
+import { toast } from './ui';
 
 interface ShareBridge {
   shareText?: (text: string) => void;
@@ -55,4 +56,21 @@ export async function copyText(text: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export function shareLink(path: string, hubUrl = window.location.origin): string {
+  return `${hubUrl.replace(/\/$/, '')}/#${path}`;
+}
+
+export function shareLines(...lines: Array<string | null | undefined>): string {
+  return lines.filter((line): line is string => !!line).join('\n');
+}
+
+export async function shareOrCopy(text: string, copiedMessage: string) {
+  if (canShare()) {
+    await shareText(text);
+    return;
+  }
+  const copied = await copyText(text);
+  toast(copied ? copiedMessage : 'Не удалось скопировать', copied ? 'success' : 'error');
 }

@@ -10,7 +10,8 @@ import { LikeButton } from '../components/LikeButton';
 import { TrackMenuButton } from '../components/TrackMenu';
 import { listen, listenAll, type ListenTrack } from '../lib/listen';
 import { canPlay, playList } from '../lib/player';
-import { navigate } from '../lib/router';
+import { enc, navigate } from '../lib/router';
+import { shareLink, shareLines, shareOrCopy } from '../lib/share';
 import { useSession } from '../lib/session';
 import { attempt, confirmDialog, toast } from '../lib/ui';
 import { ReleaseTypeSelect } from './Library';
@@ -164,6 +165,12 @@ export function LibraryAlbumPage({ id }: { id: number }) {
         back="/library"
         right={
           <>
+            <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+              shareLines(`${album.title} — ${album.album_artist}`, shareLink(
+                `/library/album/${enc(album.id)}`, me.public_hub_url || window.location.origin,
+              )),
+              'Ссылка скопирована',
+            )} />
             <LikeButton targetType="album" ndId={album.nd_album_id}
               refId={album.deezer_album_id ? `dz:${album.deezer_album_id}` : null}
               title={album.title} data={{ name: album.title, artist: album.album_artist }} />

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api/client';
 import type { TrackOut } from '../api/types';
 import { TrackRow, listenTrack } from '../components/catalog';
@@ -12,9 +12,12 @@ import { fmtLength, recordTypeLabel, tracksWord, yearOf } from '../lib/format';
 import { useAsync } from '../lib/hooks';
 import { canPlay, canPlayAll, playList, playTracks } from '../lib/player';
 import { Link, enc, goBack } from '../lib/router';
+import { shareLink, shareLines, shareOrCopy } from '../lib/share';
+import { useSession } from '../lib/session';
 import { attempt, toast } from '../lib/ui';
 
 export function AlbumPage({ refId }: { refId: string }) {
+  const { me } = useSession();
   const [rev, setRev] = useState(0);
   const res = useAsync((s) => api.album(refId, s, rev > 0), [refId, rev]);
   const [dlBusy, setDlBusy] = useState(false);
@@ -135,7 +138,12 @@ export function AlbumPage({ refId }: { refId: string }) {
           {album.cover_url && <img src={album.cover_small_url || album.cover_url} alt="" className="h-full w-full scale-125 object-cover opacity-40 blur-3xl" referrerPolicy="no-referrer" />}
           <div className="absolute inset-0 bg-gradient-to-b from-transparent via-bg/50 to-bg" />
         </div>
-        <Bar overlay />
+        <Bar overlay right={<IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+          shareLines(`${album.title} — ${album.artist}`, shareLink(
+            `/album/${enc(album.ref)}`, me.public_hub_url || window.location.origin,
+          )),
+          'Ссылка скопирована',
+        )} />} />
         <div className="relative flex flex-col items-center px-6 pb-4 text-center">
           <Cover src={album.cover_url} alt={album.title} className="aspect-square w-[min(64vw,260px)] shadow-2xl" icon="disc" />
           <h1 className="mt-4 text-2xl font-extrabold leading-tight">{album.title}</h1>
@@ -201,10 +209,12 @@ export function AlbumPage({ refId }: { refId: string }) {
   );
 }
 
-function Bar({ overlay }: { overlay?: boolean }) {
+function Bar({ overlay, right }: { overlay?: boolean; right?: ReactNode }) {
   return (
     <div className={`pt-safe ${overlay ? 'relative' : 'sticky top-0 z-20 bg-bg/90'} flex h-14 items-center px-2`}>
       <IconButton icon="back" label="Назад" onClick={() => goBack('/search')} className="bg-black/30 !text-white" />
+      <span className="flex-1" />
+      {right}
     </div>
   );
 }

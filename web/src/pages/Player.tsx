@@ -21,6 +21,8 @@ import {
   type ListenTrack,
 } from '../lib/listen';
 import { Link, enc, goBack } from '../lib/router';
+import { shareLink, shareLines, shareOrCopy } from '../lib/share';
+import { useSession } from '../lib/session';
 import { addRec, hideRec } from '../lib/smartShuffle';
 import { canWave, seedKey, startWave, trackSeed, useWave } from '../lib/wave';
 
@@ -28,6 +30,7 @@ import { canWave, seedKey, startWave, trackSeed, useWave } from '../lib/wave';
  * shuffle / repeat, ♥, ⋯ and the queue — a tap plays a track, ↑ moves it up, × takes it out. Inside the app the
  * player is the app's own. */
 export function PlayerPage() {
+  const { me } = useSession();
   const track = useListen((s) => s.track);
   const phase = useListen((s) => s.phase);
   const info = useListen((s) => s.info);
@@ -81,6 +84,16 @@ export function PlayerPage() {
       <div className="flex min-h-14 items-center gap-1 px-2">
         <IconButton icon="down" label="Свернуть" onClick={() => goBack('/home')} />
         <div className="min-w-0 flex-1 text-center text-xs uppercase tracking-wide text-muted">{contextLabel(context)}</div>
+        <IconButton icon="send" label="Поделиться" onClick={() => void shareOrCopy(
+          shareLines(
+            `${track.title} — ${track.artist}${track.year ? ` (${track.year})` : ''}`,
+            track.album ? `Альбом: ${track.album}` : null,
+            track.album_ref ? shareLink(
+              `/album/${enc(track.album_ref)}`, me.public_hub_url || window.location.origin,
+            ) : null,
+          ),
+          'Текст скопирован',
+        )} />
         <TrackMenuButton track={{ ...track, nd_song_id: info?.nd_song_id }} inPlayer />
       </div>
 
