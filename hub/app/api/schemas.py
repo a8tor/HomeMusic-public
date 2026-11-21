@@ -209,7 +209,7 @@ class AdminConfigOut(BaseModel):
     ytdlp_cache_days: int
     assistant_days: int
     autodownload_listened: bool
-    restart_required: bool = True
+    restart_required: bool = False
 
 
 class AdminConfigIn(BaseModel):

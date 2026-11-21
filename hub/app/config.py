@@ -365,3 +365,9 @@ def get_settings() -> Settings:
     s = Settings()
     s.cfg = load_app_config(s.config_file)
     return s
+
+
+def reload_settings() -> Settings:
+    """Перечитать настройки из окружения и config.yaml без перезапуска процесса."""
+    get_settings.cache_clear()
+    return get_settings()

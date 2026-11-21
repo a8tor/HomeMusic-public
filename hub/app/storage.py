@@ -37,6 +37,12 @@ CACHE_TTL_S = 60.0
 _cache: tuple[float, dict[str, Any]] | None = None
 
 
+def invalidate() -> None:
+    """Сбросить сводку, чтобы после изменения config.yaml она пересчиталась сразу."""
+    global _cache
+    _cache = None
+
+
 def _dir_size(root: Path) -> int:
     """Суммарный размер файлов под `root` (рекурсивно, без перехода по символическим ссылкам).
 

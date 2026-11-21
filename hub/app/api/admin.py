@@ -28,7 +28,7 @@ from app.api.schemas import (
     StorageOut,
 )
 from app.auth import admin_user, user_navidrome
-from app.config import editable_config, get_settings, write_editable_config
+from app.config import editable_config, get_settings, reload_settings, write_editable_config
 from app.db import get_session
 from app.library.navidrome import NavidromeAdmin
 from app.models import AiUsage, DownloadItem, Invite, Track, Upload, User, utcnow
@@ -172,7 +172,9 @@ async def update_config(body: AdminConfigIn, _: User = Depends(admin_user)):
         log.exception("Не удалось записать config.yaml")
         reason = str(e).splitlines()[0][:120] or type(e).__name__
         raise HTTPException(500, f"Не удалось записать config.yaml: {reason}") from e
-    return AdminConfigOut(**values)
+    reloaded = await asyncio.to_thread(reload_settings)
+    storage.invalidate()
+    return AdminConfigOut(**editable_config(reloaded), restart_required=False)
 
 
 @router.get("/users/{user_id}", response_model=AdminUserDetailOut)

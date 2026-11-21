@@ -248,7 +248,10 @@ function ConfigBlock({ value, onSaved }: { value: AdminConfigOut; onSaved: (next
     };
     const next = await attempt(() => api.updateAdminConfig(body), 'Настройки сохранены');
     setBusy(false);
-    if (next) onSaved(next);
+    if (next) {
+      setForm(next);
+      onSaved(next);
+    }
   };
   return (
     <>
@@ -261,7 +264,7 @@ function ConfigBlock({ value, onSaved }: { value: AdminConfigOut; onSaved: (next
         <ConfigNumber label="Кеш yt-dlp, дней" value={form.ytdlp_cache_days} onChange={(v) => update('ytdlp_cache_days', v)} />
         <ConfigNumber label="Картинки ассистента, дней" value={form.assistant_days} onChange={(v) => update('assistant_days', v)} />
         <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" className="h-5 w-5 accent-[#1ed760]" checked={form.autodownload_listened} onChange={(e) => update('autodownload_listened', e.target.checked)} /><span>Сохранять прослушанные треки в библиотеку</span></label>
-        <p className="text-xs text-muted">После сохранения перезапустите Hub, чтобы новые значения вступили в силу.</p>
+        <p className="text-xs text-muted">Настройки применяются сразу после сохранения.</p>
         <Button type="submit" variant="primary" block busy={busy}>Сохранить настройки</Button>
       </form>
     </>
