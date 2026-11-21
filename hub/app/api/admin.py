@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import accounts, storage
 from app.api.schemas import (
+    AdminConfigIn,
+    AdminConfigOut,
     AdminDownloadOut,
     AdminUserDetailOut,
     AdminUserOut,
@@ -25,6 +27,7 @@ from app.api.schemas import (
     StorageOut,
 )
 from app.auth import admin_user, user_navidrome
+from app.config import editable_config, get_settings, write_editable_config
 from app.db import get_session
 from app.library.navidrome import NavidromeAdmin
 from app.models import AiUsage, DownloadItem, Invite, Track, Upload, User, utcnow
@@ -146,6 +149,19 @@ async def storage_summary(_: User = Depends(admin_user), s: AsyncSession = Depen
     # The DB aggregates go through the request's session; the directory walk runs in a thread and the whole answer is
     # kept 60 s in memory (see app.storage): the walk costs seconds on a big library, the admin page opens often.
     return StorageOut(**await storage.overview(s))
+
+
+@router.get("/config", response_model=AdminConfigOut)
+async def config_summary(_: User = Depends(admin_user)):
+    return AdminConfigOut(**editable_config(get_settings()))
+
+
+@router.put("/config", response_model=AdminConfigOut)
+async def update_config(body: AdminConfigIn, _: User = Depends(admin_user)):
+    s = get_settings()
+    values = body.model_dump()
+    await asyncio.to_thread(write_editable_config, s.config_file, values)
+    return AdminConfigOut(**values)
 
 
 @router.get("/users/{user_id}", response_model=AdminUserDetailOut)

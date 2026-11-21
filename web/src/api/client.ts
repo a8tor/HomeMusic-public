@@ -1,4 +1,5 @@
 import type {
+  AdminConfigOut,
   AdminStorageOut,
   AdminUserDetailOut,
   AdminUsersOut,
@@ -246,6 +247,9 @@ export const api = {
 
   // admin
   adminUsers: (signal?: AbortSignal) => request<AdminUsersOut>('GET', '/api/admin/users', { signal }),
+  adminConfig: (signal?: AbortSignal) => request<AdminConfigOut>('GET', '/api/admin/config', { signal }),
+  updateAdminConfig: (body: Omit<AdminConfigOut, 'restart_required'>) =>
+    request<AdminConfigOut>('PUT', '/api/admin/config', { json: body }),
   adminUser: (id: number, signal?: AbortSignal) => request<AdminUserDetailOut>('GET', `/api/admin/users/${id}`, { signal }),
   adminStorage: (signal?: AbortSignal) => request<AdminStorageOut>('GET', '/api/admin/storage', { signal }),
   libraryPolicy: (signal?: AbortSignal) => request<LibraryPolicyOut>('GET', '/api/library/policy', { signal }),

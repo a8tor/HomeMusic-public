@@ -132,6 +132,17 @@ export interface LibraryPolicyOut {
   trash_days: number;
 }
 
+export interface AdminConfigOut {
+  trash_days: number;
+  listen_keep_s: number;
+  listen_max_mb: number;
+  listen_min_free_mb: number;
+  ytdlp_cache_days: number;
+  assistant_days: number;
+  autodownload_listened: boolean;
+  restart_required: boolean;
+}
+
 export interface OkOut {
   ok: boolean;
 }

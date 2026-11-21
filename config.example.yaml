@@ -1,4 +1,4 @@
-# HomeMusic Hub settings that are not secrets. Copy to config.yaml (mounted read-only into the hub container).
+# HomeMusic Hub settings that are not secrets. Copy to config.yaml (the admin panel can update retention settings).
 
 sources:
   # Order of providers for downloads and listening. "ru" is used when artist/title contains Cyrillic, the user asked

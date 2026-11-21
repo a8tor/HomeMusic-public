@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 
 import yaml
@@ -284,6 +287,52 @@ def load_app_config(path: Path) -> AppConfig:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return AppConfig.model_validate(data)
     return AppConfig()
+
+
+_CONFIG_WRITE_LOCK = Lock()
+
+
+def editable_config(s: Settings) -> dict[str, int | bool]:
+    cfg = s.cfg
+    return {
+        "trash_days": cfg.library.trash_days,
+        "listen_keep_s": cfg.storage.listen_keep_s,
+        "listen_max_mb": cfg.storage.listen_max_mb,
+        "listen_min_free_mb": cfg.storage.listen_min_free_mb,
+        "ytdlp_cache_days": cfg.storage.ytdlp_cache_days,
+        "assistant_days": cfg.storage.assistant_days,
+        "autodownload_listened": cfg.storage.autodownload_listened,
+    }
+
+
+def write_editable_config(path: Path, values: dict[str, int | bool]) -> None:
+    """Atomically update only the admin-editable YAML keys and validate the whole config first."""
+    with _CONFIG_WRITE_LOCK:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data = dict(data)
+        data["library"] = {**(data.get("library") or {}), "trash_days": values["trash_days"]}
+        data["storage"] = {**(data.get("storage") or {}), **{
+            key: values[key] for key in (
+                "listen_keep_s", "listen_max_mb", "listen_min_free_mb", "ytdlp_cache_days", "assistant_days",
+                "autodownload_listened",
+            )}}
+        AppConfig.model_validate(data)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                yaml.safe_dump(data, tmp, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
 
 
 @lru_cache

@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
 import { api } from '../api/client';
-import type { AdminStorageOut, AdminUserOut, InviteOut } from '../api/types';
+import type { AdminConfigOut, AdminStorageOut, AdminUserOut, InviteOut } from '../api/types';
 import { Icon } from '../components/Icon';
 import { Button, Empty, ErrorState, Field, IconButton, Notice, PageHeader, ProgressBar, SectionTitle, Segmented, Sheet, SkeletonRows, cx } from '../components/ui';
 import { fmtDate, fmtSize, fmtUsd, fmtWhen, parseTime, plural, tracksWord } from '../lib/format';
@@ -21,6 +21,7 @@ export function AdminPage() {
   const users = useAsync((s) => api.adminUsers(s), []);
   const invites = useAsync((s) => api.invites(s), []);
   const storage = useAsync((s) => api.adminStorage(s), []);
+  const config = useAsync((s) => api.adminConfig(s), []);
   const [creating, setCreating] = useState(false);
   const [shown, setShown] = useState<InviteOut>();
 
@@ -44,7 +45,7 @@ export function AdminPage() {
   return (
     <div className="pb-6">
       {/* in the app the page is opened from its settings: the system back leaves it */}
-      <PageHeader title="Пользователи" back={EMBEDDED ? undefined : '/more'} right={<IconButton icon="refresh" label="Обновить" onClick={() => (users.reload(true), invites.reload(true), storage.reload(true))} />} />
+      <PageHeader title="Пользователи" back={EMBEDDED ? undefined : '/more'} right={<IconButton icon="refresh" label="Обновить" onClick={() => (users.reload(true), invites.reload(true), storage.reload(true), config.reload(true))} />} />
 
       <ul className="mx-4 mb-3 overflow-hidden rounded-xl bg-surface">
         <InsightLink to="/admin/insights" icon="history" title="Аналитика пользователей" sub="прослушивания, миксы, волна по пользователям" />
@@ -60,6 +61,7 @@ export function AdminPage() {
       )}
 
       {storage.data && <StorageBlock s={storage.data} />}
+      {config.data && <ConfigBlock value={config.data} onSaved={(next) => config.setData(next)} />}
 
       <SectionTitle
         right={
@@ -226,6 +228,40 @@ function StorageBlock({ s }: { s: AdminStorageOut }) {
       </div>
     </>
   );
+}
+
+function ConfigBlock({ value, onSaved }: { value: AdminConfigOut; onSaved: (next: AdminConfigOut) => void }) {
+  const [form, setForm] = useState(value);
+  const [busy, setBusy] = useState(false);
+  const update = (key: keyof AdminConfigOut, raw: string | boolean) => setForm((prev) => ({ ...prev, [key]: typeof raw === 'boolean' ? raw : Number(raw) }));
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    const { restart_required: _, ...body } = form;
+    const next = await attempt(() => api.updateAdminConfig(body), 'Настройки сохранены');
+    setBusy(false);
+    if (next) onSaved(next);
+  };
+  return (
+    <>
+      <SectionTitle>Настройки хранения</SectionTitle>
+      <form onSubmit={save} className="mx-4 space-y-3 rounded-xl bg-surface p-4">
+        <ConfigNumber label="Корзина, дней" value={form.trash_days} onChange={(v) => update('trash_days', v)} />
+        <ConfigNumber label="Кеш прослушивания, часов" value={Math.round(form.listen_keep_s / 3600)} onChange={(v) => update('listen_keep_s', String(Number(v) * 3600))} />
+        <ConfigNumber label="Общий лимит кеша, МБ" value={form.listen_max_mb} onChange={(v) => update('listen_max_mb', v)} />
+        <ConfigNumber label="Минимум свободного места, МБ" value={form.listen_min_free_mb} onChange={(v) => update('listen_min_free_mb', v)} />
+        <ConfigNumber label="Кеш yt-dlp, дней" value={form.ytdlp_cache_days} onChange={(v) => update('ytdlp_cache_days', v)} />
+        <ConfigNumber label="Картинки ассистента, дней" value={form.assistant_days} onChange={(v) => update('assistant_days', v)} />
+        <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" className="h-5 w-5 accent-[#1ed760]" checked={form.autodownload_listened} onChange={(e) => update('autodownload_listened', e.target.checked)} /><span>Сохранять прослушанные треки в библиотеку</span></label>
+        <p className="text-xs text-muted">После сохранения перезапустите Hub, чтобы новые значения вступили в силу.</p>
+        <Button type="submit" variant="primary" block busy={busy}>Сохранить настройки</Button>
+      </form>
+    </>
+  );
+}
+
+function ConfigNumber({ label, value, onChange }: { label: string; value: number; onChange: (value: string) => void }) {
+  return <Field label={label}><input className="input" type="number" min={0} value={value} onChange={(e) => onChange(e.target.value)} /></Field>;
 }
 
 /** The latest of the Hub's and the player's last activity. */

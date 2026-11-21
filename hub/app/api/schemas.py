@@ -198,6 +198,30 @@ class StorageOut(BaseModel):
     largest_albums: list[StorageAlbumOut] = []
 
 
+# --- admin settings ----------------------------------------------------------------------
+
+
+class AdminConfigOut(BaseModel):
+    trash_days: int
+    listen_keep_s: int
+    listen_max_mb: int
+    listen_min_free_mb: int
+    ytdlp_cache_days: int
+    assistant_days: int
+    autodownload_listened: bool
+    restart_required: bool = True
+
+
+class AdminConfigIn(BaseModel):
+    trash_days: int = Field(ge=1, le=3650)
+    listen_keep_s: int = Field(ge=0, le=31_536_000)
+    listen_max_mb: int = Field(ge=0, le=10_000_000)
+    listen_min_free_mb: int = Field(ge=0, le=10_000_000)
+    ytdlp_cache_days: int = Field(ge=1, le=3650)
+    assistant_days: int = Field(ge=1, le=3650)
+    autodownload_listened: bool
+
+
 # --- library -----------------------------------------------------------------------------
 
 
