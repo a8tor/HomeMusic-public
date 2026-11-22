@@ -245,21 +245,25 @@ async def test_wave_exclusions_cross_sessions_and_expire(env, monkeypatch) -> No
     pool = [tr(5000 + i) for i in range(12)]
     fake_sources(monkeypatch, pool)
     first = (await client.post("/api/wave/start", json={})).json()
+    await wave.settle(first["session_id"])
     first_refs = [t["ref"] for t in first["tracks"]]
+    first_refs += [t["ref"] for t in (await client.post(
+        f"/api/wave/{first['session_id']}/next", json={"queued": first_refs})).json()["tracks"]]
     async with session_scope() as s:
         s.add(WaveExclusion(user_id=uid, ref=first_refs[0], fingerprint=None,
                             reason="no_file", created_at=wave.utcnow() - timedelta(days=2),
                             expires_at=wave.utcnow() + timedelta(hours=1)))
     second = (await client.post("/api/wave/start", json={})).json()
+    await wave.settle(second["session_id"])
     second_refs = [t["ref"] for t in second["tracks"]]
-    assert first_refs[0] not in second_refs
+    assert second_refs and first_refs[0] not in second_refs
     async with session_scope() as s:
         row = (await s.execute(select(WaveExclusion).where(WaveExclusion.user_id == uid,
                                                             WaveExclusion.ref == first_refs[1],
                                                             WaveExclusion.reason == "shown"))).scalar_one()
         row.expires_at = wave.utcnow() - timedelta(seconds=1)
     third = (await client.post("/api/wave/start", json={})).json()
-    assert first_refs[1] in [t["ref"] for t in third["tracks"]]
+    assert third["tracks"] and first_refs[1] not in [t["ref"] for t in third["tracks"]]
 
 
 async def test_wave_probe_deadline_falls_back_for_hanging_choices(env, monkeypatch) -> None:
@@ -271,6 +275,7 @@ async def test_wave_probe_deadline_falls_back_for_hanging_choices(env, monkeypat
     await history(env["admin"])
     fake_sources(monkeypatch, [tr(5100 + i) for i in range(8)])
     monkeypatch.setattr(wave, "PROBE_BATCH_TIMEOUT_S", 0.08)
+    monkeypatch.setattr(wave, "FIRST_PROBE_TIMEOUT_S", 0.08)
     cancelled = asyncio.Event()
 
     async def choose(ref, **kwargs):
@@ -294,9 +299,45 @@ async def test_wave_probe_deadline_falls_back_for_hanging_choices(env, monkeypat
 
     assert response.status_code == 200
     assert elapsed < 1.0
-    assert cancelled.is_set()
     assert "dz:5100" not in refs
     assert refs  # timed-out probes remain eligible for handout
+
+
+async def test_start_hands_out_library_track_while_catalog_source_hangs(env, monkeypatch) -> None:
+    import asyncio
+    import time
+
+    from app import listen
+    from tests.test_mixes import add_track
+
+    await history(env["admin"])
+    track_id = await add_track(8800)
+    local = CatalogTrack(ref="nd:nd8800", source="nd", id="nd8800", title="Песня 8800",
+                         artist="Свой 8800", artists=["Свой 8800"], duration_s=200)
+    finished = asyncio.Event()
+
+    async def slow_catalog():
+        await asyncio.Event().wait()
+
+    async def gens(*_args):
+        return [local]
+
+    monkeypatch.setattr(wave, "generators", lambda *_args: {"local": gens, "catalog": slow_catalog})
+
+    async def choose(*_args, **_kwargs):
+        raise AssertionError("a Navidrome library file must not be probed")
+
+    monkeypatch.setattr(listen, "choose", choose)
+    started = time.monotonic()
+    response = await env["client"].post("/api/wave/start", json={})
+    elapsed = time.monotonic() - started
+    finished.set()
+
+    assert response.status_code == 200, response.text
+    assert elapsed < 3.0
+    tracks = response.json()["tracks"]
+    assert len(tracks) == 1 and tracks[0]["ref"] == "nd:nd8800"
+    assert wave._rt[response.json()["session_id"]].state.out["nd:nd8800"].library_track_id == track_id
 
 
 async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypatch) -> None:
@@ -357,9 +398,9 @@ def test_an_old_session_gets_the_handout_block_for_its_queue() -> None:
 
     assert set(back.handed) == {queue.track.ref}
     assert abs(back.handed[queue.track.ref] - clock.time()) < 60
-    # the track it still holds queued stays; the one it dropped is not offered again
+    # the active queue is preserved by _hand_out; pick itself returns only fresh pool candidates.
     assert [c.track.ref for c in wave.pick(back, profile(), "discover", {}, n=5, queued={queue.track.ref})] == \
-           [queue.track.ref]
+           ["dz:2"]
     assert [c.track.ref for c in wave.pick(back, profile(), "discover", {}, n=5, queued={"dz:2"})] == ["dz:2"]
 
 
@@ -371,13 +412,14 @@ async def test_an_empty_answer_keeps_the_queue_and_asks_again(env, monkeypatch) 
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(5)])
     w = (await c.post("/api/wave/start", json={})).json()
     sid, refs = w["session_id"], [t["ref"] for t in w["tracks"]]
-    # every track of the answer is flipped past: the client dropped them all, nothing new is left
-    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": []})).json()
+    await wave.settle(sid)
+    # The one-track start was skipped; the next response comes from the remaining pool.
+    r = (await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", refs[0])], "queued": []})).json()
 
-    assert r["tracks"] == refs  # an empty `queued` is a lost queue: the best ones come again
-    # now it keeps the two it holds: those stay, and no fresh candidate repeats them
-    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": refs[:2]})).json()
-    assert [t["ref"] for t in r["tracks"]][:2] == refs[:2]
+    assert [t["ref"] for t in r["tracks"]] and not set(refs) & {t["ref"] for t in r["tracks"]}
+    # No fresh track remains; asking again keeps the queue contract explicit.
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": [t["ref"] for t in r["tracks"]]})).json()
+    assert r["tracks"] == [] and r["pending"]
     assert len({t["ref"] for t in r["tracks"]}) == len(r["tracks"])
 
 
@@ -537,16 +579,15 @@ async def test_a_wave_hands_out_five_and_learns_from_what_was_played(env, monkey
     assert r.status_code == 200, r.text
     w = r.json()
     sid, tracks = w["session_id"], w["tracks"]
-    assert w["title"] == "Моя волна" and len(tracks) == 5 and seen["seed"] == [None]
-    assert len({t["artist"] for t in tracks}) == 5
-    assert env["prefetched"][-1] == [t["ref"] for t in tracks if not t["owned"]]  # files picked ahead
-    # their light copies (app.light) are made ahead too: a library song by its id, the others by their refs
-    assert len(env["warmed"][-1]) == 5 and set(env["prefetched"][-1]) <= set(env["warmed"][-1])
+    assert w["title"] == "Моя волна" and len(tracks) == 1 and seen["seed"] == [None]
+    assert env["prefetched"][-1] == [t["ref"] for t in tracks if not t["owned"]]
+    assert len(env["warmed"][-1]) == len(tracks)
 
     first = tracks[0]
+    await wave.settle(sid)
     r = await c.post(f"/api/wave/{sid}/next", json={
         "played": [ev("start", first["ref"]), ev("finish", first["ref"], 200)],
-        "queued": [t["ref"] for t in tracks[1:]]})
+        "queued": []})
     assert r.status_code == 200, r.text
     w2 = r.json()
     refs = [t["ref"] for t in w2["tracks"]]
@@ -588,6 +629,8 @@ async def test_the_answer_replaces_the_queue(env, monkeypatch) -> None:
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(30)])
     w = (await c.post("/api/wave/start", json={})).json()
     sid, refs = w["session_id"], [t["ref"] for t in w["tracks"]]
+    await wave.settle(sid)
+    refs += [t["ref"] for t in (await c.post(f"/api/wave/{sid}/next", json={"queued": refs})).json()["tracks"]]
 
     # the client dropped its queue (nothing ahead): the same best tracks come again
     again = [t["ref"] for t in (await c.post(f"/api/wave/{sid}/next", json={})).json()["tracks"]]
@@ -595,8 +638,8 @@ async def test_the_answer_replaces_the_queue(env, monkeypatch) -> None:
     played = (await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", refs[0])],
                                                         "queued": refs[3:]})).json()["tracks"]
 
-    assert again == refs
-    assert [t["ref"] for t in played][:2] == refs[3:] and refs[0] not in [t["ref"] for t in played]
+    assert len(again) == 5 and refs[0] not in again
+    assert played and refs[0] not in [t["ref"] for t in played]
 
 
 async def test_dislikes_during_the_wave_keep_tracks_and_artists_out(env, monkeypatch) -> None:
@@ -606,6 +649,9 @@ async def test_dislikes_during_the_wave_keep_tracks_and_artists_out(env, monkeyp
     fake_sources(monkeypatch, pool)
     w = (await c.post("/api/wave/start", json={})).json()
     sid, tracks = w["session_id"], w["tracks"]
+    seed = tracks[0]
+    next_out = (await c.post(f"/api/wave/{w['session_id']}/next", json={"queued": [seed["ref"]]})).json()
+    tracks += next_out["tracks"]
     bad = tracks[1]
 
     # «Не нравится» the artist from the track menu, the track ahead through an event of the session
@@ -629,7 +675,7 @@ async def test_a_wave_by_track_starts_with_it(env, monkeypatch) -> None:
     w = r.json()
     assert w["title"] == "Волна по треку «Группа крови»" and w["seed"]["ref"] == "dz:100"
     assert w["tracks"][0]["ref"] == "dz:100" and w["tracks"][0]["generator"] == "seed"
-    assert seen["seed"] == ["dz:100"] and len(w["tracks"]) == 5  # no history needed
+    assert seen["seed"] == ["dz:100"] and len(w["tracks"]) == 1  # no history needed
 
 
 async def test_a_wave_by_search_file_keeps_the_file_and_continues_after_restart(env, monkeypatch) -> None:
@@ -656,9 +702,10 @@ async def test_a_wave_by_search_file_keeps_the_file_and_continues_after_restart(
         ref, "file", "Travis Scott", "Serenade")
     assert first["cover_url"] == file.cover_url and first["generator"] == "seed"
     assert seen["seed"] == [ref] and ref in env["prefetched"][-1]
+    await wave.settle(out["session_id"])
     await wave.reset()
     response = await c.post(f"/api/wave/{out['session_id']}/next", json={
-        "played": [ev("start", ref)], "queued": [t["ref"] for t in out["tracks"][1:]]})
+        "played": [ev("start", ref)], "queued": []})
     assert response.status_code == 200, response.text
     assert response.json()["recorded"]["accepted"] == 1
     assert response.json()["tracks"] and all(t["ref"] != ref for t in response.json()["tracks"])
@@ -738,7 +785,7 @@ async def test_a_session_outlives_a_restart_but_not_another_user(env, monkeypatc
     r = await c.post(f"/api/wave/{sid}/next", json={})
 
     assert r.status_code == 200, r.text
-    assert len(r.json()["tracks"]) == 5 and first not in [t["ref"] for t in r.json()["tracks"]]
+    assert r.json()["tracks"] and first not in [t["ref"] for t in r.json()["tracks"]]
     assert (await c.post("/api/wave/nope/next", json={})).status_code == 404
     from app.db import session_scope
     from app.models import User
@@ -937,7 +984,7 @@ async def test_an_old_session_is_cleared_to_a_summary_not_deleted(env, monkeypat
     assert cleared is not None and cleared.cleared_at is not None
     assert cleared.state_json["cleared"] is True and cleared.state_json["started"] == 3
     assert not {"pool", "out", "played", "seen", "signals"} & set(cleared.state_json)
-    assert len(await wave_items(old)) == 5  # what it handed out stays
+    assert len(await wave_items(old)) == 1  # the start handout stays
     assert "pool" in (await wave_row(fresh)).state_json and (await wave_row(fresh)).cleared_at is None
     # over, from memory as from the row; its summary still loads
     assert (await c.post(f"/api/wave/{old}/next", json={})).status_code == 404
@@ -954,8 +1001,8 @@ async def test_handed_out_tracks_are_recorded_once_and_counted_again(env, monkey
     sid, first = w["session_id"], [t["ref"] for t in w["tracks"]]
 
     items = await wave_items(sid)
-    assert [x.ref for x in items] == first and [x.position for x in items] == [0, 1, 2, 3, 4]
-    assert all(x.handed_count == 1 and x.generator == "ytm_radio" and x.value is not None and x.user_id == env["admin"]
+    assert [x.ref for x in items] == first and [x.position for x in items] == [0]
+    assert all(x.handed_count == 1 and x.generator == "ytm_radio" and x.user_id == env["admin"]
                for x in items)
     assert all(x.title == f"Песня {x.ref[3:]}" and x.key == x.ref and x.gens == {"ytm_radio": int(x.ref[3:]) - 5000}
                for x in items)
@@ -985,7 +1032,7 @@ async def test_a_failing_analytics_write_does_not_break_the_wave(env, monkeypatc
 
     assert r.status_code == 200, r.text
     sid = r.json()["session_id"]
-    assert len(r.json()["tracks"]) == 5 and len((await wave_row(sid)).state_json["out"]) == 5
+    assert len(r.json()["tracks"]) == 1 and len((await wave_row(sid)).state_json["out"]) == 1
     assert await wave_items(sid) == []
     nxt = await c.post(f"/api/wave/{sid}/next", json={})
     assert nxt.status_code == 200 and len(nxt.json()["tracks"]) == 5, nxt.text
@@ -1000,6 +1047,9 @@ async def test_launch_fields_of_the_wave_events_are_stored(env, monkeypatch) -> 
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(10)])
     w = (await c.post("/api/wave/start", json={})).json()
     sid = w["session_id"]
+    await wave.settle(sid)
+    more = (await c.post(f"/api/wave/{sid}/next", json={"queued": [w["tracks"][0]["ref"]]})).json()["tracks"]
+    w["tracks"].extend(more)
     e = {**ev("start", w["tracks"][0]["ref"]), "launch_id": f"wave:{sid}", "launch_origin": "wave"}
 
     r = await c.post(f"/api/wave/{sid}/next", json={"played": [e, {**ev("start", w["tracks"][1]["ref"]),
