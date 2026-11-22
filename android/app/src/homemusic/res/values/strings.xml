@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Бля.Музыка</string>
+    <string name="app_name">@string/app_name_brand</string>
     <!-- Same as the degoogled flavor: the route picker lists UPnP renderers only (no Cast SDK). -->
     <string name="upnp_route_menu_title" translatable="false">Воспроизвести на устройстве</string>
     <!-- The heart button: «Понравившиеся», as in Library. -->

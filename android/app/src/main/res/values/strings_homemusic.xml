@@ -15,7 +15,10 @@
     <string name="homemusic_hub_unreachable">Не удалось открыть Хаб</string>
     <string name="homemusic_pick_files">Выберите файлы</string>
 
-    <string name="homemusic_settings_title">Бля.Музыка</string>
+    <!-- Центральная переменная названия бренда (меняется в одном месте для всего приложения) -->
+    <string name="app_name_brand" translatable="false">Бля.Музыка</string>
+
+    <string name="homemusic_settings_title">@string/app_name_brand</string>
     <string name="homemusic_settings_hub_url">Адрес Хаба</string>
     <string name="homemusic_settings_hub_url_dialog">Адрес Хаба на вашем сервере, например http://music-pc.local:8080</string>
     <string name="homemusic_settings_hub_local_url">Домашний адрес Хаба</string>
@@ -125,7 +128,7 @@
     <string name="homemusic_downloading_to_phone">Скачивается на телефон</string>
 
     <!-- sign-in -->
-    <string name="homemusic_login_title">Бля.Музыка</string>
+    <string name="homemusic_login_title">@string/app_name_brand</string>
     <string name="homemusic_login_server_subtitle">Выберите свой сервер Бля.Музыка</string>
     <string name="homemusic_login_server">Navidrome: IP или адрес сервера</string>
     <string name="homemusic_login_server_helper">Укажите IP или имя ПК в своей сети. Без порта используется 4533.</string>

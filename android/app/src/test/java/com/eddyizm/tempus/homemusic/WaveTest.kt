@@ -282,4 +282,14 @@ class WaveTest {
         val body = JsonParser.parseString(Gson().toJson(mapOf("ref" to "dz:68976317"))).asJsonObject
         assertEquals("dz:68976317", body.get("ref").asString)
     }
+
+    @Test
+    fun isSameSeedIdentifiesCurrentWave() {
+        assertTrue(HubWave.isSameSeed(null, null))
+        assertTrue(HubWave.isSameSeed(emptyMap(), null))
+        assertTrue(HubWave.isSameSeed(mapOf("ref" to "dz:1"), mapOf("ref" to "dz:1")))
+        assertTrue(HubWave.isSameSeed(mapOf("ref" to "dz:1", "by_artist" to true), mapOf("ref" to "dz:1", "by_artist" to "true")))
+        assertFalse(HubWave.isSameSeed(null, mapOf("ref" to "dz:1")))
+        assertFalse(HubWave.isSameSeed(mapOf("ref" to "dz:1"), mapOf("ref" to "dz:2")))
+    }
 }

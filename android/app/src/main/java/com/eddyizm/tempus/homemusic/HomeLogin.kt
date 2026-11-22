@@ -468,7 +468,7 @@ class HomeLogin private constructor(private val fragment: Fragment, private val 
         val local: String? = null
         val account = Server(
             serverId = existing?.serverId ?: UUID.randomUUID().toString(),
-            serverName = existing?.serverName ?: "HomeMusic",
+            serverName = existing?.serverName ?: fragment.getString(R.string.app_name_brand),
             username = user,
             password = password,
             address = server,

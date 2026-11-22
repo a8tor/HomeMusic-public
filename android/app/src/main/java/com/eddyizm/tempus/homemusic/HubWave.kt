@@ -70,6 +70,16 @@ object HubWave {
      * failed: [fallback] when given, else a toast. [origin] — where it was started from ([WaveOrigin]).
      */
     fun start(activity: MainActivity, seed: Map<String, String>?, fallback: Runnable? = null, origin: String? = null) {
+        val wave = session
+        val livePlayer = target.get()?.livePlayer()
+        if (wave != null && livePlayer != null && isSameSeed(wave.seed, seed) && wave.isWave(livePlayer.currentMediaItem?.mediaId)) {
+            if (!livePlayer.isPlaying) {
+                livePlayer.play()
+            }
+            activity.expandBottomSheet()
+            return
+        }
+
         Toast.makeText(activity, R.string.homemusic_wave_starting, Toast.LENGTH_SHORT).show()
         HomeMusic.io.execute {
             val result = runCatching {
@@ -404,5 +414,22 @@ object HubWave {
     private fun cancelRetry() {
         retry?.let(HomeMusic.main::removeCallbacks)
         retry = null
+    }
+
+    fun isSameSeed(s1: Map<String, Any?>?, s2: Map<String, String>?): Boolean {
+        val empty1 = s1.isNullOrEmpty() || s1.values.all { it == null || it == "" }
+        val empty2 = s2.isNullOrEmpty() || s2.values.all { it.isBlank() }
+        if (empty1 && empty2) return true
+        if (empty1 != empty2) return false
+
+        val keys = setOf("ref", "nd_song_id", "artist_ref", "nd_artist_id")
+        for (k in keys) {
+            val v1 = s1?.get(k)?.toString()?.takeIf { it.isNotBlank() }
+            val v2 = s2?.get(k)?.takeIf { it.isNotBlank() }
+            if (v1 != v2) return false
+        }
+        val b1 = s1?.get("by_artist").let { it == true || it == "true" }
+        val b2 = s2?.get("by_artist") == "true"
+        return b1 == b2
     }
 }
