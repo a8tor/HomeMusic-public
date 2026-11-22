@@ -229,9 +229,8 @@ class Settings(BaseSettings):
     # how long a mix build waits for the embedder to embed new candidates, and how often it asks (tests set 0)
     mix_embed_wait_s: float = 180
     mix_poll_s: float = 5
-    # «Моя волна»: how long a request waits for its sources (the first tracks, the radio of a liked track); what
-    # comes later joins the pool in the background
-    wave_wait_s: float = 8
+    # «Моя волна»: maximum total wait per request for sources; late results join the pool in the background
+    wave_wait_s: float = 5
     # local time of the users (the hour a mix is built at); the container itself runs in UTC
     timezone: str = "Europe/Moscow"
 

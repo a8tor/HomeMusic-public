@@ -63,6 +63,8 @@ WAVE_TRANSIENT_TTL = timedelta(minutes=5)
 PICK_TOP_N = 12
 PROBE_CONCURRENCY = 4
 PROBE_BATCH_TIMEOUT_S = 7.0
+SOURCE_WAIT_S = 5.0
+TASTE_TIMEOUT_S = 5.0
 ARTIST_GAP = 8  # an artist at most once in this many tracks
 SEED_ARTIST_GAP = 3  # ... the artist a wave started from: at most once in this many
 POOL_LOW = 25  # fewer candidates left: the pool is refilled in the background
@@ -287,7 +289,10 @@ async def _profile(rt: Runtime, user: User) -> Profile:
         rt.profile = await build_profile(s, user, model=rt.state.taste_model)
     if isinstance(rt.profile, V2Profile):
         from app.mixes.taste_select import prepare
-        await prepare(rt.profile)
+        try:
+            await asyncio.wait_for(prepare(rt.profile), TASTE_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("wave: taste preparation timed out; continuing without taste geometry")
     return rt.profile
 
 
@@ -394,7 +399,10 @@ async def absorb(rt: Runtime, results: list[build.GenResult]) -> int:
     cfg = get_settings().cfg.mixes
     kept = [c for c in fresh.values() if not (rt.blocked and rt.blocked(c)) and build.keep(c, p, cfg)]
     if not isinstance(p, V2Profile):
-        await _sound(p, kept)
+        try:
+            await asyncio.wait_for(_sound(p, kept), TASTE_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("wave: candidate taste scoring timed out; continuing without sound weights")
     for c in kept:
         c.score = build.score(c, weights(), p)
         st.pool[c.track.ref] = c
@@ -428,7 +436,7 @@ async def _gather(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]], enou
     if not gens:
         return
     tasks = {asyncio.create_task(build.run_generators({n: f})) for n, f in gens}
-    deadline = time.monotonic() + get_settings().wave_wait_s
+    deadline = time.monotonic() + min(get_settings().wave_wait_s, SOURCE_WAIT_S)
     pending = tasks
     while pending:
         done, pending = await asyncio.wait(pending, timeout=max(0.0, deadline - time.monotonic()),
@@ -1100,7 +1108,10 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     sid = uuid.uuid4().hex[:16]
     if isinstance(profile, V2Profile):
         from app.mixes.taste_select import prepare, select_profile_seeds
-        await prepare(profile)
+        try:
+            await asyncio.wait_for(prepare(profile), TASTE_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("wave: taste preparation timed out; starting without taste geometry")
         profile_seeds = select_profile_seeds(profile, cfg.seeds, salt=sid)
     else:
         profile_seeds = None
@@ -1150,7 +1161,7 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
 async def next_batch(user: User, sid: str, played: list[Any], queued: list[str]) -> Batch:
     rt = await _runtime(sid, user)
     if not rt.state.pool and rt.tasks:  # nothing to pick from yet: the sources still answer (outside the lock)
-        await asyncio.wait(set(rt.tasks), timeout=get_settings().wave_wait_s)
+        await asyncio.wait(set(rt.tasks), timeout=min(get_settings().wave_wait_s, SOURCE_WAIT_S))
     async with rt.lock:
         async with session_scope() as s:
             recorded, events = await record(s, sid, user.id, played)
@@ -1268,7 +1279,11 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
     values: dict[str, float] = {}
     now = time.time()
     st.prune_handed(now)
-    vectors = await _vectors(rt)
+    try:
+        vectors = await asyncio.wait_for(_vectors(rt), TASTE_TIMEOUT_S)
+    except TimeoutError:
+        log.warning("wave: taste vectors timed out; continuing without taste weights")
+        vectors = {}
     tracks = pick(st, rt.profile, rt.mode, vectors, queued=queued, first=first, values=values)
     if tracks:
         tracks = await _probe_full(rt, tracks, first, vectors,
