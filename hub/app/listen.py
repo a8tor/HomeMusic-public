@@ -201,7 +201,8 @@ _http: httpx.AsyncClient | None = None  # Deezer preview CDN
 _media: httpx.AsyncClient | None = None
 
 
-async def choose(ref: str, *, background: bool = False, stale: Choice | None = None, full_only: bool = False) -> Choice:
+async def choose(ref: str, *, background: bool = False, stale: Choice | None = None, full_only: bool = False,
+                 cancel_resolution_on_cancel: bool = False) -> Choice:
     """The pick for `ref`: in memory, remembered or found now. Concurrent callers share one resolution, which
     also survives the caller going away (the next tap finds it ready). `background`: a prefetch, which yields to
     user requests (a user request joining it lifts it). `stale`: this pick did not open, find another."""
@@ -224,10 +225,16 @@ async def choose(ref: str, *, background: bool = False, stale: Choice | None = N
         job.task.add_done_callback(done)
     elif not background:
         job.prio.foreground()
-    choice = await asyncio.shield(job.task)
+    try:
+        choice = await asyncio.shield(job.task)
+    except asyncio.CancelledError:
+        if cancel_resolution_on_cancel and not job.task.done():
+            job.task.cancel()
+        raise
     if full_only and choice.kind == "preview":
         # A foreground request may have joined an older browser/prefetch resolution.
-        return await choose(ref, background=background, stale=choice, full_only=True)
+        return await choose(ref, background=background, stale=choice, full_only=True,
+                            cancel_resolution_on_cancel=cancel_resolution_on_cancel)
     return choice
 
 

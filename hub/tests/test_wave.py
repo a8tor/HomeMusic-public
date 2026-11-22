@@ -262,6 +262,43 @@ async def test_wave_exclusions_cross_sessions_and_expire(env, monkeypatch) -> No
     assert first_refs[1] in [t["ref"] for t in third["tracks"]]
 
 
+async def test_wave_probe_deadline_falls_back_for_hanging_choices(env, monkeypatch) -> None:
+    import asyncio
+    import time
+
+    from app import listen
+
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(5100 + i) for i in range(8)])
+    monkeypatch.setattr(wave, "PROBE_BATCH_TIMEOUT_S", 0.08)
+    cancelled = asyncio.Event()
+
+    async def choose(ref, **kwargs):
+        if ref == "dz:5100":
+            return listen.Choice(ref, "preview", "Artist", "Title")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def empty_vectors(rt):
+        return {}
+
+    monkeypatch.setattr(listen, "choose", choose)
+    monkeypatch.setattr(wave, "_vectors", empty_vectors)
+    started = time.monotonic()
+    response = await env["client"].post("/api/wave/start", json={})
+    elapsed = time.monotonic() - started
+    refs = [t["ref"] for t in response.json()["tracks"]]
+
+    assert response.status_code == 200
+    assert elapsed < 1.0
+    assert cancelled.is_set()
+    assert "dz:5100" not in refs
+    assert refs  # timed-out probes remain eligible for handout
+
+
 async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypatch) -> None:
     from app import listen
 

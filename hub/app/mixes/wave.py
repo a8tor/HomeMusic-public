@@ -1173,10 +1173,13 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
 
 
 async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand | None,
-                      vectors: dict[str, list[float]] | None = None) -> list[build.Cand]:
+                      vectors: dict[str, list[float]] | None = None,
+                      deadline: float | None = None) -> list[build.Cand]:
     from app import listen
 
     now = time.monotonic()
+    if deadline is None:
+        deadline = now + PROBE_BATCH_TIMEOUT_S
     semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
     for ref, until in list(rt.probe_cooldown.items()):
         if until <= now:
@@ -1185,23 +1188,34 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
              and c.library_track_id is None and c.track.ref not in rt.probe_cooldown]
 
     async def one(c: build.Cand):
-        async with semaphore:
-            try:
-                choice = await listen.choose(c.track.ref, background=True)
+        try:
+            async with semaphore:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                choice = await asyncio.wait_for(
+                    listen.choose(c.track.ref, background=True, cancel_resolution_on_cancel=True), remaining)
                 return c, choice, None
-            except listen.ListenError as e:
-                return c, None, e
-            except Exception as e:
-                return c, None, e
+        except TimeoutError:
+            log.info("wave probe timed out: ref=%s", c.track.ref)
+            return c, None, TimeoutError()
+        except listen.ListenError as e:
+            return c, None, e
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return c, None, e
 
-    if not probe:
+    if not probe or time.monotonic() >= deadline:
         return tracks
-    tasks = [asyncio.create_task(one(c)) for c in probe]
-    done, pending = await asyncio.wait(tasks, timeout=PROBE_BATCH_TIMEOUT_S)
+    async def run_probe(c: build.Cand):
+        return await one(c)
+
+    tasks = [asyncio.create_task(run_probe(c)) for c in probe]
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
     for task in pending:
         task.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
     absent = set()
     transient = set()
@@ -1223,7 +1237,7 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
         rt.state.out.pop(c.track.ref, None)
     await _write_exclusions(rt.user_id, rejected, "no_file", WAVE_NO_FILE_TTL)
     remaining = [c for c in tracks if c.track.ref not in absent]
-    if len(remaining) < BATCH and absent:
+    if len(remaining) < BATCH and absent and time.monotonic() < deadline:
         remaining_fps = {fp_of(c) for c in remaining}
         extras = pick(rt.state, rt.profile, rt.mode, vectors or rt.vectors, n=BATCH - len(remaining),
                       queued=set(), first=first)
@@ -1233,7 +1247,7 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
             remaining.append(c)
             remaining_fps.add(fp_of(c))
         if len(remaining) > len([c for c in tracks if c.track.ref not in absent]):
-            remaining = await _probe_full(rt, remaining, first, vectors)
+            remaining = await _probe_full(rt, remaining, first, vectors, deadline)
     return remaining
 
 
@@ -1257,7 +1271,8 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
     vectors = await _vectors(rt)
     tracks = pick(st, rt.profile, rt.mode, vectors, queued=queued, first=first, values=values)
     if tracks:
-        tracks = await _probe_full(rt, tracks, first, vectors)
+        tracks = await _probe_full(rt, tracks, first, vectors,
+                                   time.monotonic() + PROBE_BATCH_TIMEOUT_S)
     if not tracks and first is None:
         # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
         # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
