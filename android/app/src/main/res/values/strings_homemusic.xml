@@ -16,7 +16,7 @@
     <string name="homemusic_pick_files">Выберите файлы</string>
 
     <!-- Центральная переменная названия бренда (меняется в одном месте для всего приложения) -->
-    <string name="app_name_brand" translatable="false">Бля.Музыка</string>
+    <string name="app_name_brand" translatable="false">Кчау.Музыка</string>
 
     <string name="homemusic_settings_title">@string/app_name_brand</string>
     <string name="homemusic_settings_hub_url">Адрес Хаба</string>
@@ -64,8 +64,8 @@
     <string name="homemusic_notify_task_failed">Ассистент: ошибка</string>
     <string name="homemusic_notify_task_open">Откройте задачу, чтобы узнать подробности</string>
 
-    <string name="homemusic_share_label">Бля.Музыка</string>
-    <string name="homemusic_share_login_first">Сначала войдите в аккаунт Navidrome в Бля.Музыка</string>
+    <string name="homemusic_share_label">Кчау.Музыка</string>
+    <string name="homemusic_share_login_first">Сначала войдите в аккаунт Кчау.Музыка</string>
     <string name="homemusic_share_unsupported">Этот тип файлов не поддерживается. Поделитесь скриншотом, аудиофайлом или ссылкой.</string>
     <string name="homemusic_share_connecting">Подключаюсь к Хабу…</string>
     <plurals name="homemusic_share_sending_images">
@@ -84,12 +84,12 @@
     <string name="homemusic_update_checking">Проверяю обновления…</string>
     <string name="homemusic_update_latest">Установлена последняя версия (%1$s)</string>
     <string name="homemusic_update_failed">Не удалось обновить: %1$s</string>
-    <string name="homemusic_update_title">Доступно обновление Бля.Музыка</string>
+    <string name="homemusic_update_title">Доступно обновление Качу.Музыка</string>
     <string name="homemusic_update_message">Сейчас установлена версия %1$s, доступна %2$s.</string>
     <string name="homemusic_update_install">Установить</string>
     <string name="homemusic_update_later">Позже</string>
     <string name="homemusic_update_skip">Пропустить</string>
-    <string name="homemusic_update_allow_install">Разрешите Бля.Музыка устанавливать приложения и нажмите «Установить» ещё раз</string>
+    <string name="homemusic_update_allow_install">Разрешите Кчау.Музыка устанавливать приложения и нажмите «Установить» ещё раз</string>
     <string name="homemusic_update_size_mib">%1$.2f МиБ</string>
     <string name="homemusic_update_size_kib">%1$.1f КиБ</string>
     <string name="homemusic_update_preparing">Собираю обновление</string>
@@ -129,7 +129,7 @@
 
     <!-- sign-in -->
     <string name="homemusic_login_title">@string/app_name_brand</string>
-    <string name="homemusic_login_server_subtitle">Выберите свой сервер Бля.Музыка</string>
+    <string name="homemusic_login_server_subtitle">Выберите свой сервер Кчау.Музыка</string>
     <string name="homemusic_login_server">Navidrome: IP или адрес сервера</string>
     <string name="homemusic_login_server_helper">Укажите IP или имя ПК в своей сети. Без порта используется 4533.</string>
     <string name="homemusic_login_server_reset">Вернуть адрес по умолчанию</string>

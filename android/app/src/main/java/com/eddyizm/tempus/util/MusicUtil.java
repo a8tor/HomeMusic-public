@@ -75,9 +75,13 @@ public class MusicUtil {
 
         uri.append("&id=").append(id);
 
-        Log.d(TAG, "getStreamUri: " + uri);
+        Log.d(TAG, "getStreamUri: " + redactCredentials(uri.toString()));
 
         return Uri.parse(uri.toString());
+    }
+
+    static String redactCredentials(String uri) {
+        return uri.replaceAll("(?i)([?&](?:u|p|t|s)=)[^&]*", "$1***");
     }
 
     public static Uri getStreamUri(String id) {

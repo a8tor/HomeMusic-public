@@ -168,7 +168,7 @@ class HomeLogin private constructor(private val fragment: Fragment, private val 
         b.hmLoginEmailLayout.isVisible = email
         b.hmLoginCodeLayout.isVisible = next == Step.REGISTER || (email && !awaiting)
         b.hmLoginCodeLayout.hint = str(if (email) R.string.homemusic_login_email_code else R.string.homemusic_login_code)
-        b.hmLoginCodeLayout.placeholderText = if (email) "000000" else "ABCD-EFGH"
+        b.hmLoginCodeLayout.placeholderText = str(if (email) R.string.homemusic_login_email_code_placeholder else R.string.homemusic_login_code_placeholder)
         b.hmLoginCode.inputType = if (email) InputType.TYPE_CLASS_NUMBER
         else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
             InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD

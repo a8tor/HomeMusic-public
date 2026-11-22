@@ -1,7 +1,5 @@
 package com.eddyizm.tempus.ui.fragment.bottomsheetdialog;
 
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.os.Bundle;
@@ -43,6 +41,7 @@ import com.eddyizm.tempus.util.ExternalAudioReader;
 import com.eddyizm.tempus.util.MappingUtil;
 import com.eddyizm.tempus.util.MusicUtil;
 import com.eddyizm.tempus.util.Preferences;
+import com.eddyizm.tempus.util.ShareAction;
 import com.eddyizm.tempus.viewmodel.HomeViewModel;
 import com.eddyizm.tempus.viewmodel.PlaylistPageViewModel;
 import com.eddyizm.tempus.viewmodel.SongBottomSheetViewModel;
@@ -361,20 +360,22 @@ public class SongBottomSheetDialog extends BottomSheetDialogFragment implements 
         goToArtist.setVisibility(songBottomSheetViewModel.getSong().getArtistId() != null ? View.VISIBLE : View.GONE);
 
         TextView share = view.findViewById(R.id.share_text_view);
-        share.setOnClickListener(v -> songBottomSheetViewModel.shareTrack().observe(getViewLifecycleOwner(), sharedTrack -> {
-            if (sharedTrack != null) {
-                ClipboardManager clipboardManager = (ClipboardManager) requireActivity().getSystemService(Context.CLIPBOARD_SERVICE);
-                ClipData clipData = ClipData.newPlainText(getString(R.string.app_name), sharedTrack.getUrl());
-                clipboardManager.setPrimaryClip(clipData);
-                refreshShares();
-                dismissBottomSheet();
-            } else {
-                Toast.makeText(requireContext(), getString(R.string.share_unsupported_error), Toast.LENGTH_SHORT).show();
-                dismissBottomSheet();
-            }
-        }));
+        share.setOnClickListener(v -> songBottomSheetViewModel.shareTrack().observe(getViewLifecycleOwner(), sharedTrack ->
+                ShareAction.complete(sharedTrack, url -> ShareAction.copyToClipboard(requireContext(), url), new ShareAction.Result() {
+                    @Override
+                    public void onSuccess() {
+                        refreshShares();
+                        dismissBottomSheet();
+                    }
 
-        share.setVisibility(Preferences.isSharingEnabled() ? View.VISIBLE : View.GONE);
+                    @Override
+                    public void onError() {
+                        Toast.makeText(requireContext(), R.string.share_unsupported_error, Toast.LENGTH_SHORT).show();
+                        dismissBottomSheet();
+                    }
+                })));
+
+        share.setVisibility(ShareAction.isAvailable(Preferences.isSharingEnabled()) ? View.VISIBLE : View.GONE);
 
         HubTracks.adaptSheet(view, song, this::dismissBottomSheet);
     }

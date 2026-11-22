@@ -1,6 +1,8 @@
 package com.eddyizm.tempus.util;
 
 import static org.junit.Assert.assertEquals;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
@@ -42,16 +44,16 @@ public class LiveDataUtilsTest {
         }
     }
 
+    private PlaylistRepository fakeRepository(MutableLiveData<List<Child>> live) {
+        PlaylistRepository repository = mock(PlaylistRepository.class);
+        when(repository.getPlaylistSongs("pl1")).thenReturn(live);
+        return repository;
+    }
+
     @Test
     public void observePlaylistSongsOnce_invokesActionExactlyOnce() {
         MutableLiveData<List<Child>> live = new MutableLiveData<>();
-
-        PlaylistRepository fakeRepo = new PlaylistRepository() {
-            @Override
-            public MutableLiveData<List<Child>> getPlaylistSongs(String id) {
-                return live;
-            }
-        };
+        PlaylistRepository fakeRepo = fakeRepository(live);
 
         AtomicInteger called = new AtomicInteger(0);
 
@@ -71,13 +73,7 @@ public class LiveDataUtilsTest {
     @Test
     public void observePlaylistSongsOnce_emptyFirstPublishSkipsActionAndRemovesObserver() {
         MutableLiveData<List<Child>> live = new MutableLiveData<>();
-
-        PlaylistRepository fakeRepo = new PlaylistRepository() {
-            @Override
-            public MutableLiveData<List<Child>> getPlaylistSongs(String id) {
-                return live;
-            }
-        };
+        PlaylistRepository fakeRepo = fakeRepository(live);
 
         AtomicInteger called = new AtomicInteger(0);
 

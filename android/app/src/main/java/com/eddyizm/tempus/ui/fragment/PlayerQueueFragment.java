@@ -183,7 +183,7 @@ public class PlayerQueueFragment extends Fragment implements ClickCallback {
         playerSongQueueAdapter = new PlayerSongQueueAdapter(this);
         bind.playerQueueRecyclerView.setAdapter(playerSongQueueAdapter);
         // HomeMusic: ✨ marks the smart shuffle's recommendations; «+» makes one an own song
-        com.eddyizm.tempus.homemusic.HubSmart.INSTANCE.getVersion().observe(getViewLifecycleOwner(), v -> playerSongQueueAdapter.notifyDataSetChanged());
+        com.eddyizm.tempus.homemusic.HubSmart.INSTANCE.getVersion().observe(getViewLifecycleOwner(), v -> playerSongQueueAdapter.refreshRows());
         reapplyPlayback();
 
         playerBottomSheetViewModel.getQueueSong().observe(getViewLifecycleOwner(), queue -> {
@@ -238,14 +238,17 @@ public class PlayerQueueFragment extends Fragment implements ClickCallback {
 
             @Override
             public void onSwiped(@NonNull RecyclerView.ViewHolder viewHolder, int direction) {
-                MediaManager.remove(mediaBrowserListenableFuture, playerSongQueueAdapter.getItems(), viewHolder.getBindingAdapterPosition());
-                viewHolder.getBindingAdapter().notifyDataSetChanged();
+                int position = viewHolder.getBindingAdapterPosition();
+                MediaManager.remove(mediaBrowserListenableFuture, playerSongQueueAdapter.getItems(), position);
+                ArrayList<Child> updatedQueue = new ArrayList<>(playerSongQueueAdapter.getItems());
+                updatedQueue.remove(position);
+                playerSongQueueAdapter.setItems(updatedQueue);
             }
         }).attachToRecyclerView(bind.playerQueueRecyclerView);
     }
 
     private void updateNowPlayingItem() {
-        playerSongQueueAdapter.notifyDataSetChanged();
+        playerSongQueueAdapter.refreshRows();
     }
 
     @Override
@@ -255,6 +258,12 @@ public class PlayerQueueFragment extends Fragment implements ClickCallback {
 
     private void observePlayback() {
         playbackViewModel.getCurrentSongId().observe(getViewLifecycleOwner(), id -> {
+            MediaManager.getCurrentIndex(mediaBrowserListenableFuture, new com.eddyizm.tempus.interfaces.MediaIndexCallback() {
+                @Override
+                public void onRecovery(int index) {
+                    playerSongQueueAdapter.setRecoveryIndex(index);
+                }
+            });
             if (com.eddyizm.tempus.lan.LanRemoteSession.isActive()) { reapplyPlayback(); return; }
             if (playerSongQueueAdapter != null) {
                 Boolean playing = playbackViewModel.getIsPlaying().getValue();

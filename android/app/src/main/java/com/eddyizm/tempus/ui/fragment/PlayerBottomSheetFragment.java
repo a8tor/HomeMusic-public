@@ -149,6 +149,16 @@ public class PlayerBottomSheetFragment extends Fragment {
                     com.eddyizm.tempus.subsonic.models.Child media = playerBottomSheetViewModel.getLiveMedia().getValue();
                     if (bind != null) com.eddyizm.tempus.homemusic.HubSmartUi.decorateArtist(bind.playerHeaderLayout.playerHeaderMediaArtistLabel, media != null ? media.getId() : null);
                 });
+                playerBottomSheetViewModel.getLiveMedia().observe(getViewLifecycleOwner(), child -> {
+                    if (bind == null || child == null || com.eddyizm.tempus.lan.LanRemoteSession.isActive()) return;
+                    String coverId = child.getCoverArtId();
+                    if (!TextUtils.isEmpty(coverId)) {
+                        CustomGlideRequest.Builder
+                                .from(requireContext(), coverId, CustomGlideRequest.ResourceType.Song)
+                                .build()
+                                .into(bind.playerHeaderLayout.playerHeaderMediaCoverImage);
+                    }
+                });
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -262,8 +272,20 @@ public class PlayerBottomSheetFragment extends Fragment {
                 request = RadioCoverArtDownloader.applyLocalFileSignature(request, mediaMetadata.artworkUri);
                 request.into(bind.playerHeaderLayout.playerHeaderMediaCoverImage);
             } else {
+                String coverId = mediaMetadata.extras.getString("coverArtId");
+                if (TextUtils.isEmpty(coverId)) {
+                    com.eddyizm.tempus.subsonic.models.Child liveChild = playerBottomSheetViewModel.getLiveMedia().getValue();
+                    if (liveChild != null && !TextUtils.isEmpty(liveChild.getCoverArtId())) {
+                        coverId = liveChild.getCoverArtId();
+                    } else {
+                        String mediaId = mediaMetadata.extras.getString("id");
+                        if (mediaId != null && com.eddyizm.tempus.homemusic.HubTracks.isHub(mediaId)) {
+                            coverId = com.eddyizm.tempus.homemusic.HubTracks.song(mediaId).getCoverArtId();
+                        }
+                    }
+                }
                 CustomGlideRequest.Builder
-                        .from(requireContext(), mediaMetadata.extras.getString("coverArtId"), CustomGlideRequest.ResourceType.Song)
+                        .from(requireContext(), coverId, CustomGlideRequest.ResourceType.Song)
                         .build()
                         .into(bind.playerHeaderLayout.playerHeaderMediaCoverImage);
             }

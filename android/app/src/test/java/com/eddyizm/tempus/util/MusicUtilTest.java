@@ -19,6 +19,14 @@ import org.junit.runners.JUnit4;
 public class MusicUtilTest {
 
     @Test
+    public void redactCredentials_masksSubsonicSecretQueryParameters() {
+        assertEquals("https://music/stream?u=***&p=***&t=***&s=***&format=flac",
+                MusicUtil.redactCredentials("https://music/stream?u=user&p=secret&t=token&s=salt&format=flac"));
+        assertEquals("https://music/stream?id=track&c=client",
+                MusicUtil.redactCredentials("https://music/stream?id=track&c=client"));
+    }
+
+    @Test
     public void audioFormatLabel_mapsKnownMimeTypes() {
         assertEquals("flac", MusicUtil.audioFormatLabel("audio/flac"));
         assertEquals("opus", MusicUtil.audioFormatLabel("audio/opus"));

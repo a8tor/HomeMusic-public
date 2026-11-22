@@ -4,6 +4,7 @@ import androidx.annotation.Keep
 import androidx.media3.common.MediaItem
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.eddyizm.tempus.subsonic.models.Child
 import com.eddyizm.tempus.util.Preferences
@@ -12,7 +13,12 @@ import java.util.Date
 
 @Keep
 @Parcelize
-@Entity(tableName = "chronology")
+@Entity(
+    tableName = "chronology",
+    indices = [
+        Index(value = ["server", "timestamp"], name = "index_chronology_server_timestamp"),
+    ],
+)
 class Chronology(
     @PrimaryKey override val id: String,
     @ColumnInfo(name = "timestamp")

@@ -19,6 +19,8 @@ import com.eddyizm.tempus.homemusic.QueueLoading
 class DynamicMediaSourceFactory(
     private val context: Context
 ) : MediaSource.Factory {
+    private var drmSessionManagerProvider: DrmSessionManagerProvider? = null
+    private var loadErrorHandlingPolicy: LoadErrorHandlingPolicy? = null
 
     override fun createMediaSource(mediaItem: MediaItem): MediaSource {
         // Detect radio streams in a backwards-compatible way.
@@ -50,13 +52,18 @@ class DynamicMediaSourceFactory(
         return when {
             mediaItem.localConfiguration?.mimeType == MimeTypes.APPLICATION_M3U8 ||
                     mediaItem.localConfiguration?.uri?.lastPathSegment?.endsWith(".m3u8", ignoreCase = true) == true -> {
-                HlsMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItem)
+                val factory = HlsMediaSource.Factory(dataSourceFactory)
+                drmSessionManagerProvider?.let(factory::setDrmSessionManagerProvider)
+                loadErrorHandlingPolicy?.let(factory::setLoadErrorHandlingPolicy)
+                factory.createMediaSource(mediaItem)
             }
 
             else -> {
                 val extractorsFactory: ExtractorsFactory = DefaultExtractorsFactory()
                 val progressiveFactory = ProgressiveMediaSource.Factory(dataSourceFactory, extractorsFactory)
                     .setContinueLoadingCheckIntervalBytes(QueueLoading.CHECK_INTERVAL_BYTES) // HomeMusic: a finer buffer limit
+                drmSessionManagerProvider?.let(progressiveFactory::setDrmSessionManagerProvider)
+                loadErrorHandlingPolicy?.let(progressiveFactory::setLoadErrorHandlingPolicy)
 
                 val uri = mediaItem.localConfiguration?.uri
                 val isTranscoding = uri?.getQueryParameter("format") != null && uri.getQueryParameter("format") != "raw"
@@ -71,11 +78,13 @@ class DynamicMediaSourceFactory(
     }
 
     override fun setDrmSessionManagerProvider(drmSessionManagerProvider: DrmSessionManagerProvider): MediaSource.Factory {
-        TODO("Not yet implemented")
+        this.drmSessionManagerProvider = drmSessionManagerProvider
+        return this
     }
 
     override fun setLoadErrorHandlingPolicy(loadErrorHandlingPolicy: LoadErrorHandlingPolicy): MediaSource.Factory {
-        TODO("Not yet implemented")
+        this.loadErrorHandlingPolicy = loadErrorHandlingPolicy
+        return this
     }
 
     override fun getSupportedTypes(): IntArray {

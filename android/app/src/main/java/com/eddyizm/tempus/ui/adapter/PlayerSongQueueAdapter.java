@@ -1,6 +1,5 @@
 package com.eddyizm.tempus.ui.adapter;
 
-import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.LayoutInflater;
@@ -10,14 +9,13 @@ import android.view.ViewGroup;
 import androidx.annotation.NonNull;
 import androidx.appcompat.content.res.AppCompatResources;
 import androidx.media3.session.MediaBrowser;
+import androidx.recyclerview.widget.DiffUtil;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.bumptech.glide.RequestBuilder;
 import com.eddyizm.tempus.R;
 import com.eddyizm.tempus.databinding.ItemPlayerQueueSongBinding;
 import com.eddyizm.tempus.glide.CustomGlideRequest;
 import com.eddyizm.tempus.interfaces.ClickCallback;
-import com.eddyizm.tempus.interfaces.MediaIndexCallback;
 import com.eddyizm.tempus.service.DownloaderManager;
 import com.eddyizm.tempus.service.MediaManager;
 import com.eddyizm.tempus.subsonic.models.Child;
@@ -38,11 +36,23 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class PlayerSongQueueAdapter extends RecyclerView.Adapter<PlayerSongQueueAdapter.ViewHolder> {
+    public static final DiffUtil.ItemCallback<Child> DIFF_CALLBACK = new DiffUtil.ItemCallback<Child>() {
+        @Override
+        public boolean areItemsTheSame(@NonNull Child oldItem, @NonNull Child newItem) {
+            return Objects.equals(oldItem.getId(), newItem.getId());
+        }
+
+        @Override
+        public boolean areContentsTheSame(@NonNull Child oldItem, @NonNull Child newItem) {
+            return Objects.equals(oldItem, newItem);
+        }
+    };
     private static final String TAG = "PlayerSongQueueAdapter";
     private final ClickCallback click;
 
     private ListenableFuture<MediaBrowser> mediaBrowserListenableFuture;
     private List<Child> songs;
+    private int currentIndex = -1;
     private final Map<String, Boolean> downloadStatusCache = new ConcurrentHashMap<>();
     private String currentPlayingId;
     private boolean isPlaying;
@@ -61,8 +71,24 @@ public class PlayerSongQueueAdapter extends RecyclerView.Adapter<PlayerSongQueue
     }
 
     @Override
-    public void onBindViewHolder(ViewHolder holder, int position) {
-        Child song = songs.get(holder.getLayoutPosition());
+    public void onBindViewHolder(@NonNull ViewHolder holder, int position, @NonNull List<Object> payloads) {
+        if (!payloads.isEmpty() && payloads.contains("payload_recovery")) {
+            float alpha = position < currentIndex ? 0.2f : 1.0f;
+            holder.item.queueSongTitleTextView.setAlpha(alpha);
+            holder.item.queueSongSubtitleTextView.setAlpha(alpha);
+            holder.item.ratingIndicatorImageView.setAlpha(alpha);
+            return;
+        }
+        if (!payloads.isEmpty() && payloads.contains("payload_playback")) {
+            bindPlaybackState(holder, songs.get(position));
+            return;
+        }
+        super.onBindViewHolder(holder, position, payloads);
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
+        Child song = songs.get(position);
 
         holder.item.queueSongTitleTextView.setText(song.getTitle());
         holder.item.queueSongSubtitleTextView.setText(
@@ -74,40 +100,25 @@ public class PlayerSongQueueAdapter extends RecyclerView.Adapter<PlayerSongQueue
                 )
         );
 
-        RequestBuilder<Drawable> thumbnail = CustomGlideRequest.Builder
-                        .from(holder.itemView.getContext(), song.getCoverArtId(), CustomGlideRequest.ResourceType.Song)
-                        .build()
-                        .sizeMultiplier(0.1f);
-
+        int artworkSize = Math.round(52 * holder.itemView.getResources().getDisplayMetrics().density);
         CustomGlideRequest.Builder
                 .from(holder.itemView.getContext(), song.getCoverArtId(), CustomGlideRequest.ResourceType.Song)
                 .build()
-                .thumbnail(thumbnail)
+                .override(artworkSize, artworkSize)
                 .into(holder.item.queueSongCoverImageView);
-        MediaManager.getCurrentIndex(mediaBrowserListenableFuture, new MediaIndexCallback() {
-            @Override
-            public void onRecovery(int index) {
-                if (holder.getLayoutPosition() < index) {
-                    holder.item.queueSongTitleTextView.setAlpha(0.2f);
-                    holder.item.queueSongSubtitleTextView.setAlpha(0.2f);
-                    holder.item.ratingIndicatorImageView.setAlpha(0.2f);
-                } else {
-                    holder.item.queueSongTitleTextView.setAlpha(1.0f);
-                    holder.item.queueSongSubtitleTextView.setAlpha(1.0f);
-                    holder.item.ratingIndicatorImageView.setAlpha(1.0f);
-                }
-            }
-        });
+        float recoveryAlpha = position < currentIndex ? 0.2f : 1.0f;
+        holder.item.queueSongTitleTextView.setAlpha(recoveryAlpha);
+        holder.item.queueSongSubtitleTextView.setAlpha(recoveryAlpha);
+        holder.item.ratingIndicatorImageView.setAlpha(recoveryAlpha);
 
-        boolean isDownloaded = false;
-
-        if (Preferences.getDownloadDirectoryUri() == null) {
-            DownloaderManager downloaderManager = DownloadUtil.getDownloadTracker(holder.itemView.getContext());
-            if (downloaderManager != null) {
-                isDownloaded = downloaderManager.isDownloaded(song.getId());
-            }
-        } else {
-            isDownloaded = ExternalAudioReader.getUri(song) != null;
+        Boolean cachedDownloadState = downloadStatusCache.get(song.getId());
+        boolean isDownloaded = Boolean.TRUE.equals(cachedDownloadState);
+        if (cachedDownloadState == null) {
+            isDownloaded = Preferences.getDownloadDirectoryUri() != null
+                    ? ExternalAudioReader.getUri(song) != null
+                    : DownloadUtil.getDownloadTracker(holder.itemView.getContext()) != null
+                            && DownloadUtil.getDownloadTracker(holder.itemView.getContext()).isDownloaded(song.getId());
+            downloadStatusCache.put(song.getId(), isDownloaded);
         }
 
         if (isDownloaded) {
@@ -187,9 +198,36 @@ public class PlayerSongQueueAdapter extends RecyclerView.Adapter<PlayerSongQueue
         return this.songs;
     }
 
-    public void setItems(List<Child> songs) {
-        this.songs = songs;
-        notifyDataSetChanged();
+    public void setItems(List<Child> items) {
+        List<Child> newItems = items == null ? Collections.emptyList() : new ArrayList<>(items);
+        List<Child> oldItems = new ArrayList<>(songs);
+        DiffUtil.DiffResult diff = calculateQueueDiff(oldItems, newItems);
+        songs = newItems;
+        currentPlayingPositions = currentPlayingId == null
+                ? Collections.emptyList() : findPositionsById(currentPlayingId);
+        diff.dispatchUpdatesTo(this);
+    }
+
+    public void refreshRows() {
+        if (!songs.isEmpty()) notifyItemRangeChanged(0, songs.size());
+    }
+
+    static DiffUtil.DiffResult calculateQueueDiff(List<Child> oldItems, List<Child> newItems) {
+        return DiffUtil.calculateDiff(new DiffUtil.Callback() {
+            @Override public int getOldListSize() { return oldItems.size(); }
+            @Override public int getNewListSize() { return newItems.size(); }
+            @Override public boolean areItemsTheSame(int oldPosition, int newPosition) {
+                return areQueueItemsTheSame(oldItems.get(oldPosition), oldPosition,
+                        newItems.get(newPosition), newPosition);
+            }
+            @Override public boolean areContentsTheSame(int oldPosition, int newPosition) {
+                return DIFF_CALLBACK.areContentsTheSame(oldItems.get(oldPosition), newItems.get(newPosition));
+            }
+        });
+    }
+
+    static boolean areQueueItemsTheSame(Child oldItem, int oldPosition, Child newItem, int newPosition) {
+        return oldPosition == newPosition && DIFF_CALLBACK.areItemsTheSame(oldItem, newItem);
     }
 
     @Override
@@ -236,6 +274,14 @@ public class PlayerSongQueueAdapter extends RecyclerView.Adapter<PlayerSongQueue
                 notifyItemChanged(pos, "payload_playback");
             }
         }
+    }
+
+    public void setRecoveryIndex(int index) {
+        if (currentIndex == index) return;
+        int oldIndex = currentIndex;
+        currentIndex = index;
+        if (oldIndex >= 0 && oldIndex < songs.size()) notifyItemChanged(oldIndex, "payload_recovery");
+        if (index >= 0 && index < songs.size()) notifyItemChanged(index, "payload_recovery");
     }
 
     private List<Integer> findPositionsById(String id) {

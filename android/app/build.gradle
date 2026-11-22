@@ -135,7 +135,9 @@ android {
             minifyEnabled = true
             debuggable = false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.debug
+            if (homemusicKeystoreFile.exists()) {
+                signingConfig signingConfigs.homemusic
+            }
         }
 
         debug {

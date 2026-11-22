@@ -121,12 +121,13 @@ public class HomeViewModel extends AndroidViewModel {
         String server = Preferences.getServerId();
 
         int currentWeek = cal.get(Calendar.WEEK_OF_YEAR);
-        long start = cal.getTimeInMillis();
+        long upperExclusive = cal.getTimeInMillis();
 
         cal.set(Calendar.WEEK_OF_YEAR, currentWeek - 1);
-        long end = cal.getTimeInMillis();
+        long lowerInclusive = cal.getTimeInMillis();
 
-        chronologyRepository.getChronology(server, start, end).observe(owner, thisGridTopSong::postValue);
+        chronologyRepository.getChronology(server, upperExclusive, lowerInclusive)
+                .observe(owner, thisGridTopSong::postValue);
         return thisGridTopSong;
     }
 
@@ -301,24 +302,25 @@ public class HomeViewModel extends AndroidViewModel {
         String server = Preferences.getServerId();
         int currentWeek = cal.get(Calendar.WEEK_OF_YEAR);
 
-        long start = 0;
-        long end = 0;
+        long upperExclusive = 0;
+        long lowerInclusive = 0;
 
         if (period == 0) {
-            start = cal.getTimeInMillis();
+            upperExclusive = cal.getTimeInMillis();
             cal.set(Calendar.WEEK_OF_YEAR, currentWeek - 1);
-            end = cal.getTimeInMillis();
+            lowerInclusive = cal.getTimeInMillis();
         } else if (period == 1) {
-            start = cal.getTimeInMillis();
+            upperExclusive = cal.getTimeInMillis();
             cal.set(Calendar.WEEK_OF_YEAR, currentWeek - 4);
-            end = cal.getTimeInMillis();
+            lowerInclusive = cal.getTimeInMillis();
         } else if (period == 2) {
-            start = cal.getTimeInMillis();
+            upperExclusive = cal.getTimeInMillis();
             cal.set(Calendar.WEEK_OF_YEAR, currentWeek - 52);
-            end = cal.getTimeInMillis();
+            lowerInclusive = cal.getTimeInMillis();
         }
 
-        chronologyRepository.getChronology(server, start, end).observe(owner, thisGridTopSong::postValue);
+        chronologyRepository.getChronology(server, upperExclusive, lowerInclusive)
+                .observe(owner, thisGridTopSong::postValue);
     }
 
     /**

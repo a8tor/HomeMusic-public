@@ -37,6 +37,7 @@
     <string name="album_bottom_sheet_play_next">Play next</string>
     <string name="album_bottom_sheet_remove_all">Remove all</string>
     <string name="album_bottom_sheet_share">Share</string>
+    <string name="album_page_menu_share">Share</string>
     <string name="album_bottom_sheet_shuffle">Shuffle</string>
     <string name="album_catalogue_title">Albums</string>
     <string name="album_catalogue_title_expanded">Browse Albums</string>

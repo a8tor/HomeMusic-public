@@ -49,6 +49,9 @@ import com.eddyizm.tempus.util.MappingUtil;
 import com.eddyizm.tempus.util.MusicUtil;
 import com.eddyizm.tempus.util.ExternalAudioWriter;
 import com.eddyizm.tempus.util.Preferences;
+import com.eddyizm.tempus.util.ShareAction;
+import com.eddyizm.tempus.viewmodel.HomeViewModel;
+import com.eddyizm.tempus.viewmodel.AlbumBottomSheetViewModel;
 import com.eddyizm.tempus.viewmodel.AlbumPageViewModel;
 import com.eddyizm.tempus.viewmodel.PlaybackViewModel;
 import com.eddyizm.tempus.util.FavoriteRegistry;
@@ -66,6 +69,8 @@ public class AlbumPageFragment extends Fragment implements ClickCallback {
     private MainActivity activity;
     private AlbumPageViewModel albumPageViewModel;
     private PlaybackViewModel playbackViewModel;
+    private HomeViewModel homeViewModel;
+    private AlbumBottomSheetViewModel albumBottomSheetViewModel;
     private SongHorizontalAdapter songHorizontalAdapter;
     private ListenableFuture<MediaBrowser> mediaBrowserListenableFuture;
     private LiveData<ArtistID3> pendingArtist;
@@ -83,6 +88,20 @@ public class AlbumPageFragment extends Fragment implements ClickCallback {
     public void onCreateOptionsMenu(@NonNull Menu menu, @NonNull MenuInflater inflater) {
         super.onCreateOptionsMenu(menu, inflater);
         inflater.inflate(R.menu.album_page_menu, menu);
+        MenuItem shareItem = menu.findItem(R.id.action_share_album);
+        if (shareItem != null) {
+            shareItem.setVisible(ShareAction.isAvailable(Preferences.isSharingEnabled()));
+        }
+    }
+
+    /** @noinspection deprecation*/
+    @Override
+    public void onPrepareOptionsMenu(@NonNull Menu menu) {
+        super.onPrepareOptionsMenu(menu);
+        MenuItem shareItem = menu.findItem(R.id.action_share_album);
+        if (shareItem != null) {
+            shareItem.setVisible(ShareAction.isAvailable(Preferences.isSharingEnabled()));
+        }
     }
 
     @Override
@@ -94,6 +113,8 @@ public class AlbumPageFragment extends Fragment implements ClickCallback {
 
         albumPageViewModel = new ViewModelProvider(requireActivity()).get(AlbumPageViewModel.class);
         playbackViewModel = new ViewModelProvider(requireActivity()).get(PlaybackViewModel.class);
+        homeViewModel = new ViewModelProvider(requireActivity()).get(HomeViewModel.class);
+        albumBottomSheetViewModel = new ViewModelProvider(requireActivity()).get(AlbumBottomSheetViewModel.class);
 
         Bundle args = getArguments();
         if (args == null) {
@@ -158,6 +179,27 @@ public class AlbumPageFragment extends Fragment implements ClickCallback {
         /** @noinspection deprecation*/
         @Override
         public boolean onOptionsItemSelected(@NonNull MenuItem item) {
+            if (item.getItemId() == R.id.action_share_album) {
+                AlbumID3 album = albumPageViewModel.getAlbum().getValue();
+                if (album == null || !ShareAction.isAvailable(Preferences.isSharingEnabled())) {
+                    Toast.makeText(requireContext(), R.string.share_unsupported_error, Toast.LENGTH_SHORT).show();
+                    return true;
+                }
+                albumBottomSheetViewModel.setAlbum(album);
+                albumBottomSheetViewModel.shareAlbum().observe(getViewLifecycleOwner(), sharedAlbum ->
+                        ShareAction.complete(sharedAlbum, url -> ShareAction.copyToClipboard(requireContext(), url), new ShareAction.Result() {
+                            @Override
+                            public void onSuccess() {
+                                homeViewModel.refreshShares(getViewLifecycleOwner());
+                            }
+
+                            @Override
+                            public void onError() {
+                                Toast.makeText(requireContext(), R.string.share_unsupported_error, Toast.LENGTH_SHORT).show();
+                            }
+                        }));
+                return true;
+            }
             if (item.getItemId() == R.id.action_rate_album) {
                 Bundle bundle = new Bundle();
                 AlbumID3 album = albumPageViewModel.getAlbum().getValue();

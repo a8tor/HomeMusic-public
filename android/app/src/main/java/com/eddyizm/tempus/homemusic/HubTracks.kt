@@ -23,6 +23,8 @@ import com.eddyizm.tempus.util.DownloadUtil
 import com.eddyizm.tempus.util.FavoriteRegistry
 import com.google.gson.annotations.SerializedName
 import java.io.IOException
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 import java.util.function.Supplier
@@ -73,12 +75,23 @@ object HubTracks {
     /** The queue entry of a catalog track. */
     fun child(item: Item): Child? {
         val ref = item.ref?.takeIf { it.isNotBlank() } ?: return null
+        val rawCover = item.coverUrl?.takeIf { it.isNotBlank() }
+        val songId = item.songId?.takeIf { it.isNotBlank() }
+        val cover = when {
+            songId != null && rawCover?.startsWith("/api/nd/cover/") == true ->
+                runCatching { URLDecoder.decode(rawCover.substringAfter("/api/nd/cover/").substringBefore('?'), StandardCharsets.UTF_8.name()) }.getOrNull()
+            rawCover?.startsWith("/") == true ->
+                runCatching { HubClient.baseUrl().trimEnd('/') + rawCover }.getOrNull()
+            else -> rawCover
+        }
         val song = Child(ID_PREFIX + ref).apply {
             title = item.title
             artist = item.artist
             album = item.album
             // An absolute address: CustomGlideRequest.createUrl passes it through as is.
-            coverArtId = item.coverUrl?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+            coverArtId = cover?.takeIf {
+                it.startsWith("http://") || it.startsWith("https://") || (songId != null && !it.contains("/"))
+            }
             duration = item.durationS?.toInt()
         }
         known[song.id]?.starred?.let { song.starred = it }
