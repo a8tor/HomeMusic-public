@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <defs>
+    <mask id="face-cut">
+      <rect width="96" height="96" fill="#FFFFFF"/>
+      <g transform="scale(1.5)">
+        <circle cx="35.5" cy="26.5" r="4.6" fill="#000000"/>
+        <circle cx="34.2" cy="25.2" r="1.8" fill="#FFFFFF"/>
+        <circle cx="45" cy="29" r="3.4" fill="#000000"/>
+        <circle cx="46" cy="30" r="1.4" fill="#FFFFFF"/>
+        <path d="M 35 34.5 Q 40 33 44.5 35.5 Q 41 39 36 37 Z" fill="#000000"/>
+      </g>
+    </mask>
+  </defs>
+  <g transform="scale(1.5)" mask="url(#face-cut)">
+    <path d="M 35 6 L 37 6 Q 39 12 41 17 Q 44 12 46 9 L 48 10 Q 48 15 48 20 Q 52 17 55 16 L 56 18 Q 53 21 51 24 Q 55 24 58 25 L 58 27 Q 54 29 51 30 Q 56 32 59 35 L 58 37 Q 54 36 50 35 Q 53 40 55 44 L 53 46 Q 50 42 47 39 Q 48 45 48 51 L 46 52 Q 44 46 42 41 Q 38 50 33 59 L 30 59 Q 33 49 35 39 Q 23 45 12 49 L 10 47 Q 20 40 29 34 Q 17 31 5 28 L 5 25 Q 17 25 29 25 Q 20 19 12 13 L 14 11 Q 23 16 32 20 Q 28 13 24 7 L 26 6 Q 31 12 36 17 Q 35 11 35 6 Z" fill="#FFFFFF"/>
+  </g>
+</svg>
