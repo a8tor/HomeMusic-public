@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 from pathlib import Path
 
 import cairosvg
@@ -26,6 +27,10 @@ def save_png(image: Image.Image, filename: str) -> None:
 
 ICONS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Keep the web sources aligned with the canonical SVG artwork.
+shutil.copyfile(BASE_DIR / "header-logo.svg", ICONS_DIR / "header-logo.svg")
+shutil.copyfile(BASE_DIR / "favicon.svg", ICONS_DIR / "icon.svg")
+
 # Keep all standard PWA icons on the black-backed, no-white favicon artwork.
 favicon = BASE_DIR / "favicon.svg"
 for size in (192, 512):
@@ -50,21 +55,28 @@ save_png(apple_rgb, "apple-touch-icon.png")
 # Badge remains a white silhouette with transparent surroundings.
 save_png(svg_to_pil(BASE_DIR / "badge-mono.svg", 96), "badge-96.png")
 
-# Report near-white share over visible pixels, excluding transparent padding.
-for path in sorted(ICONS_DIR.glob("*.png")):
+# Report near-white share over all pixels, including transparent padding.
+for filename in (
+    "icon-192.png",
+    "icon-512.png",
+    "maskable-192.png",
+    "maskable-512.png",
+    "apple-touch-icon.png",
+    "badge-96.png",
+):
+    path = ICONS_DIR / filename
     with Image.open(path) as image:
         rgba = image.convert("RGBA")
         pixels = list(rgba.getdata())
-        visible_pixels = [pixel for pixel in pixels if pixel[3] > 0]
         white_pixels = sum(
             1
-            for red, green, blue, _alpha in visible_pixels
+            for red, green, blue, _alpha in pixels
             if red >= 245 and green >= 245 and blue >= 245
         )
-        white_fraction = white_pixels / max(1, len(visible_pixels))
+        white_fraction = white_pixels / max(1, len(pixels))
         print(
             f"{path.name}: size={image.size}, mode={image.mode}, "
-            f"near_white_visible={white_fraction:.4%}"
+            f"near_white={white_fraction:.4%}"
         )
 
 with Image.open(PUBLIC_DIR / "favicon.ico") as image:

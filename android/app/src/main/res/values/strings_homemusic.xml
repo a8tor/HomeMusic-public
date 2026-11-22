@@ -142,6 +142,7 @@
     <string name="homemusic_login_google_register_subtitle">Google-аккаунт %1$s ещё не привязан. Введите код приглашения и выберите имя</string>
     <string name="homemusic_login_change_server">Изменить</string>
     <string name="homemusic_login_code">Код приглашения</string>
+    <string name="homemusic_login_code_placeholder">ABCD-EFGH</string>
     <string name="homemusic_login_user">Имя</string>
     <string name="homemusic_login_password">Пароль</string>
     <string name="homemusic_login_password2">Пароль ещё раз</string>
@@ -166,6 +167,7 @@
     <string name="homemusic_login_email">Почта</string>
     <string name="homemusic_login_email_bad">Проверьте адрес почты</string>
     <string name="homemusic_login_email_code">Код из письма</string>
+    <string name="homemusic_login_email_code_placeholder">000000</string>
     <string name="homemusic_login_email_send">Получить код</string>
     <string name="homemusic_login_email_resend">Отправить ещё раз</string>
     <string name="homemusic_login_email_resend_in">Отправить ещё раз через %1$d с</string>

@@ -25,7 +25,7 @@ export function HomePage() {
     <div className="pb-4">
       <header className="pt-safe px-4 pb-1 pt-4">
         <div className="mb-3 flex min-h-8 items-center gap-2">
-          <img src="/icons/logo.svg" alt="" width={32} height={32} className="shrink-0 object-contain" />
+          <img src="/icons/header-logo.svg" alt="" width={32} height={32} className="shrink-0 object-contain" />
           <span className="truncate text-base font-semibold">Кчау.Музыка</span>
         </div>
         <h1 className="text-2xl font-bold">{greeting()}, {me.username}</h1>
