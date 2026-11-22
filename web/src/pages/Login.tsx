@@ -99,8 +99,8 @@ export function LoginPage({ onLogin }: { onLogin: (me: MeOut) => void }) {
     <div className="pt-safe flex min-h-dvh flex-col justify-center bg-gradient-to-b from-[#123a24] via-bg to-bg px-6">
       <div className="mx-auto w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center gap-3 text-center">
-          <img src="/icons/icon.svg" alt="" width={80} height={80} className="rounded-2xl shadow-lg" />
-          <h1 className="text-3xl font-bold">HomeMusic</h1>
+          <img src="/icons/logo.svg" alt="" width={80} height={80} className="object-contain" />
+          <h1 className="text-3xl font-bold">Кчау.Музыка</h1>
           <p className="text-sm text-muted">{SUBTITLE[mode]}</p>
         </div>
         <form onSubmit={submit} className="space-y-4">

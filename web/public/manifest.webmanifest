@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "HomeMusic",
-  "short_name": "HomeMusic",
-  "description": "Домашняя музыка: поиск, загрузки, библиотека и ИИ-ассистент",
+  "name": "Кчау.Музыка",
+  "short_name": "Кчау",
+  "description": "Кчау.Музыка: поиск, загрузки, библиотека и ИИ-ассистент",
   "lang": "ru",
   "dir": "ltr",
   "start_url": "/",
