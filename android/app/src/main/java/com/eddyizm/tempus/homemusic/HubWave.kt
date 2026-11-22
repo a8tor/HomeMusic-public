@@ -4,6 +4,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.widget.Toast
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -37,6 +38,7 @@ object HubWave {
     private var session: WaveSession? = null
     private var retry: Runnable? = null
     private var endedAt = 0L
+    private var emptyQueueSessionId: String? = null
 
     /** The playback service: the wave edits its player. */
     @JvmStatic
@@ -134,6 +136,37 @@ object HubWave {
 
     // --- what the player does --------------------------------------------------------------------
 
+    /** A catalog track of the wave had only a 30 s preview (503 / preview header): tell its captured session. */
+    @JvmStatic
+    fun onNoFile(sessionId: String, ref: String) {
+        val cleanRef = ref.trim().removePrefix(HubTracks.ID_PREFIX)
+        if (sessionId.isBlank() || cleanRef.isBlank()) return
+        HomeMusic.io.execute {
+            runCatching { HubClient.waveNoFile(sessionId, cleanRef) }
+        }
+    }
+
+    /** The failed item is removed; ask immediately when it was the last queued wave track. */
+    fun onTrackUnavailable(player: Player, mediaId: String, sessionId: String, ref: String) {
+        HomeMusic.main.post {
+            val wave = session?.takeIf { it.id == sessionId && it.context == HubPlays.contextOf(mediaId) } ?: return@post
+            if (!wave.isWave(mediaId) || player.currentMediaItem?.mediaId != mediaId) return@post
+            onNoFile(sessionId, ref)
+            val queue = target.get() ?: return@post
+            val index = player.currentMediaItemIndex
+            if (index == C.INDEX_UNSET) return@post
+            val hasNext = player.hasNextMediaItem()
+            if (hasNext) {
+                player.seekToNextMediaItem()
+                MediaManager.removeRange(queue, index, index + 1)
+            } else {
+                emptyQueueSessionId = sessionId
+                MediaManager.removeRange(queue, index, index + 1)
+                ask()
+            }
+        }
+    }
+
     /** A new queue started; [contexts] — its entries' contexts: the wave goes on only when it is the wave's own. */
     fun onQueueStarted(contexts: Map<String, String>) {
         HomeMusic.main.post {
@@ -199,16 +232,20 @@ object HubWave {
 
     private fun end() {
         session = null
+        emptyQueueSessionId = null
         cancelRetry()
     }
 
     // --- next -----------------------------------------------------------------------------------
 
-    /** The service's player while it plays the wave (until the wave's queue is in, the old one plays). */
+    /** The service's player while it plays the wave (or its queue is empty after an unavailable track). */
     private fun player(wave: WaveSession): Player? {
         if (LanRemoteSession.isActive()) return null
         val player = target.get()?.livePlayer() ?: return null
-        return player.takeIf { wave.isWave(it.currentMediaItem?.mediaId) }
+        return player.takeIf {
+            wave.isWave(it.currentMediaItem?.mediaId) ||
+                (it.mediaItemCount == 0 && emptyQueueSessionId == wave.id)
+        }
     }
 
     /** The wave's queue entries after the one playing, in order, with their positions. */
@@ -311,6 +348,7 @@ object HubWave {
         HubPlays.addContexts(wave.ids().associateWith { wave.context }, launchesOf(wave))
         val stale = player.playbackState == Player.STATE_ENDED && SystemClock.elapsedRealtime() - endedAt > RESUME_WITHIN_MS
         MediaManager.insertAt(queue, at, add.map { it.child }, add.map { it.item })
+        emptyQueueSessionId = null
         // the user waits on the loading page, or the queue ran out a moment ago: go on to the first new track
         if (!stale) QueueAhead.extended(player, at, add.size)
     }

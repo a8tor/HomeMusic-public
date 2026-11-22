@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">HomeMusic</string>
+    <string name="app_name">Бля.Музыка</string>
     <!-- The heart button: «Понравившиеся», as in Library. -->
     <string name="song_list_page_starred">Понравившиеся</string>
 

@@ -89,7 +89,7 @@ def top_artists(p: V2Profile, n: int) -> list[str]:
     return out[:n]
 
 
-def select_profile_seeds(p: V2Profile, n: int, max_per_artist: int = 2) -> list[TasteTrack]:
+def select_profile_seeds(p: V2Profile, n: int, max_per_artist: int = 2, *, salt: str | None = None) -> list[TasteTrack]:
     """Weighted sampling without replacement, with significant facets represented before redistribution."""
     if n <= 0:
         return []
@@ -99,8 +99,8 @@ def select_profile_seeds(p: V2Profile, n: int, max_per_artist: int = 2) -> list[
                        not p.disliked(ref=t.ref, nd_song_id=t.nd_song_id, artist=t.artist, artist_ref=None)),
                       key=lambda t: t.key)
     day = p.now.replace(tzinfo=UTC).astimezone(ZoneInfo(p.timezone)).date().isoformat()
-    salt = hashlib.sha256(f"{p.user_id}|{day}|v2".encode()).digest()
-    rng = random.Random(int.from_bytes(salt, "big"))
+    seed_salt = hashlib.sha256(f"{p.user_id}|{day}|{salt or 'v2'}".encode()).digest()
+    rng = random.Random(int.from_bytes(seed_salt, "big"))
     # One random priority per canonical key keeps selection independent of input order.
     priorities = {t.key: -math.log(max(rng.random(), 1e-15)) / max(t.score, 1) for t in sorted(pool, key=lambda t: t.key)}
     ranked = sorted(pool, key=lambda t: (priorities[t.key], t.key))

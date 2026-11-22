@@ -30,6 +30,7 @@ import androidx.media3.extractor.metadata.icy.IcyInfo
 import androidx.media3.extractor.metadata.id3.TextInformationFrame
 import androidx.media3.extractor.metadata.vorbis.VorbisComment
 import com.eddyizm.tempus.homemusic.HubPlays
+import com.eddyizm.tempus.homemusic.WaveTrackUnavailableException
 import com.eddyizm.tempus.homemusic.QueueAhead
 import com.eddyizm.tempus.homemusic.HomeTraffic
 import com.eddyizm.tempus.homemusic.QueueLoading
@@ -332,6 +333,18 @@ open class BaseMediaService : MediaLibraryService(), MediaManager.QueueTarget {
                 // position, but only for recoverable IO errors and throttled so a permanent
                 // failure (bad URL, auth) can't spin in an endless prepare loop.
                 Log.w(TAG, "onPlayerError: ${error.errorCodeName}", error)
+
+                val unavailable = generateSequence<Throwable>(error) { it.cause }
+                    .filterIsInstance<WaveTrackUnavailableException>().firstOrNull()
+                if (unavailable != null) {
+                    val mediaId = player.currentMediaItem?.mediaId
+                    val context = mediaId?.let(HubPlays::contextOf).orEmpty()
+                    val sessionId = context.takeIf { it.startsWith("wave:") }?.removePrefix("wave:")
+                    if (mediaId != null && sessionId != null) {
+                        HubWave.onTrackUnavailable(player, mediaId, sessionId, unavailable.ref)
+                    }
+                    return
+                }
 
                 val recoverable = when (error.errorCode) {
                     PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,

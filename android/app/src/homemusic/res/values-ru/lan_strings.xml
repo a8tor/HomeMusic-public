@@ -16,12 +16,12 @@
     <string name="lan_queue_changed">Очередь изменилась. Откройте её снова, чтобы обновить.</string>
     <string name="lan_pair_first">Сначала свяжите телефоны в настройках «Пульт», затем снова выберите телефон.</string>
     <string name="lan_server_mismatch">На обоих телефонах должен быть один и тот же адрес музыкального сервера.</string>
-    <string name="lan_update_both">Обновите HomeMusic на обоих телефонах, чтобы управлять воспроизведением.</string>
+    <string name="lan_update_both">Обновите Бля.Музыка на обоих телефонах, чтобы управлять воспроизведением.</string>
     <string name="lan_menu_summary">Связать телефоны и управлять музыкой в домашней сети.</string>
     <string name="lan_device_name">Название устройства</string>
     <string name="lan_name_saved">Название сохранено. Выключите и снова включите доступность, чтобы его увидели в сети.</string>
     <string name="lan_allow">Разрешить управление из домашней сети</string>
-    <string name="lan_available">HomeMusic доступен в домашней сети</string>
+    <string name="lan_available">Бля.Музыка доступен в домашней сети</string>
     <string name="lan_disable">Выключить</string>
     <string name="lan_pair_new">Разрешить связывание</string>
     <string name="lan_paired">Связанные пульты</string>
@@ -44,7 +44,7 @@
     <string name="lan_queue_limit">Пока можно передать очередь из 1–500 треков без повторов. Радио и подкасты не поддерживаются.</string>
     <string name="lan_identity_error">Не удалось подготовить сертификат этого телефона для подключения.</string>
     <string name="lan_connect_error">Телефон найден, но недоступен. Проверьте, что он ещё доступен и что сеть или VPN не блокируют связь между телефонами.</string>
-    <string name="lan_tls_error">Не удалось установить защищённое соединение. Обновите HomeMusic на обоих телефонах и попробуйте ещё раз.</string>
+    <string name="lan_tls_error">Не удалось установить защищённое соединение. Обновите Бля.Музыка на обоих телефонах и попробуйте ещё раз.</string>
     <string name="lan_identity_mismatch">Не удалось проверить телефон. Запустите поиск снова и сравните коды.</string>
     <string name="lan_response_error">Соединение открылось, но телефон не ответил на связывание. Включите на нём «Разрешить связывание» и попробуйте ещё раз.</string>
     <string name="lan_device_status">%1$s · %2$s</string>

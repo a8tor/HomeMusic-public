@@ -226,6 +226,63 @@ def test_a_track_no_source_has_is_not_picked_again() -> None:
     assert [c.track.ref for c in got] == ["dz:2"]
 
 
+def test_pick_filters_persisted_exclusions_and_relaxes_only_shown() -> None:
+    st = state(*(cand(i) for i in range(1, 9)))
+    st.exclusion_refs = {f"dz:{i}" for i in range(1, 5)}
+    st.nofile = {"dz:1"}
+    st.exclusion_fps = {wave.fp_of(cand(1))}
+    got = wave.pick(st, profile(), "discover", {}, n=5)
+    assert "dz:1" not in [c.track.ref for c in got]
+    assert len(got) == 5  # shown is relaxed to top up a short pool
+
+
+async def test_wave_exclusions_cross_sessions_and_expire(env, monkeypatch) -> None:
+    from app.db import session_scope
+    from app.models import WaveExclusion
+
+    client, uid = env["client"], env["admin"]
+    await history(uid)
+    pool = [tr(5000 + i) for i in range(12)]
+    fake_sources(monkeypatch, pool)
+    first = (await client.post("/api/wave/start", json={})).json()
+    first_refs = [t["ref"] for t in first["tracks"]]
+    async with session_scope() as s:
+        s.add(WaveExclusion(user_id=uid, ref=first_refs[0], fingerprint=None,
+                            reason="no_file", created_at=wave.utcnow() - timedelta(days=2),
+                            expires_at=wave.utcnow() + timedelta(hours=1)))
+    second = (await client.post("/api/wave/start", json={})).json()
+    second_refs = [t["ref"] for t in second["tracks"]]
+    assert first_refs[0] not in second_refs
+    async with session_scope() as s:
+        row = (await s.execute(select(WaveExclusion).where(WaveExclusion.user_id == uid,
+                                                            WaveExclusion.ref == first_refs[1],
+                                                            WaveExclusion.reason == "shown"))).scalar_one()
+        row.expires_at = wave.utcnow() - timedelta(seconds=1)
+    third = (await client.post("/api/wave/start", json={})).json()
+    assert first_refs[1] in [t["ref"] for t in third["tracks"]]
+
+
+async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypatch) -> None:
+    from app import listen
+
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(5000 + i) for i in range(8)])
+    original = listen.choose
+
+    async def choose(ref, **kwargs):
+        if ref == "dz:5000":
+            return listen.Choice(ref, "preview", "Artist", "Title")
+        return listen.Choice(ref, "full", "Artist", "Title")
+
+    monkeypatch.setattr(listen, "choose", choose)
+    async def empty_vectors(rt):
+        return {}
+    monkeypatch.setattr(wave, "_vectors", empty_vectors)
+    result = (await env["client"].post("/api/wave/start", json={})).json()
+    assert "dz:5000" not in [t["ref"] for t in result["tracks"]]
+    assert len(result["tracks"]) >= 1
+
+
 async def test_no_file_drops_the_track_from_the_session_and_survives_a_restart(env, monkeypatch) -> None:
     from app.db import session_scope
     from app.mixes.wave import WaveSession

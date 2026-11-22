@@ -399,9 +399,15 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
     (info) => {
       if (resolving !== ctl) return;
       // A wave plays full tracks only: when no source has this one, it goes on instead of stopping at 30 seconds.
-      if (info.kind === 'preview' && auto && onWave() && hasNext(state)) {
-        skipNoFile(track.ref);
-        return void start(state.queue, state.index + 1, true);
+      if (info.kind === 'preview' && onWave()) {
+        const failedContext = state.context;
+        void skipNoFile(track.ref, failedContext).finally(() => {
+          if (resolving !== ctl) return;
+          playEvent('skip', { ref: track.ref }, { context: failedContext });
+          if (hasNext(state)) start(state.queue, state.index + 1, true);
+          else set({ phase: 'ended' });
+        });
+        return;
       }
       set({ info, duration: info.kind === 'preview' ? (info.duration_s ?? 30) : state.duration });
       reportStart();
@@ -409,6 +415,21 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
     },
     (e: unknown) => {
       if (isAbort(e) || resolving !== ctl) return;
+      if (e instanceof ApiError && e.status === 503 && onWave()) {
+        const failedContext = state.context;
+        void skipNoFile(track.ref, failedContext).finally(() => {
+          if (resolving !== ctl) return;
+          playEvent('skip', { ref: track.ref }, { context: failedContext });
+          if (hasNext(state)) start(state.queue, state.index + 1, true);
+          else set({ phase: 'ended' });
+        });
+        return;
+      }
+      if (auto && e instanceof ApiError && e.status === 404 && onWave()) {
+        if (hasNext(state)) return void start(state.queue, state.index + 1, true);
+        set({ phase: 'ended' });
+        return;
+      }
       if (auto && e instanceof ApiError && e.status === 404 && hasNext(state)) return void start(state.queue, state.index + 1, true);
       set({ phase: 'error', error: errorMessage(e) });
       a.pause();
@@ -418,13 +439,14 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
 
 /** A wave track no source has (the Hub answered with a 30 s preview): tell it so it is not handed out again.
  * Nothing is reported as a listen: a preview is no playback of the track. */
-function skipNoFile(ref: string) {
-  const sid = state.context.startsWith('wave:') ? state.context.slice(5) : null;
-  if (!sid) return;
-  void api.waveNoFile(sid, ref).catch(() => {
-    /* the next answer of the wave simply tries it again */
+function skipNoFile(ref: string, context: string): Promise<void> {
+  const sid = context.startsWith('wave:') ? context.slice(5) : null;
+  if (!sid) return Promise.resolve();
+  return api.waveNoFile(sid, ref).then(() => undefined, () => {
+    /* Continue playback even when the exclusion could not be saved. */
   });
 }
+
 
 /** The Hub opens the picked file only when the stream asks for it, and moves on to the next file if it doesn't
  * open: once sound plays, the source shown is asked for again (the Hub has it in memory). */
@@ -433,7 +455,7 @@ async function resolveListen(ref: string, signal?: AbortSignal): Promise<ListenO
     try {
       return await api.listen(ref, signal);
     } catch (e) {
-      const retryable = e instanceof ApiError && [0, 408, 429, 502, 503, 504].includes(e.status);
+      const retryable = e instanceof ApiError && [0, 408, 429, 502, 504].includes(e.status);
       const delay = RESOLVE_RETRY_MS[attempt];
       if (!retryable || delay === undefined || signal?.aborted) throw e;
       await new Promise<void>((resolve, reject) => {

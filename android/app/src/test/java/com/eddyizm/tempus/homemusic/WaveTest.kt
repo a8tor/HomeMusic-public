@@ -2,6 +2,7 @@ package com.eddyizm.tempus.homemusic
 
 import com.google.gson.Gson
 import com.google.gson.JsonParser
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -33,6 +34,14 @@ class WaveTest {
         assertEquals(mapOf("nd_song_id" to "song", "by_artist" to "true"), WaveSeeds.artist("song", null))
         assertNull(WaveSeeds.track("hub:file:42"))
         assertNull(WaveSeeds.track(" "))
+    }
+
+    @Test
+    fun unavailableFullTrackExceptionIsTerminalAndCarriesCatalogRef() {
+        val error = WaveTrackUnavailableException("dz:42", "full track unavailable", IOException("503"))
+        assertEquals("full track unavailable", error.message)
+        assertEquals("503", error.cause?.message)
+        assertEquals("dz:42", WaveTrackUnavailableException("dz:42", "unavailable").ref)
     }
 
     // --- the answer goes into the queue ------------------------------------------------------
@@ -182,6 +191,12 @@ class WaveTest {
         assertEquals(mapOf("seed" to mapOf("nd_artist_id" to "ar1")),
             WaveSession.startBody(mapOf("artist_ref" to "dz:9", "artist" to "A", "nd_artist_id" to "ar1"), null))
         assertEquals(emptyMap<String, Any>(), WaveSession.startBody(null, null))
+
+        assertEquals(mapOf("seed" to mapOf("nd_song_id" to "s1")), WaveSession.startBody(mapOf("nd_song_id" to "s1"), null))
+        assertEquals(mapOf("seed" to mapOf("ref" to "dz:7", "by_artist" to true)), WaveSession.startBody(mapOf("ref" to "dz:7", "by_artist" to "true"), null))
+        assertEquals(mapOf("seed" to mapOf("ref" to "dz:7", "by_artist" to true)), WaveSession.startBody(mapOf("ref" to "dz:7", "by_artist" to true), null))
+        assertEquals(mapOf("seed" to mapOf("nd_song_id" to "s1", "by_artist" to true)), WaveSession.startBody(mapOf("nd_song_id" to "s1", "by_artist" to "true"), null))
+        assertEquals(mapOf("seed" to mapOf("nd_song_id" to "s1", "by_artist" to true)), WaveSession.startBody(mapOf("nd_song_id" to "s1", "by_artist" to true), null))
     }
 
     // --- retries ------------------------------------------------------------------------------
@@ -260,5 +275,11 @@ class WaveTest {
         assertTrue(wave.settled("a"))
         wave.failures = 0
         assertFalse(wave.settled("a"))
+    }
+
+    @Test
+    fun noFileBodyHasTheTrackRef() {
+        val body = JsonParser.parseString(Gson().toJson(mapOf("ref" to "dz:68976317"))).asJsonObject
+        assertEquals("dz:68976317", body.get("ref").asString)
     }
 }

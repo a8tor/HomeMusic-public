@@ -57,7 +57,7 @@ async def start(body: WaveStartIn | None = None, user: User = Depends(current_us
 
 @router.post("/{session_id}/no_file", response_model=dict[str, bool])
 async def no_file(session_id: str, body: WaveNoFileIn, user: User = Depends(current_user)):
-    """A track of the wave no source has (the client got a 30 s preview): it is not handed out again."""
+    """A track with no full source is excluded from this and future waves for 24 hours."""
     return {"ok": await wave.no_file(user, session_id, body.ref)}
 
 

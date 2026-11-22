@@ -35,6 +35,8 @@ import java.util.function.Supplier
  * cookie when the player opens it, so a queue made at home keeps playing outside. ♥ and «Скачать в библиотеку»
  * queue a Hub download (♥ also stars the song in Navidrome once it is imported, silently: no toast or notification).
  */
+class WaveTrackUnavailableException(val ref: String, message: String, cause: Throwable? = null) : IOException(message, cause)
+
 object HubTracks {
     private const val TAG = "HubTracks"
     const val ID_PREFIX = "hub:"
@@ -298,7 +300,7 @@ object HubTracks {
                     hub.open(resolve(dataSpec, ref, light))
                 } catch (e: HttpDataSource.InvalidResponseCodeException) {
                     if (catalog && e.responseCode == 503) {
-                        throw IOException(App.getContext().getString(R.string.homemusic_full_track_unavailable), e)
+                        throw WaveTrackUnavailableException(ref, App.getContext().getString(R.string.homemusic_full_track_unavailable), e)
                     }
                     if (e.responseCode != 401) throw e
                     hub.close()
@@ -307,9 +309,15 @@ object HubTracks {
                 }
                 if (catalog && hub.responseHeaders.entries.any {
                     it.key.equals("X-HomeMusic-Listen-Kind", ignoreCase = true) && it.value.firstOrNull() == "preview"
-                }) throw IOException(App.getContext().getString(R.string.homemusic_full_track_unavailable))
+                }) {
+                    throw WaveTrackUnavailableException(ref, App.getContext().getString(R.string.homemusic_full_track_unavailable))
+                }
                 if (light && HubLight.variantOf(hub.responseHeaders) == HubLight.PENDING) markBad(dataSpec)
                 length
+            } catch (e: WaveTrackUnavailableException) {
+                hub.close()
+                current = null
+                throw e
             } catch (e: IOException) {
                 // The Hub does not give a song Navidrome has: Navidrome's own file (kept in the cache under the key
                 // of the light variant for now, `markBad` drops it after).

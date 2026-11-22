@@ -545,6 +545,22 @@ class WaveSession(Base):
     cleared_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class WaveExclusion(Base):
+    """A user's temporary wave exclusion, shared across sessions."""
+
+    __tablename__ = "wave_exclusions"
+    __table_args__ = (UniqueConstraint("user_id", "ref", "reason", name="uq_wave_exclusions_user_ref_reason"),
+                      Index("ix_wave_exclusions_user_expires", "user_id", "expires_at"))
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    ref: Mapped[str] = mapped_column(String(64))
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(String(16))  # shown/skipped/no_file
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class WaveItem(Base):
     """A track a wave handed out (INSIGHTS.md 6.4), once per session: analytics only, the wave never reads it."""
 

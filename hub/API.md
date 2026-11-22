@@ -288,7 +288,9 @@ An endless stream for the user's taste: the Hub hands out 5 tracks at a time and
 | Method | Path | Body → Response |
 |---|---|---|
 | POST | `/api/wave/start` | `WaveStartIn` `{seed?: {ref? \| nd_song_id? \| artist_ref? \| nd_artist_id?}, mode?: normal\|favorites\|discover, origin?, client?, restart_of?}` → `WaveOut`. No `seed` — the user's own wave from the taste profile (no history and no picked artists → `409`); `seed.ref` (`dz:…` or `nd:<song>`) / `seed.nd_song_id` — «Волна по треку»: that track is `tracks[0]`; `seed.artist_ref` (`dz:…`) — a wave by the artist; `seed.nd_artist_id` — a wave by a Navidrome artist (the app's «Радиостанции»): the artist's library songs (generator `artist_songs`) with the radios of its Deezer artist (found by a song's catalog record or the exact name; none — the radios of its songs). The artist of a wave by an artist plays at most once in 3 tracks. Unknown seed → `404`, none of them → `422`. `mode` — the familiar share as a mix's (default: the user's mix mode). May take up to ~10 s (the sources are asked; the profile is made) |
-| POST | `/api/wave/{session_id}/next` | `WaveNextIn` `{played: PlayEventIn[] (≤ 500), queued: [ref] (≤ 50)}` → `WaveOut` with `recorded` (`PlayEventsOut` of `played`). Unknown session, another user's, or not asked for 24 h → `404` «Волна закончилась» (start a new one) |
+| POST | `/api/wave/{session_id}/next` | `WaveNextIn` `{played: PlayEventIn[] (≤ 500), queued: [ref] (≤ 50)}` → `WaveOut` with `recorded` (`PlayEventsOut` of `played`). Catalog tracks are checked for a full source before hand-out; preview-only refs are skipped. Unknown session, another user's, or not asked for 24 h → `404` «Волна закончилась» (start a new one) |
+
+| POST | `/api/wave/{session_id}/no_file` | `WaveNoFileIn {ref}` → `{"ok": true}` (same response contract); records a 24-hour cross-session exclusion for the ref/fingerprint |
 
 `origin`, `client`, `restart_of` — optional, analytics only (INSIGHTS.md 6.3; the wave never reads them; clients send
 them when `/healthz` has `wave_origin_v1`): `origin` ≤ 32, `^[a-z][a-z0-9_]*$` (else `422`; an unknown code is stored

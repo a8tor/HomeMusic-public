@@ -192,13 +192,22 @@ class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, 
         ): Map<String, Any> {
             val body = HashMap<String, Any>()
             val ref = seed?.get("ref") as? String
+            val ndSong = seed?.get("nd_song_id") as? String
             val artist = seed?.get("artist_ref") as? String
             val ndArtist = seed?.get("nd_artist_id") as? String
-            when {
-                !ref.isNullOrBlank() -> body["seed"] = mapOf("ref" to ref)
+            val seedMap = when {
+                !ref.isNullOrBlank() -> mutableMapOf<String, Any>("ref" to ref)
+                !ndSong.isNullOrBlank() -> mutableMapOf<String, Any>("nd_song_id" to ndSong)
                 // a wave by a Navidrome artist keeps its library songs
-                !ndArtist.isNullOrBlank() -> body["seed"] = mapOf("nd_artist_id" to ndArtist)
-                !artist.isNullOrBlank() -> body["seed"] = mapOf("artist_ref" to artist)
+                !ndArtist.isNullOrBlank() -> mutableMapOf<String, Any>("nd_artist_id" to ndArtist)
+                !artist.isNullOrBlank() -> mutableMapOf<String, Any>("artist_ref" to artist)
+                else -> null
+            }
+            if (seedMap != null) {
+                if (seed?.get("by_artist").let { it == true || it == "true" }) {
+                    seedMap["by_artist"] = true
+                }
+                body["seed"] = seedMap
             }
             if (!mode.isNullOrBlank()) body["mode"] = mode
             Launch.validOrigin(origin)?.let { body["origin"] = it }

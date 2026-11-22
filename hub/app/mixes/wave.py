@@ -47,7 +47,7 @@ from app.mixes.resolve import catalog_track, library_track
 from app.mixes.taste import EARLY_SKIP_S, Profile, TasteTrack, artist_key, build_profile, skip_weight
 from app.mixes.taste_math import V2Profile, saturation
 from app.mixes.taste_snapshot import TasteEvent
-from app.models import DownloadBatch, DownloadItem, PlayEvent, Track, User, WaveItem, WaveSession, utcnow
+from app.models import DownloadBatch, DownloadItem, PlayEvent, Track, User, WaveExclusion, WaveItem, WaveSession, utcnow
 from app.services import svc
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,13 @@ PLAY_KINDS = ("start", "skip", "finish")
 
 BATCH = 5
 HISTORY_MAX = 50
+WAVE_SHOWN_TTL = timedelta(hours=12)
+WAVE_SKIP_TTL = timedelta(days=3)
+WAVE_NO_FILE_TTL = timedelta(seconds=86400)  # listen.KEEP_PREVIEW_S
+WAVE_TRANSIENT_TTL = timedelta(minutes=5)
+PICK_TOP_N = 12
+PROBE_CONCURRENCY = 4
+PROBE_BATCH_TIMEOUT_S = 7.0
 ARTIST_GAP = 8  # an artist at most once in this many tracks
 SEED_ARTIST_GAP = 3  # ... the artist a wave started from: at most once in this many
 POOL_LOW = 25  # fewer candidates left: the pool is refilled in the background
@@ -131,6 +138,9 @@ class State:
     played: list[Played] = field(default_factory=list)
     heard: set[str] = field(default_factory=set)  # fingerprints of every track started: never again
     nofile: set[str] = field(default_factory=set)  # refs no source had: a 30 s preview is no wave track
+    exclusion_refs: set[str] = field(default_factory=set)
+    exclusion_fps: set[str] = field(default_factory=set)
+    no_file_fps: set[str] = field(default_factory=set)
     handed: dict[str, float] = field(default_factory=dict)  # ref -> when it was handed out (no repeat for a while)
     skips: dict[str, int] = field(default_factory=dict)  # artist key -> early skips in the session
     pos: list[str] = field(default_factory=list)  # vector keys of the session's likes and finished tracks
@@ -148,7 +158,8 @@ class State:
                 "signals": self.signals, "positive_weights": self.positive_weights, "space": self.space,
                 "pool": [cand_json(c) for c in self.pool.values()], "out": [cand_json(c) for c in self.out.values()],
                 "played": [p.__dict__ for p in self.played], "heard": sorted(self.heard), "handed": self.handed,
-                "nofile": sorted(self.nofile), "skips": self.skips,
+                "nofile": sorted(self.nofile), "exclusion_refs": sorted(self.exclusion_refs),
+                "exclusion_fps": sorted(self.exclusion_fps), "no_file_fps": sorted(self.no_file_fps), "skips": self.skips,
                 "pos": self.pos, "neg": self.neg, "radios": self.radios, "seeds_used": self.seeds_used,
                 "started": self.started, "started_familiar": self.started_familiar, "downloads": self.downloads,
                 "gens": self.gens, "seed_artist": self.seed_artist}
@@ -165,13 +176,15 @@ class State:
                  downloads=list(d.get("downloads") or []), gens=dict(d.get("gens") or {}),
                  heard=set(d.get("heard") or []), seed_artist=d.get("seed_artist"),
                  nofile=set(d.get("nofile") or []),
+                 exclusion_refs=set(d.get("exclusion_refs") or []),
+                 exclusion_fps=set(d.get("exclusion_fps") or []),
+                 no_file_fps=set(d.get("no_file_fps") or []),
                  handed={k: float(v) for k, v in (d.get("handed") or {}).items()})
         st.pool = {c.track.ref: c for c in map(cand_of, d.get("pool") or [])}
         st.out = {c.track.ref: c for c in map(cand_of, d.get("out") or [])}
         st.played = [Played(**p) for p in d.get("played") or []]
-        if not d.get("handed"):
-            # A session started before `handed` existed: everything it hands out is new to the block, so a track
-            # flipped past now is protected at once instead of coming back as if it were a fresh candidate.
+        if "handed" not in d:
+            # Older persisted sessions have no handout ledger; protect their current queue.
             fresh = time.time()
             st.handed = {ref: fresh for ref in st.out}
         return st
@@ -192,6 +205,9 @@ class Runtime:
     mode: str
     state: State
     profile: Profile | None = None
+    no_file_refs: set[str] = field(default_factory=set)
+    probe_cooldown: dict[str, float] = field(default_factory=dict)
+    salt: str = ""
     vectors: dict[str, list[float]] = field(default_factory=dict)
     asked: dict[str, float] = field(default_factory=dict)  # key -> when it was asked (monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -205,6 +221,38 @@ class Runtime:
 
 
 _rt: dict[str, Runtime] = {}
+
+
+async def _write_exclusion(user_id: int, ref: str, fp: str | None, reason: str, ttl: timedelta) -> None:
+    if not ref:
+        return
+    try:
+        now = utcnow()
+        stmt = sqlite_insert(WaveExclusion).values(user_id=user_id, ref=ref, fingerprint=fp, reason=reason,
+                                                   created_at=now, expires_at=now + ttl)
+        async with session_scope() as s:
+            await s.execute(stmt.on_conflict_do_update(
+                index_elements=["user_id", "ref", "reason"],
+                set_={"fingerprint": stmt.excluded.fingerprint, "created_at": now, "expires_at": now + ttl}))
+    except Exception:
+        log.exception("wave exclusion write failed: user=%s reason=%s ref=%s", user_id, reason, ref)
+
+
+async def _write_exclusions(user_id: int, tracks: list[build.Cand], reason: str, ttl: timedelta) -> None:
+    if not tracks:
+        return
+    try:
+        async with session_scope() as s:
+            now = utcnow()
+            rows = [dict(user_id=user_id, ref=c.track.ref, fingerprint=fp_of(c) or None, reason=reason,
+                         created_at=now, expires_at=now + ttl) for c in tracks]
+            stmt = sqlite_insert(WaveExclusion).values(rows)
+            await s.execute(stmt.on_conflict_do_update(
+                index_elements=["user_id", "ref", "reason"],
+                set_={"fingerprint": stmt.excluded.fingerprint, "created_at": now,
+                      "expires_at": stmt.excluded.expires_at}))
+    except Exception:
+        log.exception("wave exclusion write failed: user=%s reason=%s", user_id, reason)
 
 
 async def _save(sid: str, rt: Runtime) -> None:
@@ -221,7 +269,7 @@ async def _runtime(sid: str, user: User) -> Runtime:
             row = await s.get(WaveSession, sid)
             if row is None or row.user_id != user.id or row.updated_at < utcnow() - IDLE:
                 raise WaveError(404, "Волна закончилась: запустите новую")
-            rt = Runtime(user_id=user.id, mode=row.mode, state=State.load(row.state_json or {}))
+            rt = Runtime(user_id=user.id, mode=row.mode, state=State.load(row.state_json or {}), salt=sid)
             if "seen" not in (row.state_json or {}):
                 # Legacy state has no event ledger. Preserve its already-saved learning
                 # rather than applying the old journal again when an offline client retries.
@@ -528,6 +576,9 @@ def _session_weights(st: State, profile: V2Profile) -> None:
 async def _learn_v2(sid: str, rt: Runtime, events: list[PlayEvent]) -> None:
     st, liked = rt.state, []
     assert isinstance(rt.profile, V2Profile)
+    eligible_events = [e for e in events if e.user_id == rt.user_id and e.ts <= utcnow()
+                       and not (e.client or "").lower().endswith("-debug")]
+    await _record_early_skips(rt, eligible_events)
     for e in events:
         if e.user_id != rt.user_id or not e.event_id or e.event_id in st.seen:
             continue
@@ -607,14 +658,28 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     # An empty `queued` is a client that lost its queue, not one that dropped these: it gets the best ones again.
     now = time.time()  # wall clock: `handed` outlives the process (it is in the session's JSON)
     fresh = {fp_of(c) for ref, c in [*st.pool.items(), *st.out.items()]
-             if queued and ref not in queued and now - st.handed.get(ref, -HANDED_TTL_S) < HANDED_TTL_S}
+             if now - st.handed.get(ref, -HANDED_TTL_S) < HANDED_TTL_S
+             and (not queued or ref not in queued)}
+    # The active client queue is retained even when it is the only candidate, as next replaces that queue.
     pool: list[build.Cand] = []
+    excluded_shown: list[build.Cand] = []
     for c in candidates:
         fp = fp_of(c)
         if not fp or fp in seen or fp in fresh:
             continue
+        if c.track.ref in st.nofile or fp in st.no_file_fps:
+            continue
+        if c.track.ref in st.exclusion_refs or fp in st.exclusion_fps:
+            if c.track.ref in queued:
+                seen.add(fp)
+                pool.append(c)
+            else:
+                excluded_shown.append(c)
+            continue
         seen.add(fp)
         pool.append(c)
+    if len(pool) < BATCH:
+        pool.extend(excluded_shown)
     vals = {id(c): value(c, st, vectors, pos, neg, c.track.ref in queued) for c in pool}
     if values is not None:
         values.update((c.track.ref, vals[id(c)]) for c in pool)
@@ -629,8 +694,15 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
         total, fam = st.started + len(out), st.started_familiar + sum(c.familiar for c in out)
         want_fam = fam + 1 <= share * (total + 1) + 0.5
         ok = [c for c in ranked if c.artist not in (seed_gap if c.artist == st.seed_artist else gap)]
-        best = (next((c for c in ok if c.familiar == want_fam), None) or (ok[0] if ok else None)
-                or next((c for c in ranked if not seq or c.artist != seq[-1]), None))
+        eligible = [c for c in ok if c.familiar == want_fam] or ok
+        window = eligible[:PICK_TOP_N]
+        if window:
+            top = vals[id(window[0])]
+            near = [c for c in window if top - vals[id(c)] <= max(0.25, abs(top) * 0.05)]
+            rng = random.Random(f"{getattr(st, 'salt', '')}:{len(out)}")
+            best = rng.choice(near)
+        else:
+            best = next((c for c in ranked if not seq or c.artist != seq[-1]), None)
         if best is None:
             break
         ranked.remove(best)
@@ -727,6 +799,21 @@ def _as_played(c: build.Cand) -> Played:
                   track=c.track.model_dump(mode="json"))
 
 
+async def _record_early_skips(rt: Runtime, events: list[PlayEvent]) -> None:
+    for e in events:
+        if ((e.target_type or "track") != "track" or e.kind != "skip" or e.reverts_event_id
+                or (e.position_s or 0) >= EARLY_SKIP_S):
+            continue
+        track = rt.profile.find(ref=e.ref, nd_song_id=e.nd_song_id) if rt.profile is not None else None
+        fp = track.fp if track is not None else None
+        ref = e.ref or (f"nd:{e.nd_song_id}" if e.nd_song_id else "")
+        await _write_exclusion(rt.user_id, ref, fp, "skipped", WAVE_SKIP_TTL)
+        if ref:
+            rt.state.exclusion_refs.add(ref)
+        if fp:
+            rt.state.exclusion_fps.add(fp)
+
+
 async def learn(sid: str, rt: Runtime, events: list[PlayEvent]) -> None:
     """What the session's events say: starts, early skips, likes, tracks played to the end."""
     if rt.state.taste_model == "v2":
@@ -749,6 +836,13 @@ async def learn(sid: str, rt: Runtime, events: list[PlayEvent]) -> None:
             x = _start(st, x) if e.kind in PLAY_KINDS else _as_played(x)
         if e.kind in ("skip", "finish"):
             x.kind, x.position_s = e.kind, e.position_s
+        if e.kind == "skip" and (e.position_s or 0) < EARLY_SKIP_S:
+            await _write_exclusion(rt.user_id, x.ref,
+                                   fingerprint(x.track.get("artist", ""), x.track.get("title", ""))
+                                   if x.track else None, "skipped", WAVE_SKIP_TTL)
+            st.exclusion_refs.add(x.ref)
+            if x.track:
+                st.exclusion_fps.add(fingerprint(x.track.get("artist", ""), x.track.get("title", "")))
         if (e.kind == "skip" and (e.position_s or 0) < EARLY_SKIP_S) or e.kind == "dislike":
             st.skips[x.artist] = st.skips.get(x.artist, 0) + 1
             _signal(st.neg, x.key)
@@ -998,23 +1092,32 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     async with session_scope() as s:
         await clear_old(s)
         mode = mode or (await settings_of(s, user.id)).mode
+        exclusions = list((await s.execute(select(WaveExclusion).where(
+            WaveExclusion.user_id == user.id, WaveExclusion.expires_at > utcnow()))).scalars())
     seed_track, seed_artist = await _seed(seed, user) if seed else (None, None)
     async with session_scope() as s:
         profile = await build_profile(s, user, model=cfg.taste_model)
+    sid = uuid.uuid4().hex[:16]
     if isinstance(profile, V2Profile):
-        from app.mixes.taste_select import prepare
+        from app.mixes.taste_select import prepare, select_profile_seeds
         await prepare(profile)
+        profile_seeds = select_profile_seeds(profile, cfg.seeds, salt=sid)
+    else:
+        profile_seeds = None
     seeds: list[TasteTrack] = []
     if seed_track is None and seed_artist is None:
         if isinstance(profile, V2Profile):
-            from app.mixes.taste_select import seeds as select_seeds
-            seeds = await select_seeds(profile, cfg.seeds)
+            seeds = profile_seeds or []
         else:
             seeds = profile.seeds(cfg.seeds) or await build.cold_seeds(profile, cfg.seeds)
         if profile.empty or not seeds:
             raise WaveError(409, "Волне не от чего оттолкнуться: послушайте что-нибудь или выберите исполнителей")
-    sid = uuid.uuid4().hex[:16]
-    rt = Runtime(user_id=user.id, mode=mode, state=State(taste_model=cfg.taste_model), profile=profile)
+    rt = Runtime(user_id=user.id, mode=mode, state=State(taste_model=cfg.taste_model), profile=profile,
+                 salt=sid)
+    rt.state.exclusion_refs = {x.ref for x in exclusions if x.reason != "no_file"}
+    rt.state.exclusion_fps = {x.fingerprint for x in exclusions if x.fingerprint and x.reason != "no_file"}
+    rt.state.nofile.update(x.ref for x in exclusions if x.reason == "no_file")
+    rt.state.no_file_fps = {x.fingerprint for x in exclusions if x.reason == "no_file" and x.fingerprint}
     rt.state.seeds_used = [t.key for t in seeds]
     rt.state.seed_artist = artist_key(seed_artist["name"]) if seed_artist else None
     seed_json = ({"ref": seed_track.ref, "artist": seed_track.artist, "title": seed_track.title} if seed_track
@@ -1069,6 +1172,71 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
     return Batch(sid, title_of(seed_json), rt.mode, seed_json, tracks, pending, recorded)
 
 
+async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand | None,
+                      vectors: dict[str, list[float]] | None = None) -> list[build.Cand]:
+    from app import listen
+
+    now = time.monotonic()
+    semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+    for ref, until in list(rt.probe_cooldown.items()):
+        if until <= now:
+            rt.probe_cooldown.pop(ref, None)
+    probe = [c for c in tracks if c is not first and c.track.source == "dz" and not c.nd_song_id
+             and c.library_track_id is None and c.track.ref not in rt.probe_cooldown]
+
+    async def one(c: build.Cand):
+        async with semaphore:
+            try:
+                choice = await listen.choose(c.track.ref, background=True)
+                return c, choice, None
+            except listen.ListenError as e:
+                return c, None, e
+            except Exception as e:
+                return c, None, e
+
+    if not probe:
+        return tracks
+    tasks = [asyncio.create_task(one(c)) for c in probe]
+    done, pending = await asyncio.wait(tasks, timeout=PROBE_BATCH_TIMEOUT_S)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
+    absent = set()
+    transient = set()
+    for c, choice, error in results:
+        if choice is not None and choice.kind == "preview":
+            absent.add(c.track.ref)
+        elif error is not None:
+            transient.add(c.track.ref)
+    if transient:
+        until = time.monotonic() + WAVE_TRANSIENT_TTL.total_seconds()
+        rt.probe_cooldown.update({ref: until for ref in transient})
+    rejected = [c for c in tracks if c.track.ref in absent]
+    for c in rejected:
+        rt.state.nofile.add(c.track.ref)
+        rt.state.exclusion_refs.add(c.track.ref)
+        rt.state.exclusion_fps.add(fp_of(c))
+        rt.state.no_file_fps.add(fp_of(c))
+        rt.state.pool.pop(c.track.ref, None)
+        rt.state.out.pop(c.track.ref, None)
+    await _write_exclusions(rt.user_id, rejected, "no_file", WAVE_NO_FILE_TTL)
+    remaining = [c for c in tracks if c.track.ref not in absent]
+    if len(remaining) < BATCH and absent:
+        remaining_fps = {fp_of(c) for c in remaining}
+        extras = pick(rt.state, rt.profile, rt.mode, vectors or rt.vectors, n=BATCH - len(remaining),
+                      queued=set(), first=first)
+        for c in extras:
+            if c.track.ref in absent or fp_of(c) in remaining_fps:
+                continue
+            remaining.append(c)
+            remaining_fps.add(fp_of(c))
+        if len(remaining) > len([c for c in tracks if c.track.ref not in absent]):
+            remaining = await _probe_full(rt, remaining, first, vectors)
+    return remaining
+
+
 async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand | None = None) -> list[build.Cand]:
     """Picks the next batch; it becomes the client's queue (the rest of the old one goes back to the pool). Their
     files are picked by the Hub now."""
@@ -1086,7 +1254,10 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
     values: dict[str, float] = {}
     now = time.time()
     st.prune_handed(now)
-    tracks = pick(st, rt.profile, rt.mode, await _vectors(rt), queued=queued, first=first, values=values)
+    vectors = await _vectors(rt)
+    tracks = pick(st, rt.profile, rt.mode, vectors, queued=queued, first=first, values=values)
+    if tracks:
+        tracks = await _probe_full(rt, tracks, first, vectors)
     if not tracks and first is None:
         # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
         # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
@@ -1100,6 +1271,10 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
         st.pool.pop(c.track.ref, None)
         st.out[c.track.ref] = c
         st.handed[c.track.ref] = now
+        if c.track.ref in queued:
+            st.exclusion_refs.discard(c.track.ref)
+            st.exclusion_fps.discard(fp_of(c))
+    await _write_exclusions(rt.user_id, tracks, "shown", WAVE_SHOWN_TTL)
     await _save(sid, rt)
     try:  # its own transaction after the state's: a failure here never costs the wave its answer or its state
         async with session_scope() as s:
@@ -1152,9 +1327,19 @@ async def no_file(user: User, sid: str, ref: str) -> bool:
     async with rt.lock:
         st = rt.state
         c = st.out.pop(ref, None) or st.pool.pop(ref, None)
+        if c is None and rt.profile is not None:
+            taste_track = rt.profile.find(ref=ref)
+            if taste_track is not None:
+                c = build.Cand(track=taste_track.track, gens={})
         st.handed.pop(ref, None)
         st.nofile.add(ref)
+        st.exclusion_refs.add(ref)
+        if c is not None:
+            st.exclusion_fps.add(fp_of(c))
+            st.no_file_fps.add(fp_of(c))
         await _save(sid, rt)
+        await _write_exclusion(rt.user_id, ref, fp_of(c) or None if c is not None else None,
+                               "no_file", WAVE_NO_FILE_TTL)
         if c is not None:
             log.info("wave %s: no source has %s — %s", sid, c.track.artist, c.track.title)
         return True

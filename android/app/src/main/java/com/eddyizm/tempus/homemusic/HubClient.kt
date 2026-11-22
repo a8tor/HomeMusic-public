@@ -560,6 +560,15 @@ object HubClient {
         return call({ Request.Builder().url("$it/api/wave/$sessionId/next").post(json).build() }) { parse(it, WaveOut::class.java) }
     }
 
+    /** `POST /api/wave/{id}/no_file`: a track no source has (only a 30 s preview); the Hub excludes it from the wave. */
+    @JvmStatic
+    @WorkerThread
+    @Throws(IOException::class)
+    fun waveNoFile(sessionId: String, ref: String) {
+        val json = gson.toJson(mapOf("ref" to ref)).toRequestBody(JSON)
+        call({ Request.Builder().url("$it/api/wave/$sessionId/no_file").post(json).build() }) { }
+    }
+
     /** `POST /api/smart-shuffle/start`: [body] — [SmartSession.startBody]; the order of the list's own songs and the first recommendations. */
     @JvmStatic
     @WorkerThread
