@@ -392,6 +392,7 @@ def test_an_old_session_gets_the_handout_block_for_its_queue() -> None:
     saved.out = {queue.track.ref: queue}
     saved.pool = {cand(2, score=1).track.ref: cand(2, score=1)}
     old = saved.dump()
+    old["pool"] = [wave.cand_json(c) for c in saved.pool.values()]
     old.pop("handed")  # a session of an older build
 
     back = wave.State.load(old)
@@ -423,6 +424,69 @@ async def test_an_empty_answer_keeps_the_queue_and_asks_again(env, monkeypatch) 
     assert len({t["ref"] for t in r["tracks"]}) == len(r["tracks"])
 
 
+def test_compact_state_round_trip_keeps_float32_vectors_and_pick() -> None:
+    import json
+    import struct
+
+    st = state(cand(1), cand(2))
+    st.out["dz:1"] = st.pool.pop("dz:1")
+    st.space = {"model": "embed-v2", "space_id": "space-1", "dim": 3,
+                "vectors": {"dz:1": [0.123456789, 1.25, -2.5], "dz:2": [0.0, 0.5, 1.0]}}
+    packed = json.loads(json.dumps(st.dump()))
+    back = wave.State.load(packed)
+
+    assert back.space["model"] == "embed-v2" and back.space["space_id"] == "space-1"
+    for key, vector in st.space["vectors"].items():
+        assert back.space["vectors"][key] == list(struct.unpack(f"{len(vector)}f", struct.pack(f"{len(vector)}f", *vector)))
+    assert [c.track.ref for c in wave.pick(back, profile(), "discover", {}, n=2)]
+
+
+def test_legacy_state_loads_space_vectors_and_pool() -> None:
+    old = wave.State()
+    old.space = {"model": "legacy", "space_id": "old-space", "vectors": {"dz:1": [0.1, 0.2]}}
+    old.pool["dz:1"] = cand(1)
+    legacy = old.dump()
+    legacy["pool"] = [wave.cand_json(c) for c in old.pool.values()]
+    legacy["space"] = old.space
+    legacy.pop("space_b64")
+
+    back = wave.State.load(legacy)
+
+    assert back.space == old.space and back.pool["dz:1"].track.ref == "dz:1"
+
+
+def test_compact_state_json_is_smaller_than_legacy() -> None:
+    import json
+
+    st = state(*(cand(i) for i in range(1, 36)))
+    st.space = {"model": "embed-v2", "space_id": "space-1", "dim": 128,
+                "vectors": {f"dz:{i}": [i / 1000 + j / 10000 for j in range(128)] for i in range(1, 36)}}
+    modern = st.dump()
+    legacy = {**modern, "pool": [wave.cand_json(c) for c in st.pool.values()],
+              "space": {**st.space, "vectors": st.space["vectors"]}}
+    legacy.pop("space_b64")
+    old_len = len(json.dumps(legacy, separators=(",", ":")))
+    new_len = len(json.dumps(modern, separators=(",", ":")))
+    assert new_len < old_len * 0.5
+
+
+async def test_profile_timeout_still_hands_out_seed(env, monkeypatch) -> None:
+    import asyncio
+
+    await history(env["admin"])
+
+    async def slow_profile(*args, **kwargs):
+        await asyncio.sleep(0.1)
+
+    monkeypatch.setattr(wave, "build_profile", slow_profile)
+    monkeypatch.setattr(wave, "PROFILE_TIMEOUT_S", 0.01)
+    fake_sources(monkeypatch, [tr(9850 + i) for i in range(6)])
+    response = await env["client"].post("/api/wave/start", json={"seed": {"ref": "dz:100"}})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tracks"] and response.json()["tracks"][0]["ref"] == "dz:100"
+
+
 def test_state_survives_its_json() -> None:
     st = state(cand(1), played=["Арт A"])
     st.out["dz:2"] = cand(2)
@@ -430,7 +494,7 @@ def test_state_survives_its_json() -> None:
 
     back = wave.State.load(st.dump())
 
-    assert back.dump() == st.dump() and back.pool["dz:1"].track == st.pool["dz:1"].track
+    assert back.dump() == st.dump() and not back.pool and back.out["dz:2"].track == st.out["dz:2"].track
 
 
 def test_the_pool_comes_from_the_seed_or_the_mix_generators() -> None:
@@ -708,7 +772,8 @@ async def test_a_wave_by_search_file_keeps_the_file_and_continues_after_restart(
         "played": [ev("start", ref)], "queued": []})
     assert response.status_code == 200, response.text
     assert response.json()["recorded"]["accepted"] == 1
-    assert response.json()["tracks"] and all(t["ref"] != ref for t in response.json()["tracks"])
+    assert all(t["ref"] != ref for t in response.json()["tracks"])
+    assert response.json()["pending"]
 
 
 async def test_a_wave_rejects_an_unknown_search_file(env) -> None:
@@ -985,7 +1050,7 @@ async def test_an_old_session_is_cleared_to_a_summary_not_deleted(env, monkeypat
     assert cleared.state_json["cleared"] is True and cleared.state_json["started"] == 3
     assert not {"pool", "out", "played", "seen", "signals"} & set(cleared.state_json)
     assert len(await wave_items(old)) == 1  # the start handout stays
-    assert "pool" in (await wave_row(fresh)).state_json and (await wave_row(fresh)).cleared_at is None
+    assert "pool" not in (await wave_row(fresh)).state_json and (await wave_row(fresh)).cleared_at is None
     # over, from memory as from the row; its summary still loads
     assert (await c.post(f"/api/wave/{old}/next", json={})).status_code == 404
     await wave.reset()

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +16,7 @@ from app.mixes import wave
 from app.models import User
 
 router = APIRouter(prefix="/api/wave", tags=["wave"])
+log = logging.getLogger(__name__)
 
 
 async def track_outs(s: AsyncSession, cands: list, user_id: int) -> list[WaveTrackOut]:
@@ -32,13 +36,17 @@ async def track_outs(s: AsyncSession, cands: list, user_id: int) -> list[WaveTra
 
 
 async def wave_out(s: AsyncSession, b: wave.Batch, user_id: int) -> WaveOut:
+    started = time.monotonic()
     tracks = await track_outs(s, b.tracks, user_id)
     recorded = None
     if b.recorded is not None:
         r = b.recorded
         recorded = PlayEventsOut(accepted=r.accepted, duplicates=r.duplicates, rejected=r.rejected)
-    return WaveOut(session_id=b.session_id, title=b.title, mode=b.mode,  # type: ignore[arg-type]
-                   seed=b.seed, tracks=tracks, pending=b.pending, recorded=recorded)
+    result = WaveOut(session_id=b.session_id, title=b.title, mode=b.mode,  # type: ignore[arg-type]
+                     seed=b.seed, tracks=tracks, pending=b.pending, recorded=recorded)
+    log.info("wave %s: annotate_tracks/response=%.2fs tracks=%d", b.session_id, time.monotonic() - started,
+             len(tracks))
+    return result
 
 
 @router.post("/start", response_model=WaveOut)

@@ -21,7 +21,10 @@ after every action.
 
 from __future__ import annotations
 
+import array
 import asyncio
+import base64
+import json
 import logging
 import math
 import random
@@ -56,6 +59,9 @@ PLAY_KINDS = ("start", "skip", "finish")
 
 BATCH = 5
 HISTORY_MAX = 50
+STATE_HISTORY_MAX = 300
+SAVE_DEBOUNCE_S = 1.5
+PROFILE_TIMEOUT_S = 5.0
 WAVE_SHOWN_TTL = timedelta(hours=12)
 WAVE_SKIP_TTL = timedelta(days=3)
 WAVE_NO_FILE_TTL = timedelta(seconds=86400)  # listen.KEEP_PREVIEW_S
@@ -158,22 +164,50 @@ class State:
     seed_artist: str | None = None  # artist key of a wave by an artist: it plays more often (`SEED_ARTIST_GAP`)
 
     def dump(self) -> dict[str, Any]:
-        return {"version": self.version, "taste_model": self.taste_model, "seen": sorted(self.seen),
-                "signals": self.signals, "positive_weights": self.positive_weights, "space": self.space,
-                "pool": [cand_json(c) for c in self.pool.values()], "out": [cand_json(c) for c in self.out.values()],
-                "played": [p.__dict__ for p in self.played], "heard": sorted(self.heard), "handed": self.handed,
+        vectors: dict[str, list[float]] = {}
+        space_meta = self.space
+        if isinstance(self.space, dict):
+            space_meta = {k: v for k, v in self.space.items() if k != "vectors"}
+            vectors = self.space.get("vectors") if isinstance(self.space.get("vectors"), dict) else {}
+        encoded = {key: base64.b64encode(array.array("f", vector).tobytes()).decode("ascii")
+                   for key, vector in vectors.items() if isinstance(vector, (list, tuple))}
+        return {"version": self.version, "taste_model": self.taste_model, "seen": sorted(self.seen)[-STATE_HISTORY_MAX:],
+                "signals": dict(list(self.signals.items())[-STATE_HISTORY_MAX:]),
+                "positive_weights": self.positive_weights, "space": space_meta,
+                "space_b64": {"fmt": "f32b64", "v": encoded},
+                "out": [cand_json(c) for c in self.out.values()],
+                "played": [p.__dict__ for p in self.played[-STATE_HISTORY_MAX:]],
+                "heard": sorted(self.heard), "handed": dict(list(self.handed.items())[-STATE_HISTORY_MAX:]),
                 "nofile": sorted(self.nofile), "exclusion_refs": sorted(self.exclusion_refs),
                 "exclusion_fps": sorted(self.exclusion_fps), "no_file_fps": sorted(self.no_file_fps), "skips": self.skips,
-                "pos": self.pos, "neg": self.neg, "radios": self.radios, "seeds_used": self.seeds_used,
-                "started": self.started, "started_familiar": self.started_familiar, "downloads": self.downloads,
-                "gens": self.gens, "seed_artist": self.seed_artist}
+                "pos": self.pos[-STATE_HISTORY_MAX:], "neg": self.neg[-STATE_HISTORY_MAX:],
+                "radios": self.radios[-STATE_HISTORY_MAX:], "seeds_used": self.seeds_used[-STATE_HISTORY_MAX:],
+                "started": self.started, "started_familiar": self.started_familiar,
+                "downloads": self.downloads[-STATE_HISTORY_MAX:], "gens": self.gens, "seed_artist": self.seed_artist}
 
     @classmethod
     def load(cls, d: dict[str, Any]) -> State:
+        space = d.get("space")
+        packed = d.get("space_b64")
+        if isinstance(packed, dict) and packed.get("fmt") == "f32b64":
+            try:
+                raw = packed.get("v") or {}
+                vectors = {}
+                for key, value in raw.items():
+                    data = base64.b64decode(value, validate=True)
+                    if len(data) % array.array("f").itemsize:
+                        raise ValueError("invalid float32 vector size")
+                    vectors[key] = list(array.array("f", data))
+                if isinstance(space, dict):
+                    space = {**space, "vectors": vectors}
+                elif vectors:
+                    space = {"vectors": vectors}
+            except (ValueError, TypeError, KeyError):
+                space = d.get("space")
         st = cls(version=int(d.get("version") or 1), taste_model="v2" if d.get("version") and
                  d.get("taste_model") == "v2" else "v1", seen=set(d.get("seen") or []),
                  signals=dict(d.get("signals") or {}), positive_weights=dict(d.get("positive_weights") or {}),
-                 space=d.get("space"), skips=dict(d.get("skips") or {}),
+                 space=space, skips=dict(d.get("skips") or {}),
                  pos=list(d.get("pos") or []), neg=list(d.get("neg") or []),
                  radios=list(d.get("radios") or []), seeds_used=list(d.get("seeds_used") or []),
                  started=int(d.get("started") or 0), started_familiar=int(d.get("started_familiar") or 0),
@@ -220,6 +254,9 @@ class Runtime:
     # a session of another kind (the smart shuffle, app.mixes.smart) keeps its state in its own row, and a track
     # played to its end is not downloaded for it
     save: Callable[[str, Runtime], Awaitable[None]] | None = None
+    last_saved: float = 0.0
+    save_pending: bool = False
+    last_state_kb: int = 0
     download_finished: bool = True
     blocked: Callable[[build.Cand], bool] | None = None  # candidates the session never takes (its own songs...)
 
@@ -259,11 +296,22 @@ async def _write_exclusions(user_id: int, tracks: list[build.Cand], reason: str,
         log.exception("wave exclusion write failed: user=%s reason=%s", user_id, reason)
 
 
-async def _save(sid: str, rt: Runtime) -> None:
+async def _save(sid: str, rt: Runtime, *, force: bool = False) -> None:
+    now_mono = time.monotonic()
+    if not force and rt.last_saved and now_mono - rt.last_saved < SAVE_DEBOUNCE_S:
+        rt.save_pending = True
+        return
+    started = time.monotonic()
+    dumped = rt.state.dump()
+    size = len(json.dumps(dumped, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     async with session_scope() as s:
         row = await s.get(WaveSession, sid)
         if row is not None:
-            row.state_json, row.updated_at = rt.state.dump(), utcnow()
+            row.state_json, row.updated_at = dumped, utcnow()
+    rt.last_saved = time.monotonic()
+    rt.save_pending = False
+    rt.last_state_kb = size // 1024
+    log.debug("wave %s: _save=%.3fs state=%dKB (bytes=%d)", sid, time.monotonic() - started, size // 1024, size)
 
 
 async def _runtime(sid: str, user: User) -> Runtime:
@@ -274,6 +322,10 @@ async def _runtime(sid: str, user: User) -> Runtime:
             if row is None or row.user_id != user.id or row.updated_at < utcnow() - IDLE:
                 raise WaveError(404, "Волна закончилась: запустите новую")
             rt = Runtime(user_id=user.id, mode=row.mode, state=State.load(row.state_json or {}), salt=sid)
+            if "space_b64" in (row.state_json or {}) and not rt.state.pool and rt.state.out:
+                rt.state.pool.update(rt.state.out)
+                rt.state.out.clear()
+                rt.state.handed.clear()
             if "seen" not in (row.state_json or {}):
                 # Legacy state has no event ledger. Preserve its already-saved learning
                 # rather than applying the old journal again when an offline client retries.
@@ -286,9 +338,19 @@ async def _runtime(sid: str, user: User) -> Runtime:
     return rt
 
 
-async def _profile(rt: Runtime, user: User) -> Profile:
-    async with session_scope() as s:
-        rt.profile = await build_profile(s, user, model=rt.state.taste_model)
+async def _profile(rt: Runtime, user: User, *, timings: dict[str, float] | None = None) -> Profile:
+    started = time.monotonic()
+    try:
+        async with session_scope() as s:
+            rt.profile = await asyncio.wait_for(
+                build_profile(s, user, model=rt.state.taste_model), PROFILE_TIMEOUT_S)
+    except TimeoutError:
+        log.warning("wave: build_profile timed out after %.1fs; using cached/minimal profile", PROFILE_TIMEOUT_S)
+        if rt.profile is None:
+            rt.profile = Profile(user_id=user.id, now=utcnow())
+    finally:
+        if timings is not None:
+            timings["_profile"] = time.monotonic() - started
     if isinstance(rt.profile, V2Profile):
         from app.mixes.taste_select import prepare
         try:
@@ -1196,6 +1258,8 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     analytics only."""
     from app.mixes.core import settings_of
 
+    total_started = time.monotonic()
+    timings: dict[str, float] = {}
     cfg = get_settings().cfg.mixes
     async with session_scope() as s:
         await clear_old(s)
@@ -1203,8 +1267,14 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
         exclusions = list((await s.execute(select(WaveExclusion).where(
             WaveExclusion.user_id == user.id, WaveExclusion.expires_at > utcnow()))).scalars())
     seed_track, seed_artist = await _seed(seed, user) if seed else (None, None)
-    async with session_scope() as s:
-        profile = await build_profile(s, user, model=cfg.taste_model)
+    stage = time.monotonic()
+    try:
+        async with session_scope() as s:
+            profile = await asyncio.wait_for(build_profile(s, user, model=cfg.taste_model), PROFILE_TIMEOUT_S)
+    except TimeoutError:
+        log.warning("wave: build_profile timed out after %.1fs; using minimal profile", PROFILE_TIMEOUT_S)
+        profile = Profile(user_id=user.id, now=utcnow())
+    timings["build_profile"] = time.monotonic() - stage
     sid = uuid.uuid4().hex[:16]
     if isinstance(profile, V2Profile):
         from app.mixes.taste_select import select_profile_seeds
@@ -1245,13 +1315,17 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
             first.familiar = build.keep(first, profile, cfg) and first.familiar
             first.score = build.score(first, weights(), profile)
     gens = list(generators(profile, seed_track, seed_artist, seeds).items())
+    stage = time.monotonic()
     if first is not None:
         rt.state.heard.add(fp_of(first))  # the radios' copies of the seed stay out
         await _start_pool(sid, rt, gens, time.monotonic())
     else:
         first = await _start_pool(sid, rt, gens, time.monotonic() + START_FIRST_TIMEOUT_S)
+    timings["_gather/probe"] = time.monotonic() - stage
     async with rt.lock:
+        stage = time.monotonic()
         tracks = await _hand_out(sid, rt, set(), first, first_only=seed_track is None)
+        timings["_hand_out"] = time.monotonic() - stage
         pending = bool(rt.tasks)
     if isinstance(profile, V2Profile):
         from app.mixes.taste_select import prepare
@@ -1265,13 +1339,29 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
         rt.tasks.add(task)
         task.add_done_callback(rt.tasks.discard)
         pending = True
+    save_started = time.monotonic()
+    await _save(sid, rt, force=True)
+    timings["_save"] = time.monotonic() - save_started
+    timings["total"] = time.monotonic() - total_started
+    log.info("wave %s: start total=%.2fs build_profile=%.2f _gather/probe=%.2f _hand_out=%.2f _save=%.2f "
+             "state=%dKB", sid, timings["total"], timings["build_profile"], timings["_gather/probe"],
+             timings["_hand_out"], timings["_save"], getattr(rt, "last_state_kb", 0))
     return Batch(sid, title_of(seed_json), mode, seed_json, tracks, pending)
 
 
 async def next_batch(user: User, sid: str, played: list[Any], queued: list[str]) -> Batch:
+    total_started = time.monotonic()
+    timings: dict[str, float] = {}
     rt = await _runtime(sid, user)
     if not rt.state.pool and rt.tasks:  # nothing to pick from yet: the sources still answer (outside the lock)
         await asyncio.wait(set(rt.tasks), timeout=min(get_settings().wave_wait_s, SOURCE_WAIT_S))
+    if not rt.state.pool and not rt.tasks and rt.profile is None:
+        async with session_scope() as s:
+            row = await s.get(WaveSession, sid)
+            if row is not None and row.seed_json and row.seed_json.get("ref") and not rt.state.heard:
+                seed_track, _ = await _seed({"ref": row.seed_json["ref"]}, user)
+                if seed_track is not None:
+                    rt.state.pool[seed_track.ref] = build.Cand(track=seed_track, gens={"seed": 0})
     async with rt.lock:
         async with session_scope() as s:
             recorded, events = await record(s, sid, user.id, played)
@@ -1283,13 +1373,28 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
             seed_json = row.seed_json if row else None
             if row is not None:
                 row.next_calls = (row.next_calls or 0) + 1
-        await _profile(rt, user)  # Must follow the event transaction, including external state changes.
+        await _profile(rt, user, timings=timings)  # after events and external state changes
+        stage = time.monotonic()
         await learn(sid, rt, events)
+        timings["learn/gather"] = time.monotonic() - stage
         st = rt.state
         if len(st.pool) < POOL_LOW:
             _refill(sid, rt)
+        stage = time.monotonic()
         tracks = await _hand_out(sid, rt, {q for q in queued if q in st.out})
+        timings["hand_out"] = time.monotonic() - stage
+        timings["_vectors"] = getattr(rt, "_wave_vector_elapsed", 0.0)
+        timings["_probe"] = getattr(rt, "_wave_probe_elapsed", 0.0)
+        timings["_save"] = getattr(rt, "_wave_save_elapsed", 0.0)
+        save_started = time.monotonic()
+        await _save(sid, rt, force=bool(played))
+        timings["_save"] += time.monotonic() - save_started
         pending = bool(rt.tasks) or not tracks  # an empty answer means "ask again": the sources are refilling
+    timings["total"] = time.monotonic() - total_started
+    log.info("wave %s: next total=%.2fs _profile=%.2f _vectors=%.2f _gather=%.2f _probe=%.2f _hand_out=%.2f "
+             "_save=%.2f state=%dKB", sid, timings["total"], timings.get("_profile", 0.0),
+             timings.get("_vectors", 0.0), timings.get("learn/gather", 0.0), timings.get("_probe", 0.0),
+             timings.get("hand_out", 0.0), timings.get("_save", 0.0), getattr(rt, "last_state_kb", 0))
     return Batch(sid, title_of(seed_json), rt.mode, seed_json, tracks, pending, recorded)
 
 
@@ -1394,21 +1499,27 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
         vectors = rt.vectors
     else:
         try:
+            stage = time.monotonic()
             vectors = await asyncio.wait_for(_vectors(rt), TASTE_TIMEOUT_S)
+            rt._wave_vector_elapsed = time.monotonic() - stage
         except TimeoutError:
             log.warning("wave: taste vectors timed out; continuing without taste weights")
             vectors = {}
     tracks = pick(st, rt.profile, rt.mode, vectors, n=1 if first_only else BATCH,
                   queued=queued, first=first, values=values)
+    probe_started = time.monotonic()
     if tracks and not first_only:
         tracks = await _probe_full(rt, tracks, first, vectors,
                                    time.monotonic() + PROBE_BATCH_TIMEOUT_S)
+    rt._wave_probe_elapsed = time.monotonic() - probe_started
     if not tracks and first is None:
         # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
         # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
         # would leave the next `queued` naming tracks this session no longer knows.
         _refill(sid, rt)
+        save_started = time.monotonic()
         await _save(sid, rt)
+        rt._wave_save_elapsed = time.monotonic() - save_started
         return tracks
     for ref in list(st.out):
         st.pool[ref] = st.out.pop(ref)
@@ -1420,7 +1531,9 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
             st.exclusion_refs.discard(c.track.ref)
             st.exclusion_fps.discard(fp_of(c))
     await _write_exclusions(rt.user_id, tracks, "shown", WAVE_SHOWN_TTL)
-    await _save(sid, rt)
+    save_started = time.monotonic()
+    await _save(sid, rt, force=st.started == 0)
+    rt._wave_save_elapsed = time.monotonic() - save_started
     try:  # its own transaction after the state's: a failure here never costs the wave its answer or its state
         async with session_scope() as s:
             await save_items(s, sid, rt.user_id, tracks, values)
@@ -1482,7 +1595,7 @@ async def no_file(user: User, sid: str, ref: str) -> bool:
         if c is not None:
             st.exclusion_fps.add(fp_of(c))
             st.no_file_fps.add(fp_of(c))
-        await _save(sid, rt)
+        await _save(sid, rt, force=True)
         await _write_exclusion(rt.user_id, ref, fp_of(c) or None if c is not None else None,
                                "no_file", WAVE_NO_FILE_TTL)
         if c is not None:
