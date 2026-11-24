@@ -336,7 +336,7 @@ export function UploadPage() {
               <div className="card flex items-center gap-3 p-3">
                 {existing ? (
                   <>
-                    <Cover src={existing.has_cover ? libraryCoverUrl(existing.id, 100) : null} size={48} icon="disc" />
+                    <Cover src={existing.has_cover ? libraryCoverUrl(existing.id, 100, existing.cover_rev) : null} size={48} icon="disc" />
                     <div className="min-w-0 flex-1">
                       <div className="truncate">{existing.title}</div>
                       <div className="truncate text-xs text-muted">{[existing.album_artist, existing.year, tracksWord(existing.track_count)].filter(Boolean).join(' · ')}</div>

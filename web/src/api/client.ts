@@ -421,8 +421,9 @@ export const api = {
   deleteChat: (id: number) => request<OkOut>('DELETE', `/api/assistant/chats/${id}`),
 };
 
-export const libraryCoverUrl = (albumId: number, size = 300, bust?: string | number) =>
-  withQuery(`/api/library/albums/${albumId}/cover`, { size, v: bust });
+/** Match the URL across views until the cover revision changes. */
+export const libraryCoverUrl = (albumId: number, size = 300, rev?: string | null) =>
+  withQuery(`/api/library/albums/${albumId}/cover`, { size, v: rev });
 
 /** Audio of a catalog track for `<audio src>`; retry adds a cache-busting query parameter. */
 export const listenStreamUrl = (ref: string, retry = 0) => withQuery('/api/listen/stream', { ref, retry: retry || undefined });

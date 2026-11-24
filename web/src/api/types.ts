@@ -121,6 +121,7 @@ export interface AdminStorageOut {
   backups_bytes: number;
   ytdlp_bytes: number;
   assistant_bytes: number;
+  covers_bytes: number;
   tracks: number;
   albums: number;
   library_tracks_bytes: number;
@@ -288,6 +289,8 @@ export interface LibAlbumOut {
   deezer_album_id: string | null;
   track_count: number;
   has_cover: boolean;
+  /** `cover.jpg` mtime in ns: part of the cover URL, so a replaced cover gets a new URL (and a cacheable one) */
+  cover_rev?: string | null;
   nd_album_id?: string | null;
   tracks?: LibTrackOut[] | null;
 }

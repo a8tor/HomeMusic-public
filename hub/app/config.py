@@ -149,6 +149,12 @@ class StorageCfg(BaseModel):
     listen_max_mb: int = Field(default=500, ge=0)
     # keep at least this much free on the filesystem holding staging, unless active copies prevent it
     listen_min_free_mb: int = Field(default=1024, ge=0)
+    # the cover cache (`DATA_DIR/covers`): a file older than this is fetched again (`app/covers.py`)
+    covers_ttl_s: int = Field(default=7 * 86400, ge=0)
+    # a cache file this old is pruned even when the cache is under its budget
+    covers_keep_s: int = Field(default=30 * 86400, ge=0)
+    # soft ceiling of the cover cache; the oldest covers go first
+    covers_max_mb: int = Field(default=512, ge=0)
     # legacy behavior: persist a library download after a wave listen / economy import
     autodownload_listened: bool = False
     # yt-dlp's own cache (`YTDLP_CACHE_DIR`): entries untouched for this many days go

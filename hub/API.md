@@ -400,7 +400,7 @@ unlike the wave). The rows are kept for the analytics: `smart_sessions`, `smart_
 | GET | `/api/library/albums/{id}` | `LibAlbumOut` with `tracks` |
 | PATCH | `/api/library/albums/{id}` | `AlbumPatchIn` → `LibAlbumOut` (rename, album artist, year, genre, type) |
 | PUT | `/api/library/albums/{id}/cover` | multipart `file` (image) → `LibAlbumOut` |
-| GET | `/api/library/albums/{id}/cover?size=300` | image/jpeg |
+| GET | `/api/library/albums/{id}/cover?size=300` | image/jpeg (`size` 32–1000, absent — 1000). Requires a session. Cached by size and source revision for seven days; when the source is unavailable the last cached revision can still be served. `ETag` + `If-None-Match` → `304`; `Cache-Control: private, max-age=604800, immutable` and `Vary: Cookie`. The client's `v` carries `LibAlbumOut.cover_rev`, the file's nanosecond mtime as a string. |
 | POST | `/api/library/albums/merge` | `AlbumMergeIn` → `LibAlbumOut` (target) |
 | POST | `/api/library/tracks/move` | `TracksMoveIn` → `LibAlbumOut` (target) |
 | PATCH | `/api/library/tracks/{id}` | `TrackPatchIn` → `LibTrackOut` |
@@ -452,7 +452,7 @@ from it → `502`.
 | GET | `/api/nd/artists` | `NdArtistOut[]` — every artist (the alphabetical index flattened) |
 | GET | `/api/nd/artists/{id}` | `NdArtistPageOut {artist, albums}` — albums by year, newest first, those without a year last, ties by title; `404` unknown |
 | GET | `/api/nd/liked` | `NdLikedOut {songs, albums, artists}` — Navidrome stars merged with own track favorites and pending import likes. Own decisions override ND/import state; aliases deduplicate songs. Catalog-only songs have `owned=false`, nullable `nd_song_id` and remain playable by `ref`; listing never starts downloads or catalog requests. Stored subject/import/playback metadata supplies names (ref fallback when unavailable). Songs and albums newest ♥ first; unknown import dates last. Successful `/api/star` commits before publishing a `library` SSE (`starred`/`unstarred`). |
-| GET | `/api/nd/cover/{cover_id}?size=` | the Navidrome cover (`getCoverArt`, `size` 32–1500) proxied, so the page needs no Navidrome credentials; `Cache-Control: private, max-age=86400`; `404` no image, `502` no answer from Navidrome |
+| GET | `/api/nd/cover/{cover_id}?size=` | Navidrome cover (`getCoverArt`, `size` 32–1500), proxied as the signed-in user. The disk cache is per user. `ETag` + `If-None-Match` → `304`; `Cache-Control: private, max-age=604800, immutable` and `Vary: Cookie`. On a source failure, a stale file is served with `private, max-age=300`; `404` no image, `502` source unavailable and no cached copy. |
 
 `NdAlbumOut {id, title, artist, artist_id, year, song_count, duration_s, cover_url, starred, tracks?}`,
 `NdArtistOut {id, name, album_count, cover_url, starred}` — Navidrome ids. `NdSongOut` is a `TrackOut` plus

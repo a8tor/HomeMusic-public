@@ -214,7 +214,7 @@ export function PlaylistPage({ id }: { id: string }) {
     <div>
       <PageHeader title={p.name} back="/playlists" right={<IconButton icon="trash" label="Удалить плейлист" onClick={drop} />} />
       <Hero
-        cover={p.tracks[0]?.cover_url}
+        cover={p.tracks[0]?.cover_small_url || p.tracks[0]?.cover_url}
         title={p.name}
         sub={[tracksWord(p.song_count), p.duration_s ? fmtLength(p.duration_s) : null].filter(Boolean).join(' · ')}
       />
@@ -339,7 +339,7 @@ export function NdAlbumPage({ id }: { id: string }) {
         }
       />
       <Hero
-        cover={a.cover_url?.replace(/size=\d+/, 'size=600')}
+        cover={a.cover_url}
         title={a.title}
         sub={
           <>

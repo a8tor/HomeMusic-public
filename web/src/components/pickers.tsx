@@ -156,7 +156,7 @@ export function AlbumPicker({
                   onClick={() => onPick(a)}
                   className="flex min-h-16 w-full items-center gap-3 px-4 py-2 text-left hover:bg-fg/5 disabled:opacity-50"
                 >
-                  <Cover src={a.has_cover ? libraryCoverUrl(a.id, 100) : null} size={48} icon="disc" />
+                  <Cover src={a.has_cover ? libraryCoverUrl(a.id, 100, a.cover_rev) : null} size={48} icon="disc" />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate">{a.title}</span>
                     <span className="block truncate text-xs text-muted">

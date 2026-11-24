@@ -10,11 +10,11 @@ from datetime import datetime
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import covers
 from app.api.schemas import NdAlbumOut, NdArtistOut, NdArtistPageOut, NdHomeOut, NdLikedOut, NdSongOut
 from app.auth import current_user, user_navidrome
 from app.db import get_session
@@ -219,17 +219,35 @@ async def liked(user: User = Depends(current_user), s: AsyncSession = Depends(ge
 
 
 @router.get("/cover/{cover_id}")
-async def cover(cover_id: str, size: int | None = Query(None, ge=32, le=1500), user: User = Depends(current_user)):
-    """A Navidrome cover (getCoverArt), so the page needs no Navidrome credentials."""
-    nd = user_navidrome(user)
+async def cover(cover_id: str, size: int | None = Query(None, ge=32, le=1500),
+                if_none_match: str | None = Header(None), user: User = Depends(current_user)):
+    """A Navidrome cover (getCoverArt), so the page needs no Navidrome credentials.
+
+    Answered from the disk cache (`app/covers.py`): the key carries the user id, because Navidrome gave the image to
+    that user, so one user's entry is never served for another. A miss fetches `getCoverArt` as the user and stores
+    the file; a file past its TTL is fetched again, and kept (served with a short max-age) when Navidrome is down.
+    """
+    cache_key = covers.key("nd", user.id, cover_id, size)
+    entry = await asyncio.to_thread(covers.get, cache_key)
+    if entry is not None and entry.fresh:
+        return covers.build_response(entry, if_none_match, user_id=user.id)
     try:
-        url, params = nd.cover_art_url_params(cover_id, size)
-        r = await nd.http.get(url, params=params)
+        nd = user_navidrome(user)
+        try:
+            url, params = nd.cover_art_url_params(cover_id, size)
+            r = await nd.http.get(url, params=params)
+        finally:
+            await nd.aclose()
     except httpx.HTTPError as e:
+        if entry is not None:  # stale-while-error: Navidrome is down, the old image is better than none
+            return covers.build_response(entry, if_none_match, user_id=user.id, stale=True)
         raise HTTPException(502, "Navidrome не отвечает") from e
-    finally:
-        await nd.aclose()
-    kind = r.headers.get("content-type", "")
-    if r.status_code != 200 or not kind.startswith("image/"):
+    if r.status_code >= 500:
+        if entry is not None:
+            return covers.build_response(entry, if_none_match, user_id=user.id, stale=True)
+        raise HTTPException(502, "Navidrome не отвечает")
+    ext = covers.image_ext(r.content) if r.status_code == 200 else None
+    if ext is None:
         raise HTTPException(404, "Нет обложки")
-    return Response(r.content, media_type=kind, headers={"Cache-Control": "private, max-age=86400"})
+    entry = await asyncio.to_thread(covers.put, cache_key, r.content, ext)
+    return covers.build_response(entry, if_none_match, user_id=user.id)

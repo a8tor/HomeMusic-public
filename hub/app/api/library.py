@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import io
+import stat
 import uuid
+from os import stat_result
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import covers
 from app.api.schemas import (
     AlbumCreateIn,
     AlbumMergeIn,
@@ -49,18 +52,24 @@ def track_out(t: Track) -> LibTrackOut:
     )
 
 
-def _has_cover(a: Album) -> bool:
-    return (library_abs(album_reldir(a)) / "cover.jpg").is_file()
+def _cover_rev(a: Album) -> str | None:
+    """Keep the nanosecond timestamp exact when the client parses the JSON."""
+    try:
+        st = (library_abs(album_reldir(a)) / "cover.jpg").stat()
+    except OSError:
+        return None
+    return str(st.st_mtime_ns) if stat.S_ISREG(st.st_mode) else None
 
 
 async def album_out(s: AsyncSession, a: Album, *, with_tracks: bool = False) -> LibAlbumOut:
     tracks = (
         await s.execute(select(Track).where(Track.album_id == a.id).order_by(Track.disc_no, Track.track_no, Track.id))
     ).scalars().all()
+    rev = _cover_rev(a)
     return LibAlbumOut(
         id=a.id, uid=a.uid, title=a.title, album_artist=a.album_artist, year=a.year, release_type=a.release_type,
-        genre=a.genre, deezer_album_id=a.deezer_album_id, track_count=len(tracks), has_cover=_has_cover(a),
-        tracks=[track_out(t) for t in tracks] if with_tracks else None,
+        genre=a.genre, deezer_album_id=a.deezer_album_id, track_count=len(tracks), has_cover=rev is not None,
+        cover_rev=rev, tracks=[track_out(t) for t in tracks] if with_tracks else None,
     )
 
 
@@ -103,12 +112,13 @@ async def list_albums(q: str | None = None, offset: int = 0, limit: int = Query(
         select(Track.album_id, func.count(Track.id)).where(Track.album_id.in_([a.id for a in rows]))
         .group_by(Track.album_id)
     )).all())
-    return [
-        LibAlbumOut(id=a.id, uid=a.uid, title=a.title, album_artist=a.album_artist, year=a.year,
-                    release_type=a.release_type, genre=a.genre, deezer_album_id=a.deezer_album_id,
-                    track_count=counts.get(a.id, 0), has_cover=_has_cover(a))
-        for a in rows
-    ]
+    out = []
+    for a in rows:
+        rev = _cover_rev(a)  # one stat per album: `has_cover` and the URL revision are the same fact
+        out.append(LibAlbumOut(id=a.id, uid=a.uid, title=a.title, album_artist=a.album_artist, year=a.year,
+                               release_type=a.release_type, genre=a.genre, deezer_album_id=a.deezer_album_id,
+                               track_count=counts.get(a.id, 0), has_cover=rev is not None, cover_rev=rev))
+    return out
 
 
 @router.post("/api/library/albums", response_model=LibAlbumOut)
@@ -159,20 +169,59 @@ async def put_cover(album_id: int, file: UploadFile = File(...), user: User = De
 
 
 @router.get("/api/library/albums/{album_id}/cover")
-async def get_cover(album_id: int, size: int | None = Query(None, ge=32, le=1000), user: User = Depends(current_user),
+async def get_cover(album_id: int, size: int | None = Query(None, ge=32, le=1000),
+                    if_none_match: str | None = Header(None), user: User = Depends(current_user),
                     s: AsyncSession = Depends(get_session, scope="function")):
+    """Cache each requested size while tracking the revision of the original image."""
     a = await _album(s, album_id)
-    p = library_abs(album_reldir(a)) / "cover.jpg"
-    data: bytes | None = await asyncio.to_thread(p.read_bytes) if p.is_file() else None
-    if data is None:
-        t = (await s.execute(select(Track).where(Track.album_id == a.id).limit(1))).scalar_one_or_none()
-        if t is not None and library_abs(t.path).is_file():
-            data = await asyncio.to_thread(tagger.read_cover, library_abs(t.path))
-    if data is None:
+    size = size or 1000
+    group = covers.key("lib", a.uid, size)
+    source = library_abs(album_reldir(a)) / "cover.jpg"
+    try:
+        st = await asyncio.to_thread(source.stat)
+        if not stat.S_ISREG(st.st_mode):
+            raise FileNotFoundError(source)
+        embedded = False
+    except FileNotFoundError:
+        t = await s.scalar(select(Track).where(Track.album_id == a.id).order_by(Track.id).limit(1))
+        source = library_abs(t.path) if t is not None else None
+        st = None
+        embedded = True
+    except OSError:
+        source = None
+        st = None
+        embedded = False
+
+    if source is not None:
+        entry = await asyncio.to_thread(_load_album_cover, group, source, size, embedded, st)
+        if entry is not None:
+            return covers.build_response(entry, if_none_match, user_id=user.id)
+
+    entry = await asyncio.to_thread(covers.latest, group)
+    if entry is None:
         raise HTTPException(404, "Нет обложки")
-    if size:
-        data = await asyncio.to_thread(_resize, data, size)
-    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    return covers.build_response(entry, if_none_match, user_id=user.id, stale=True)
+
+
+def _load_album_cover(group: str, source: Path, size: int, embedded: bool,
+                      st: stat_result | None) -> covers.Entry | None:
+    from PIL import Image
+
+    try:
+        st = st if st is not None else source.stat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        revision = covers.key(source, st.st_mtime_ns, st.st_size)
+        cache_key = f"{group}/{revision}"
+        entry = covers.get(cache_key)
+        if entry is not None and entry.fresh:
+            return entry
+        data = tagger.read_cover(source) if embedded else source.read_bytes()
+        if data:
+            return covers.put(cache_key, _resize(data, size), ".jpg")
+    except (OSError, ValueError, Image.DecompressionBombError):
+        pass
+    return None
 
 
 def _resize(data: bytes, size: int) -> bytes:

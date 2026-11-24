@@ -178,6 +178,7 @@ function StorageBlock({ s }: { s: AdminStorageOut }) {
     ['Бэкапы', s.backups_bytes],
     ['yt-dlp', s.ytdlp_bytes],
     ['Ассистент', s.assistant_bytes],
+    ['Обложки', s.covers_bytes],
   ];
   return (
     <>

@@ -191,6 +191,7 @@ class StorageOut(BaseModel):
     backups_bytes: int = 0  # .backups
     ytdlp_bytes: int = 0  # YTDLP_CACHE_DIR
     assistant_bytes: int = 0  # DATA_DIR/assistant: the task images
+    covers_bytes: int = 0  # DATA_DIR/covers: the cover cache
     tracks: int = 0
     albums: int = 0
     library_tracks_bytes: int = 0  # sum of the tracks' size_bytes
@@ -268,6 +269,9 @@ class LibAlbumOut(BaseModel):
     deezer_album_id: str | None
     track_count: int = 0
     has_cover: bool = False
+    # revision of `cover.jpg` (mtime_ns): the client puts it in the cover URL, so a replaced cover is a new URL and the
+    # answer may be cached as immutable (`app/api/library.py`)
+    cover_rev: str | None = None
     nd_album_id: str | None = None
     tracks: list[LibTrackOut] | None = None
 

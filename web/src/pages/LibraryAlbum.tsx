@@ -23,7 +23,6 @@ export function LibraryAlbumPage({ id }: { id: number }) {
   const res = useAsync((s) => api.libAlbum(id, s), [id]);
   const trashPolicy = useAsync((s) => api.libraryPolicy(s), []);
   const trashDays = trashPolicy.data?.trash_days ?? 30;
-  const [coverRev, setCoverRev] = useState(() => Date.now());
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [picker, setPicker] = useState<'move' | 'merge' | null>(null);
   const [pickBusy, setPickBusy] = useState(false);
@@ -51,10 +50,13 @@ export function LibraryAlbumPage({ id }: { id: number }) {
   const allSelected = tracks.length > 0 && selected.size === tracks.length;
   // Tracks Navidrome has scanned play in album order: in the app's player, in a browser in the page's own one.
   const playable = tracks.filter((t) => t.nd_song_id);
+  // The cover URL carries the album's cover revision, so it changes only with the image itself (no cache busting
+  // per mount: the browser and the service worker may keep it).
+  const cover = (size: number) => (album.has_cover ? libraryCoverUrl(album.id, size, album.cover_rev) : null);
   const asListen = (t: LibTrackOut): ListenTrack => ({
     ref: `nd:${t.nd_song_id}`, title: t.title, artist: t.artist, album: t.album ?? undefined, duration_s: t.duration_s,
-    cover_url: album.has_cover ? libraryCoverUrl(album.id, 600, coverRev) : null,
-    cover_small_url: album.has_cover ? libraryCoverUrl(album.id, 120, coverRev) : null,
+    cover_url: cover(600),
+    cover_small_url: cover(300),
   });
   const playFrom = (from?: LibTrackOut) => {
     if (canPlay()) return playList(playable, (x) => x.nd_song_id, from);
@@ -184,12 +186,9 @@ export function LibraryAlbumPage({ id }: { id: number }) {
 
       <AlbumForm
         album={album}
-        coverSrc={album.has_cover ? libraryCoverUrl(album.id, 600, coverRev) : null}
+        coverSrc={cover(300)}
         onSaved={(a) => res.setData((prev) => ({ ...a, tracks: a.tracks ?? prev?.tracks }))}
-        onCover={(a) => {
-          res.setData((prev) => ({ ...a, tracks: a.tracks ?? prev?.tracks }));
-          setCoverRev(Date.now());
-        }}
+        onCover={(a) => res.setData((prev) => ({ ...a, tracks: a.tracks ?? prev?.tracks }))}
       />
 
       <SectionTitle

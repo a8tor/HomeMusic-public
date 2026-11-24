@@ -7,7 +7,10 @@ Navidrome is a mock: artists «Кино» (♥, 2 albums) and «Кто-то» (1
 
 from __future__ import annotations
 
+import hashlib
+import os
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -67,7 +70,8 @@ async def env(hub_env):
         elif name == "getPlaylist":
             body = {"playlist": {"id": "pl1", "name": "Дорога", "songCount": 2, "duration": 465, "entry": SONGS}}
         elif name == "getCoverArt":
-            return httpx.Response(200, content=b"\xff\xd8jpeg", headers={"content-type": "image/jpeg"})
+            return httpx.Response(200, content=state.get("art", b"\xff\xd8jpeg"),
+                                  headers={"content-type": "image/jpeg"})
         return httpx.Response(200, json={"subsonic-response": {**OK, **body}})
 
     app = create_app()
@@ -265,6 +269,209 @@ async def test_cover_is_proxied_as_the_user(env):
     assert r.status_code == 200 and r.content == b"\xff\xd8jpeg" and r.headers["content-type"] == "image/jpeg"
     p = [p for n, p in env["state"]["calls"] if n == "getCoverArt"][-1]
     assert (p["id"], p["size"], p["u"]) == ("al-alK", "300", "admin")
+
+
+# --- the disk cache of covers (`app/covers.py`) ---------------------------------------------------------------
+
+
+def _cover_calls(env) -> list[dict]:
+    return [p for n, p in env["state"]["calls"] if n == "getCoverArt"]
+
+
+def _cached_files() -> list[Path]:
+    from app import covers
+
+    root = covers.root()
+    return sorted(p for p in root.iterdir() if p.is_file()) if root.is_dir() else []
+
+
+async def test_cover_is_fetched_once_then_served_from_disk(env):
+    c = env["client"]
+    first = await c.get("/api/nd/cover/al-alK", params={"size": 300})
+    assert first.status_code == 200
+    assert len(_cover_calls(env)) == 1
+    second = await c.get("/api/nd/cover/al-alK", params={"size": 300})
+    assert second.status_code == 200 and second.content == first.content
+    assert len(_cover_calls(env)) == 1, "the second request must not ask Navidrome again"
+    # a different size is a different entry: it does go to the source once
+    assert (await c.get("/api/nd/cover/al-alK", params={"size": 600})).status_code == 200
+    assert len(_cover_calls(env)) == 2
+    assert len(_cached_files()) == 2
+
+
+async def test_cover_headers_scope_caching_to_session_and_answer_304(env):
+    c = env["client"]
+    first = await c.get("/api/nd/cover/al-alK", params={"size": 300})
+    assert first.headers["cache-control"] == "private, max-age=604800, immutable"
+    assert first.headers["vary"] == "Cookie"
+    assert first.headers["x-cover-user"] == str((await c.get("/api/auth/me")).json()["id"])
+    etag = first.headers["etag"]
+    assert etag == f'"{hashlib.sha256(first.content).hexdigest()}"'
+    again = await c.get("/api/nd/cover/al-alK", params={"size": 300}, headers={"If-None-Match": etag})
+    assert again.status_code == 304 and again.content == b""
+    assert again.headers["etag"] == etag
+    # a weak or unquoted token from an old client matches too
+    assert (await c.get("/api/nd/cover/al-alK", params={"size": 300},
+                        headers={"If-None-Match": f"W/{etag}"})).status_code == 304
+
+
+async def test_cover_cache_file_is_written_atomically(env, monkeypatch):
+    from app import covers
+
+    calls: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(covers.os, "replace", spy)
+    r = await env["client"].get("/api/nd/cover/al-alK", params={"size": 300})
+    assert r.status_code == 200
+    assert len(calls) == 1, "the cache entry must be renamed into place, not written in place"
+    src, dst = calls[0]
+    assert src.endswith(".tmp") and dst.endswith(".jpg")
+    # no half-written leftovers, and the file holds exactly the image that was served
+    files = _cached_files()
+    assert len(files) == 1 and files[0].read_bytes() == r.content
+    assert len(files[0].stem) == 64
+    assert not [p for p in covers.root().iterdir() if p.name.endswith(".tmp")]
+
+
+async def test_cover_uses_image_signature_and_preserves_old_file_on_write_failure(env, monkeypatch):
+    from app import covers
+
+    c = env["client"]
+    url = "/api/nd/cover/al-alK"
+    first = await c.get(url)
+    old = _cached_files()[0]
+    monkeypatch.setattr(covers.get_settings().cfg.storage, "covers_ttl_s", 0)
+    env["state"]["art"] = b"\x89PNG\r\n\x1a\nexample"
+
+    def fail_replace(src, dst):
+        raise OSError("cache temporarily unwritable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(covers.os, "replace", fail_replace)
+        r = await c.get(url)
+    assert r.headers["content-type"] == "image/png"
+    assert _cached_files() == [old] and old.read_bytes() == first.content
+
+    r = await c.get(url)
+    assert r.headers["content-type"] == "image/png"
+    assert old.with_suffix(".png").read_bytes() == r.content
+
+
+async def test_expired_cover_is_served_when_the_source_is_down(env):
+    from app import covers
+
+    c = env["client"]
+    first = await c.get("/api/nd/cover/al-alK", params={"size": 300})
+    assert first.status_code == 200
+    path = _cached_files()[0]
+    old = path.stat().st_mtime - (covers.get_settings().cfg.storage.covers_ttl_s + 60)
+    os.utime(path, (old, old))
+    env["state"]["down"] = True
+    stale = await c.get("/api/nd/cover/al-alK", params={"size": 300})
+    assert stale.status_code == 200 and stale.content == first.content
+    assert stale.headers["cache-control"] == "private, max-age=300", "a stale image must be rechecked soon"
+    assert stale.headers["etag"] == first.headers["etag"]
+
+
+async def test_unknown_cover_is_404_and_nothing_is_cached(env):
+    env["state"]["fail"]["getCoverArt"] = 70
+    r = await env["client"].get("/api/nd/cover/no-such-cover", params={"size": 300})
+    assert r.status_code == 404
+    assert _cached_files() == []
+    # and the failure is not remembered: the same id works once Navidrome knows it
+    env["state"]["fail"].clear()
+    assert (await env["client"].get("/api/nd/cover/no-such-cover", params={"size": 300})).status_code == 200
+
+
+async def test_cover_cache_prunes_to_the_budget_and_drops_orphan_tmp(env, monkeypatch):
+    from app import covers
+    from app.config import get_settings
+
+    folder = covers.root()
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(4):
+        (folder / f"{i:040d}.jpg").write_bytes(b"x" * 100)
+    orphan = folder / ".dead.jpg.0123456789abcdef.tmp"
+    orphan.write_bytes(b"y" * 100)
+    old = 1.0  # older than `covers_keep_s` in the test settings
+    os.utime(orphan, (old, old))
+    monkeypatch.setattr(get_settings().cfg.storage, "covers_max_mb", 0)  # budget 0: everything goes
+    removed = covers.prune()
+    assert removed == 5
+    assert list(folder.iterdir()) == []
+
+
+async def test_library_cover_is_resized_once_and_cached(env, monkeypatch):
+    from PIL import Image
+    from sqlalchemy import select
+
+    from app import covers
+    from app.api import library as library_api
+    from app.config import get_settings
+    from app.db import session_scope
+    from app.models import Album
+
+    # the layout of `app.library.importer.album_reldir`: `{Artist}/{Year} - {Album}`
+    album_dir = get_settings().library_dir / "Кино" / "1988 - Группа крови"
+    album_dir.mkdir(parents=True)
+    Image.new("RGB", (400, 400), (10, 20, 30)).save(album_dir / "cover.jpg", "JPEG")
+    calls: list[int] = []
+    real_resize = library_api._resize
+
+    def spy(data: bytes, size: int) -> bytes:
+        calls.append(size)
+        return real_resize(data, size)
+
+    monkeypatch.setattr(library_api, "_resize", spy)
+    async with session_scope() as s:
+        s.add(Album(uid=str(uuid.uuid4()), title="Группа крови", album_artist="Кино", year=1988))
+        await s.commit()
+    async with session_scope() as s:
+        album_id = (await s.execute(select(Album.id))).scalar_one()
+
+    c = env["client"]
+    album_url = f"/api/library/albums/{album_id}"
+    url = f"{album_url}/cover?size=300"
+    source = album_dir / "cover.jpg"
+    assert (await c.get(album_url)).json()["cover_rev"] == str(source.stat().st_mtime_ns)
+    first = await c.get(url)
+    assert first.status_code == 200 and first.headers["content-type"] == "image/jpeg"
+    assert first.headers["cache-control"] == "private, max-age=604800, immutable"
+    second = await c.get(url)
+    assert second.status_code == 200 and second.content == first.content
+    assert calls == [300], "Pillow must resize once, then the disk cache answers"
+    assert (await c.get(url, headers={"If-None-Match": first.headers["etag"]})).status_code == 304
+    assert (await c.get("/api/library/albums/999/cover")).status_code == 404
+
+    cached, = covers.root().glob("*/*.jpg")
+    old = cached.stat().st_mtime - (get_settings().cfg.storage.covers_ttl_s + 60)
+    os.utime(cached, (old, old))
+    assert (await c.get(url)).content == first.content
+    assert calls == [300, 300], "an expired entry must be refreshed when the source is available"
+
+    Image.new("RGB", (420, 420), (100, 120, 130)).save(source, "JPEG")
+    updated = await c.get(url, headers={"If-None-Match": first.headers["etag"]})
+    assert updated.status_code == 200 and updated.headers["etag"] != first.headers["etag"]
+    files = list(covers.root().glob("*/*.jpg"))
+    assert len(files) == 2
+    for path in files:
+        os.utime(path, (path.stat().st_mtime - 7 * 86400 - 60,) * 2)
+    source.unlink()
+    stale = await c.get(url)
+    assert stale.status_code == 200 and stale.content == updated.content
+    assert stale.headers["cache-control"] == "private, max-age=300"
+    assert (await c.get(f"{album_url}/cover?size=600")).status_code == 404
+
+    nd_url = "/api/nd/cover/al-alK?size=300"
+    assert (await c.get(nd_url)).status_code == 200
+    assert (await c.post("/api/auth/logout")).status_code == 200
+    for cover_url in (url, nd_url):
+        assert (await c.get(cover_url, headers={"If-None-Match": "*"})).status_code == 401
 
 
 async def test_library_needs_a_session(hub_env):

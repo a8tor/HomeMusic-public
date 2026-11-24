@@ -93,6 +93,7 @@ def _dir_sizes() -> dict[str, int]:
         "backups_bytes": _dir_size(s.backups_dir),
         "ytdlp_bytes": _dir_size(Path(ytdlp)) if ytdlp else 0,
         "assistant_bytes": _dir_size(s.data_dir / "assistant"),  # как в ai/pipeline.py: task_dir
+        "covers_bytes": _dir_size(s.data_dir / "covers"),  # кеш обложек (`app/covers.py`)
     }
 
 

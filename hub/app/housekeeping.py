@@ -159,6 +159,14 @@ async def run_daily() -> None:
     except Exception:
         log.exception("yt-dlp cache prune failed")
     try:
+        # the cover cache is pruned on writes too; this pass catches old files while nobody asks for covers
+        from app import covers
+
+        n = await asyncio.to_thread(covers.prune)
+        log.info("housekeeping: cover cache pruned (%s files removed, soft limit %s MB)", n, cfg.storage.covers_max_mb)
+    except Exception:
+        log.exception("cover cache prune failed")
+    try:
         from sqlalchemy import select
         from app.models import AssistantTask, AssistantChat
         from app.db import session_scope
