@@ -55,8 +55,8 @@ object HomeTraffic {
     /** The network is only read when the setting is on. */
     internal inline fun decide(enabled: Boolean, metered: () -> Boolean): Boolean = enabled && metered()
 
-    /** How many next tracks the precache loads: at most one when saving, so a skip costs one head, not three. */
+    /** Cap the configured count at one when saving and at five otherwise. Zero still disables precaching. */
     @JvmStatic
     fun precacheCount(configured: Int, economy: Boolean): Int =
-        if (economy) configured.coerceAtMost(1) else configured
+        configured.coerceAtMost(if (economy) 1 else HomeDefaults.PRECACHE_TRACKS)
 }

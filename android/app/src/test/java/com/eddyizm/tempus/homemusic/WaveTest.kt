@@ -93,6 +93,48 @@ class WaveTest {
         assertEquals(listOf(1), plan.add)
     }
 
+    @Test
+    fun deltaKeepsFourEntriesWhenOneInTheMiddleDropsOut() {
+        val ahead = listOf("a", "b", "c", "d", "e")
+        val keep = listOf("a", "b", "d", "e")
+        val plan = WavePlan.ofDelta(ahead, keep, listOf("f"))
+        assertEquals(4, plan.keep)
+        assertEquals(listOf(2), plan.remove)
+        assertEquals(keep, ahead.filterIndexed { i, _ -> i !in plan.remove })
+        assertEquals(listOf(0), plan.add)
+        assertEquals(6, plan.insertAt(listOf(1, 2, 3, 4, 5), 7)) // after the non-wave tail, too
+    }
+
+    @Test
+    fun deltaWithEmptyKeepReplacesTheWholeWindow() {
+        val plan = WavePlan.ofDelta(listOf("a", "b"), emptyList(), listOf("x", "y"))
+        assertEquals(0, plan.keep)
+        assertEquals(listOf(0, 1), plan.remove)
+        assertEquals(listOf(0, 1), plan.add)
+    }
+
+    @Test
+    fun deltaDoesNotAppendRetainedOrRepeatedRefs() {
+        val plan = WavePlan.ofDelta(listOf("a"), listOf("a"), listOf("a", "x", "x"))
+        assertEquals(1, plan.keep)
+        assertTrue(plan.remove.isEmpty())
+        assertEquals(listOf(1), plan.add)
+    }
+
+    @Test
+    fun anEmptyQueueUsesTheWholeStartBatch() {
+        val out = Gson().fromJson(
+            """{"keep":[],"add":[{"ref":"x"},{"ref":"y"}],"tracks":[{"ref":"x"},{"ref":"y"}],"target_len":2}""",
+            WaveOut::class.java,
+        )
+        assertEquals(2, out.targetLen)
+        val refs = out.newTracks().map { it.ref.orEmpty() }
+        val plan = WavePlan.ofDelta(emptyList(), out.keep!!, refs)
+        assertTrue(plan.remove.isEmpty())
+        assertEquals(listOf("x", "y"), plan.add.map { refs[it] })
+        assertEquals(0, plan.insertAt(emptyList(), 0))
+    }
+
     // --- the session: which events ask, what is sent -----------------------------------------
 
     @Test
@@ -225,6 +267,8 @@ class WaveTest {
             {"ref":"dz:2","nd_song_id":null,"owned":false,"title":"Y","generator":"ytm_radio","familiar":false,"sim":null}],"pending":true,"recorded":null}"""
         val out = Gson().fromJson(json, WaveOut::class.java)
         assertEquals("abc", out.sessionId)
+        assertEquals(5, out.targetLen)
+        assertEquals(out.tracks, out.newTracks())
         assertTrue(out.pending)
         assertEquals("dz:1", out.seed?.get("ref"))
         val (first, second) = out.tracks!!

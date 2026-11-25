@@ -3,9 +3,13 @@ package com.eddyizm.tempus.service
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Uri
+import android.os.Handler
+import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.CacheWriter
@@ -34,16 +38,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * streams or already-downloaded tracks, and by default only on unmetered
  * networks.
  *
- * HomeMusic: only the first seconds of each next track (`QueueLoading`), and
- * only once the player has loaded the playing track: the rest of a next track
- * stays on the server. Saving mobile traffic ([HomeTraffic.economy]): one next
- * track, not three, and for a wave only after the Hub has answered for the playing
- * track (the wave replaces its queue ahead). A transcoded stream is skipped: the player could not
- * continue its head with a Range request.
+ * HomeMusic: only the first seconds of each next track (`QueueLoading`), after five
+ * seconds of playback and, in a wave, after the Hub answers for the current track.
+ * Traffic economy caps the batch at one head. A transcoded stream is skipped:
+ * the player could not continue its head with a Range request.
  */
 @UnstableApi
 object QueuePreloader {
     private const val TAG = "QueuePreloader"
+    private const val STABLE_PRELOAD_MS = 5_000L
 
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, HomeTrafficStats.PRELOAD_THREAD).apply { priority = Thread.MIN_PRIORITY }
@@ -60,30 +63,91 @@ object QueuePreloader {
     /** Keys of heads stored without the file's length that were dropped to be loaded again (once per key). */
     private val relearned = HashSet<String>()
 
+    // Only accessed on the player's application thread.
+    private var playback: PlaybackGate? = null
+
+    private class PlaybackGate(val context: Context, val player: Player) : Player.Listener {
+        private val handler = Handler(player.applicationLooper)
+        private val retry = Runnable { preload(context, player) }
+        private val window = Timeline.Window()
+        private var currentUid = currentWindowUid()
+        private var playedMs = 0L
+        private var startedAt = SystemClock.elapsedRealtime().takeIf { player.isPlaying }
+
+        private fun currentWindowUid(): Any? {
+            val timeline = player.currentTimeline
+            val index = player.currentMediaItemIndex
+            return if (index in 0 until timeline.windowCount) timeline.getWindow(index, window).uid else null
+        }
+
+        fun checkTransition(repeated: Boolean = false) {
+            val uid = currentWindowUid()
+            if (!repeated && uid == currentUid) return
+            currentUid = uid
+            invalidateBatch()
+            playedMs = 0L
+            startedAt = SystemClock.elapsedRealtime().takeIf { player.isPlaying }
+        }
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            checkTransition(repeated = reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)
+            preload(context, player)
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            val now = SystemClock.elapsedRealtime()
+            startedAt?.let { playedMs += now - it }
+            startedAt = now.takeIf { isPlaying }
+            preload(context, player)
+        }
+
+        fun ready(): Boolean {
+            handler.removeCallbacks(retry)
+            if (!player.isPlaying) return false
+            // A seek (including resume from a saved position) is not time spent playing.
+            val played = playedMs + (startedAt?.let { SystemClock.elapsedRealtime() - it } ?: 0L)
+            val remaining = maxOf(STABLE_PRELOAD_MS - played, STABLE_PRELOAD_MS - player.currentPosition)
+            if (remaining <= 0L) return true
+            handler.postDelayed(retry, remaining.coerceAtLeast(100L))
+            return false
+        }
+
+        fun detach() {
+            handler.removeCallbacks(retry)
+            player.removeListener(this)
+        }
+    }
+
     /** Must be called from the player's application thread. */
     fun preload(context: Context, player: Player) {
+        val gate = playback?.takeIf { it.player === player } ?: run {
+            cancel()
+            PlaybackGate(context.applicationContext, player).also {
+                playback = it
+                player.addListener(it)
+            }
+        }
+        // The service can call us from onTimelineChanged before our transition callback.
+        gate.checkTransition()
         val economy = HomeTraffic.economy()
         val count = HomeTraffic.precacheCount(Preferences.getPrecacheTracksCount(), economy)
-        if (count <= 0) return
-        if (Preferences.getStreamingCacheSize() <= 0L) return
-
-        val appContext = context.applicationContext
-
-        if (Preferences.isPrecacheWifiOnly() && isMetered(appContext)) {
-            cancel()
+        val appContext = gate.context
+        if (count <= 0 || Preferences.getStreamingCacheSize() <= 0L ||
+            (Preferences.isPrecacheWifiOnly() && isMetered(appContext))) {
+            invalidateBatch()
             return
         }
 
-        // The playing track loads first; BaseMediaService calls again once the player stops loading.
-        if (player.isLoading) return
-
-        // A wave still replaces its queue ahead: the heads loaded now would be thrown away (HubWave calls again after its answer).
-        if (!HubWave.preloadReady(player)) {
-            cancel()
-            return
-        }
-
+        val ready = gate.ready() && !player.isLoading && HubWave.preloadReady(player)
+        if (!ready && runningUris.isEmpty()) return
         val uris = collectUpcomingStreamUris(appContext, player, count, economy)
+        // Reconcile an existing batch even while the player is loading (e.g. after a delta).
+        if (!ready) {
+            synchronized(this) {
+                if (!uris.containsAll(runningUris)) invalidateBatch()
+            }
+            return
+        }
 
         val myGeneration: Int
         synchronized(this) {
@@ -114,7 +178,14 @@ object QueuePreloader {
         }
     }
 
+    /** Stop the worker and release the player listener on service teardown. */
     fun cancel() {
+        playback?.detach()
+        playback = null
+        invalidateBatch()
+    }
+
+    private fun invalidateBatch() {
         synchronized(this) {
             generation.incrementAndGet()
             runningUris = emptyList()

@@ -1,6 +1,5 @@
 package com.eddyizm.tempus.homemusic
 
-import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -22,7 +21,7 @@ import java.lang.ref.WeakReference
 /**
  * «Моя волна» in the app's player (MIXES.md 7): plays a wave's first tracks and keeps the queue going by itself —
  * on the start of every wave track (and after a ♥ or «Не нравится» of one) it gives the Hub the events since the
- * last call and the tracks still ahead (`POST /api/wave/{id}/next`), and the answer replaces those tracks. Offline,
+ * last call and the tracks still ahead (`POST /api/wave/{id}/next`), and applies the Hub's queue delta. Offline,
  * the queue stays as it is and the call is tried again later. Another queue ends the wave.
  * The queue is edited on the service's player ([attach]), so it goes on with the app in the background.
  * Everything here runs on the main thread, the calls on [HomeMusic.io].
@@ -31,13 +30,9 @@ import java.lang.ref.WeakReference
 object HubWave {
     private const val TAG = "HubWave"
 
-    // The network came back soon after the queue ran out: the wave plays on by itself.
-    private const val RESUME_WITHIN_MS = 5 * 60_000L
-
     private var target = WeakReference<MediaManager.QueueTarget>(null)
     private var session: WaveSession? = null
     private var retry: Runnable? = null
-    private var endedAt = 0L
     private var emptyQueueSessionId: String? = null
 
     /** The playback service: the wave edits its player. */
@@ -51,7 +46,11 @@ object HubWave {
     /** `HomeMusicAndroid.playWave`: the page started a wave (`POST /api/wave/start`) and hands over its answer. */
     fun play(activity: MainActivity, out: WaveOut) {
         val id = out.sessionId?.takeIf { it.isNotBlank() }
-        val tracks = out.tracks.orEmpty()
+        val batch = out.newTracks()
+        val refs = batch.map { it.ref.orEmpty() }
+        val plan = out.keep?.takeIf { out.add != null }?.let { WavePlan.ofDelta(emptyList(), it, refs) }
+            ?: WavePlan.of(emptyList(), refs)
+        val tracks = plan.add.map { batch[it] }
         if (id == null || tracks.isEmpty()) {
             Toast.makeText(activity, R.string.homemusic_wave_empty, Toast.LENGTH_SHORT).show()
             return
@@ -200,11 +199,10 @@ object HubWave {
         }
     }
 
-    /** The queue played out (nothing ahead came in time): ask now, and play on if the answer comes soon. */
+    /** The queue played out (nothing ahead came in time): ask now so the wave can play on. */
     fun onQueueEnded() {
         HomeMusic.main.post {
             val wave = session ?: return@post
-            endedAt = SystemClock.elapsedRealtime()
             if (!wave.inFlight) ask()
         }
     }
@@ -287,7 +285,7 @@ object HubWave {
                 val out = if (sent.played.any { it.account != null })
                     HubClient.withAccountSession(requireNotNull(account)) { HubClient.waveNext(id, sent) }
                 else HubClient.waveNext(id, sent)
-                out to prepare(out.tracks.orEmpty(), wave.context)
+                out to prepare(out.newTracks(), wave.context)
             }
             HomeMusic.main.post { answered(wave, sent, result) }
         }
@@ -311,7 +309,7 @@ object HubWave {
         result.onSuccess { (out, prepared) ->
             wave.sent(request)
             wave.failures = 0
-            apply(wave, prepared)
+            apply(wave, out, prepared)
             wave.settledFor = wave.askedFor
             if (wave.again) {
                 ask()
@@ -339,28 +337,41 @@ object HubWave {
         }
     }
 
-    /** The answer replaces the wave's tracks ahead ([WavePlan]). */
-    private fun apply(wave: WaveSession, prepared: List<Prepared>) {
+    /** Edit only the upcoming wave entries; a response may arrive after playback has advanced. */
+    private fun apply(wave: WaveSession, out: WaveOut, prepared: List<Prepared>) {
         val queue = target.get() ?: return
         val player = player(wave) ?: return
         val ahead = ahead(player, wave)
-        val plan = WavePlan.of(ahead.map { wave.refOf(it.second).orEmpty() }, prepared.map { it.track.ref.orEmpty() })
-        val add = plan.add.map { prepared[it] }
-        Log.i(TAG, "next ${wave.id}: ahead ${ahead.map { wave.refOf(it.second) }} → ${prepared.map { it.track.ref }} (kept ${plan.keep})")
-        if (plan.remove.isEmpty() && add.isEmpty()) return
+        val queued = ahead.map { wave.refOf(it.second).orEmpty() }
+        val incoming = prepared.map { it.track.ref.orEmpty() }
+        val keep = out.keep?.takeIf { out.add != null }
+        val plan = if (keep != null) WavePlan.ofDelta(queued, keep, incoming) else WavePlan.of(queued, incoming)
+        val currentRef = player.currentMediaItem?.mediaId?.let(wave::refOf)
+        val add = plan.add.map { prepared[it] }.filter { it.track.ref != currentRef }
+        val resume = player.playbackState == Player.STATE_ENDED || emptyQueueSessionId == wave.id
+        val wasEmpty = player.mediaItemCount == 0
         val at = plan.insertAt(ahead.map { it.first }, player.mediaItemCount)
         for (i in plan.remove.reversed()) {
             val index = ahead[i].first
             MediaManager.removeRange(queue, index, index + 1)
         }
-        if (add.isEmpty()) return
-        wave.register(add.map { it.track })
-        HubPlays.addContexts(wave.ids().associateWith { wave.context }, launchesOf(wave))
-        val stale = player.playbackState == Player.STATE_ENDED && SystemClock.elapsedRealtime() - endedAt > RESUME_WITHIN_MS
-        MediaManager.insertAt(queue, at, add.map { it.child }, add.map { it.item })
-        emptyQueueSessionId = null
-        // the user waits on the loading page, or the queue ran out a moment ago: go on to the first new track
-        if (!stale) QueueAhead.extended(player, at, add.size)
+        if (add.isNotEmpty()) {
+            wave.register(add.map { it.track })
+            HubPlays.addContexts(wave.ids().associateWith { wave.context }, launchesOf(wave))
+            MediaManager.insertAt(queue, at, add.map { it.child }, add.map { it.item })
+            emptyQueueSessionId = null
+        }
+        val next = if (wasEmpty) 0 else player.currentMediaItemIndex + 1
+        if (resume && next in 0 until player.mediaItemCount) {
+            // Adding items can change STATE_ENDED. Resume based on the state before editing.
+            player.seekToDefaultPosition(next)
+            player.prepare()
+            player.play()
+            QueueAhead.extended(player, C.INDEX_UNSET, 1)
+        } else if (add.isNotEmpty()) {
+            // Honour an explicit request from the loading page, without restarting the current item.
+            QueueAhead.extended(player, at, add.size)
+        }
     }
 
     /** The Hub forgot the session (24 h, a long offline): a new one with the same seed carries the queue on. */
@@ -374,17 +385,20 @@ object HubWave {
                     HubPlays.client.takeIf { known })
                 val out = HubClient.waveStart(body)
                 // a track's wave starts with that track again: it has played already
-                val tracks = out.tracks.orEmpty().filter { it.generator != WaveTrack.SEED }
+                val tracks = out.newTracks().filter { it.generator != WaveTrack.SEED }
                 val id = out.sessionId ?: throw HubException("Пустой ответ Хаба")
                 Triple(id, out, prepare(tracks, WaveSession.CONTEXT_PREFIX + id))
             }
             HomeMusic.main.post {
                 wave.inFlight = false
                 if (session !== wave) return@post
-                result.onSuccess { (id, _, prepared) ->
+                result.onSuccess { (id, out, prepared) ->
+                    val resumeEmpty = emptyQueueSessionId == oldId
                     wave.renew(id)
+                    if (resumeEmpty) emptyQueueSessionId = id
                     HubPlays.addContexts(wave.ids().associateWith { wave.context }, launchesOf(wave))
-                    apply(wave, prepared)
+                    wave.settledFor = player(wave)?.currentMediaItem?.mediaId
+                    apply(wave, out, prepared)
                     if (wave.again) ask() else kickPreload(wave)
                 }.onFailure { e ->
                     Log.w(TAG, "renew: ${e.message}")

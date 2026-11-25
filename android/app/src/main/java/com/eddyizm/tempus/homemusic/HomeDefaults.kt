@@ -40,8 +40,8 @@ class HomeDefaults : ContentProvider() {
             if (seeded < 3) {
                 if (untouched("precache_tracks_count", "0")) putString("precache_tracks_count", PRECACHE_TRACKS.toString())
                 if (untouched("precache_wifi_only", true)) putBoolean("precache_wifi_only", false)
-            } else if (seeded < 4 && prefs.getString("precache_tracks_count", null) == "5") {
-                // 4: the heads of 3 next tracks instead of 5 whole files; version 3's default counts as untouched
+            } else if (untouched("precache_tracks_count", if (seeded < 4) "5" else "3")) {
+                // 6: five heads; migrate only an absent value or the previous version's default.
                 putString("precache_tracks_count", PRECACHE_TRACKS.toString())
             }
             if (seeded < 5) {
@@ -69,10 +69,10 @@ class HomeDefaults : ContentProvider() {
     companion object {
         const val HUB_ACCENT = "HEX:#1ED760"
         private const val PREF_VERSION = "homemusic_defaults_version"
-        private const val VERSION = 5 // 2: values equal to Tempus defaults count as untouched; 3: precache; 4: 3 heads; 5: cache, covers
+        private const val VERSION = 6 // 2: untouched Tempus defaults; 3: precache; 4: 3 heads; 5: cache, covers; 6: 5 heads
 
         /** Next tracks whose first seconds the precache loads (`QueueLoading`; an entry of Tempus' `precache_tracks_values`). */
-        const val PRECACHE_TRACKS = 3
+        const val PRECACHE_TRACKS = 5
 
         /** Cover size in px (an entry of Tempus' `pref_image_size_values`). */
         const val COVER_SIZE = "500"

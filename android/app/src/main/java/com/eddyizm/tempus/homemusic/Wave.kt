@@ -83,7 +83,13 @@ class WaveOut {
     /** `{ref, artist, title}` (a track's wave), `{artist_ref, artist}` (an artist's) or null (the user's own). */
     var seed: Map<String, Any?>? = null
     var tracks: List<WaveTrack>? = null
+    var keep: List<String>? = null
+    var add: List<WaveTrack>? = null
+    @SerializedName("target_len") val targetLen: Int = 5
     var pending: Boolean = false
+
+    /** With a delta, only the new entries need resolving. On start, `add` is the entire window. */
+    fun newTracks(): List<WaveTrack> = (add.takeIf { keep != null } ?: tracks).orEmpty()
 }
 
 /** `WaveNextIn`. */
@@ -218,23 +224,25 @@ class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, 
     }
 }
 
-/**
- * How an answer goes into the queue: it replaces the wave's tracks ahead. The common head of both stays where it
- * is (the player may be loading the next file already), the rest of the old ones goes, the rest of the answer
- * comes in after the head.
- */
-data class WavePlan(val keep: Int, val remove: List<Int>, val add: List<Int>) {
-    /**
-     * Where the new tracks go once [remove] is done: after the kept head, else where the replaced ones were, else
-     * at the end. [positions] — the queue positions of the wave's tracks ahead (the `ahead` of [of]).
-     */
+/** Edits to the window ahead of the current track; retained entries are never recreated. */
+data class WavePlan(val keep: Int, val remove: List<Int>, val add: List<Int>, private val append: Boolean = false) {
+    /** Where to insert after [remove] is done. A delta appends at the tail of the queue. */
     fun insertAt(positions: List<Int>, queueSize: Int): Int = when {
+        append -> queueSize - remove.size
         keep > 0 -> positions[keep - 1] + 1
         positions.isNotEmpty() -> positions.first()
         else -> queueSize
     }
 
     companion object {
+        /** [keep] is a subsequence of the sent queue by contract; surviving entries stay in that order. */
+        fun ofDelta(ahead: List<String>, keep: List<String>, add: List<String>): WavePlan {
+            val kept = keep.toSet()
+            val remove = ahead.indices.filter { ahead[it] !in kept }
+            val append = add.indices.filter { add[it] !in kept }.distinctBy { add[it] }
+            return WavePlan(ahead.size - remove.size, remove, append, append = true)
+        }
+
         /** [ahead], [answer] — refs; [remove] — positions in [ahead], [add] — positions in [answer]. */
         fun of(ahead: List<String>, answer: List<String>): WavePlan {
             var keep = 0
