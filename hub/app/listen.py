@@ -38,7 +38,8 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from itertools import islice
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -84,6 +85,8 @@ PROBE_RANGE = "bytes=0-0"
 HEARD_CHECK_WAIT_S = 10  # a download waits this long for the check of the file just heard
 PREFETCH_WORKERS = 3
 PREFETCH_MAX = 40  # tracks per user
+PIN_TTL_S = 1800
+PIN_MAX_PER_USER = 10
 _PLAYABLE_TYPES = ("audio/", "video/")  # googlevideo may label audio-only formats video/*
 LOCAL_DIR = "listen"  # under staging: server copies, and copies of files of sources without plain HTTP audio
 # Both limits are tunables (config.yaml, `storage`): a dead copy takes the SSD for no reason, so the daily
@@ -153,7 +156,10 @@ class _Copy:
     have: int = 0  # bytes on disk
     done: bool = False
     failed: ListenError | None = None
-    readers: int = 0  # streams of a played track reading it
+    readers: int = 0
+    playing: int = 0  # foreground readers, as opposed to precache requests
+    cancelled: bool = False  # dropped from the last window that wanted this unfinished copy
+    bg_slot: bool = False
     task: asyncio.Task | None = None
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
@@ -188,6 +194,10 @@ _choices: dict[str, Choice] = {}
 _inflight: dict[str, _Job] = {}
 _fetching: dict[str, _Job] = {}  # ref -> download of a local copy (`_predownload`)
 _copies: dict[str, _Copy] = {}  # ref -> server copy of its picked file
+_pinned: dict[int, tuple[float, set[str]]] = {}  # user id -> (monotonic expiry, refs)
+_pin_order: dict[int, tuple[str, ...]] = {}  # preserve window order when adding refs from ahead requests
+_bg_copy_sem = asyncio.Semaphore(1)
+_bg_copy_changed = asyncio.Event()
 _calm: asyncio.Event | None = None  # set while no copy of a played track downloads (`_stir`)
 _missed: dict[str, float] = {}  # ref -> monotonic time until which the prefetch skips it
 _wanted: dict[int, list[str]] = {}  # user id -> refs on their screen still to pick, top first
@@ -247,11 +257,14 @@ MOBILE = "mobile"  # the quality of a stream for a metered network (`light`)
 
 
 async def open_media(ref: str, range_header: str | None, *, ahead: bool = False, quality: str | None = None,
-                     full_only: bool = False) -> Media:
+                     full_only: bool = False, user_id: int | None = None) -> Media:
     """The audio for the client's Range: the library file, a local copy, the server copy of the picked file (a
     preview: the upstream). `ahead`: the app loads a track of its queue ahead; its server copy waits for those of
     played tracks. `quality` "mobile": the light variant when the file is heavy (`app.light`). A pick none of whose
-    files opens is replaced by a new one (once)."""
+    files opens is replaced by a new one (once). With `user_id`, an ahead request also pins its ref."""
+    if ahead and user_id is not None:
+        pinned_refs()  # discard expired windows before extending this one
+        pin(user_id, (ref, *_pin_order.get(user_id, ())))
     c = await choose(ref, background=ahead, full_only=full_only)
     lite = quality == MOBILE
     for retry in (False, True):
@@ -259,8 +272,9 @@ async def open_media(ref: str, range_header: str | None, *, ahead: bool = False,
             assert c.path is not None
             return await _lighten(c, Media(c, path=c.path), c.path, _library_ident(c.path), ahead) if lite                 else Media(c, path=c.path)
         if _downloads_only(c):
-            await _predownload(c)
-            _heard(c)
+            await _predownload(c, background=ahead)
+            if not ahead:
+                _heard(c)
             assert c.local is not None
             media = Media(c, path=c.local, media_type=local_media_type(c.local))
             return await _lighten(c, media, c.local, _file_ident(c), ahead) if lite else media
@@ -268,12 +282,18 @@ async def open_media(ref: str, range_header: str | None, *, ahead: bool = False,
             break
         known = await light.cached(_file_ident(c)) if lite else None
         if known is not None and known[0] is not None:  # the light copy is on disk: no need for the file at all
-            _heard(c)
+            if not ahead:
+                _heard(c)
             return _variant(c, known)
+        if (old := _copies.get(ref)) is not None and old.cancelled:
+            await old.until(old.settled)  # the old writer must close and unlink before we reuse its path
         cp = _server_copy(c, background=ahead)
         await cp.until(lambda cp=cp: cp.size is not None or cp.settled())
+        if cp.cancelled:
+            raise ListenError(503, "Предзагрузка файла отменена")
         if cp.failed is None or cp.have:
-            _heard(c)
+            if not ahead:
+                _heard(c)
             variant = known[1] if known else light.PENDING
             if lite and known is None:
                 media, variant = await _lighten_copy(c, cp, ahead)
@@ -286,7 +306,8 @@ async def open_media(ref: str, range_header: str | None, *, ahead: bool = False,
             raise cp.failed
         c = await choose(ref, background=ahead, stale=c, full_only=full_only)
     resp, src = await open_stream(c, range_header)
-    _heard(c)
+    if not ahead:
+        _heard(c)
     media = _upstream_media(c, resp, src)
     if lite:
         media.variant = light.ORIGINAL if c.kind == "preview" else light.PENDING
@@ -357,6 +378,8 @@ async def _light_source(c: Choice) -> tuple[Path, str] | None:
     if _downloads_only(c):
         await _predownload(c)
         return (c.local, _file_ident(c)) if c.local is not None else None
+    if (old := _copies.get(c.ref)) is not None and old.cancelled:
+        await old.until(old.settled)
     cp = _server_copy(c, background=True)
     await cp.until(cp.settled)
     return (cp.path, _file_ident(c)) if cp.done else None
@@ -498,6 +521,43 @@ def _media_client() -> httpx.AsyncClient:
 # --- prefetch --------------------------------------------------------------------------------------------------
 
 
+def pinned_refs() -> set[str]:
+    """Return the union of live user windows, forgetting expired windows on the event loop."""
+    now = time.monotonic()
+    for user_id, (expires, _) in list(_pinned.items()):
+        if expires <= now:
+            del _pinned[user_id]
+            _pin_order.pop(user_id, None)
+    return {ref for _, refs in _pinned.values() for ref in refs}
+
+
+def pin(user_id: int, refs: Iterable[str]) -> None:
+    """Replace this user's window. A ref still wanted by another user keeps its shared copy."""
+    previous = _pinned.get(user_id)
+    order = tuple(islice(_unique_refs(refs), PIN_MAX_PER_USER))
+    if order:
+        _pinned[user_id] = (time.monotonic() + PIN_TTL_S, set(order))
+        _pin_order[user_id] = order
+    else:
+        _pinned.pop(user_id, None)
+        _pin_order.pop(user_id, None)
+    if previous is not None:
+        for ref in previous[1] - pinned_refs():
+            cp = _copies.get(ref)
+            if (cp is not None and cp.prio.background and not cp.settled() and not cp.readers
+                    and cp.task is not None and not cp.cancelled):
+                cp.cancelled = True
+                cp.task.cancel()
+
+
+def _unique_refs(refs: Iterable[str]) -> Iterable[str]:
+    seen: set[str] = set()
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            yield ref
+
+
 def prefetch(user_id: int, refs: list[str]) -> int:
     """The catalog tracks on this user's screen, top first: their files are picked in the background. Replaces
     the user's previous list (tracks that scrolled away are dropped). Returns how many are still to pick."""
@@ -568,10 +628,11 @@ async def _warm(ref: str) -> None:
 
 async def reset() -> None:
     """Forget picks in memory, stop the prefetch and server copies, close the clients (app shutdown, tests)."""
-    global _http, _media, _wake, _calm
+    global _http, _media, _wake, _calm, _bg_copy_changed
     tasks = set([*_workers, *_tasks, *(j.task for j in [*_inflight.values(), *_fetching.values()])])
     for t in tasks:
-        t.cancel()
+        if not t.cancelling():
+            t.cancel()
     # Resolution may still be rolling back its DB session. Finish cancellation before
     # disposing the engine/closing clients; a second event-loop cancellation interrupts that cleanup.
     if tasks:
@@ -584,7 +645,10 @@ async def reset() -> None:
     _choices.clear()
     _missed.clear()
     _wanted.clear()
+    _pinned.clear()
+    _pin_order.clear()
     _wake = _calm = None
+    _bg_copy_changed = asyncio.Event()
     light.reset()
     for client in (_http, _media):
         if client is not None:
@@ -863,16 +927,17 @@ def _downloads_only(c: Choice) -> bool:
     return provider is not None and not getattr(provider, "streams", True)
 
 
-async def _predownload(c: Choice) -> Path:
+async def _predownload(c: Choice, *, background: bool | None = None) -> Path:
     """The local copy of the file (downloaded now, or already). Concurrent callers share one download; a user
     request joining a background one lifts it."""
     if c.local is not None and c.local.is_file():
         await asyncio.to_thread(os.utime, c.local)
         return c.local
+    background = in_background() if background is None else background
     job = _fetching.get(c.ref)
     if job is None:
         assert c.candidate is not None
-        prio = Priority(in_background())
+        prio = Priority(background)
         job = _Job(asyncio.create_task(_fetch_local(c.ref, c.candidate), context=priority_context(prio)), prio)
         _fetching[c.ref] = job
 
@@ -882,7 +947,7 @@ async def _predownload(c: Choice) -> Path:
                 t.exception()  # retrieved here: nobody may be awaiting it any more
 
         job.task.add_done_callback(done)
-    elif not in_background():
+    elif not background:
         job.prio.foreground()
     c.local = await asyncio.shield(job.task)
     return c.local
@@ -921,10 +986,25 @@ async def prune_cache() -> None:
     never races a copy that is being written or read.
     """
     root = get_settings().staging_dir / LOCAL_DIR
+    refs = pinned_refs()
+    pinned = {root / _local_name(ref) for ref in refs}
+    for ref in refs:
+        if (choice := _choices.get(ref)) is None:
+            continue
+        if choice.kind == "full":
+            ident = _file_ident(choice)
+        elif choice.kind == "library" and choice.path is not None:
+            try:
+                ident = _library_ident(choice.path)
+            except OSError:
+                continue  # library file was removed or moved
+        else:
+            continue
+        pinned.add(light.copy_path(light.key_of(ident)))
     copies = list(_copies.values())
     fetching = list(_fetching)
     encodes = list(light._jobs)
-    protected = cache_policy.protected_listen_paths(copies, fetching, root)
+    protected = cache_policy.protected_listen_paths(copies, fetching, root, pinned)
     protected.update(light.copy_path(key) for key in encodes)
     protected.update(light.copy_path(key).with_name(light.copy_path(key).name + ".part") for key in encodes)
     await asyncio.to_thread(cache_policy.prune_roots,
@@ -980,9 +1060,11 @@ def _server_copy(c: Choice, *, background: bool) -> _Copy:
             not cp.done or cp.path.is_file()):
         if not background:
             cp.prio.foreground()
+            _release_bg_slot(cp)
+            _bg_copy_changed.set()  # a promoted copy can now bypass the queue
             _stir()
         return cp
-    if cp is not None and cp.task is not None:
+    if cp is not None and cp.task is not None and not cp.task.cancelling():
         cp.task.cancel()
     for ref in [r for r, old in _copies.items() if old.failed or (old.done and not old.path.is_file())]:
         del _copies[ref]
@@ -990,6 +1072,15 @@ def _server_copy(c: Choice, *, background: bool) -> _Copy:
     cp = _Copy(c.candidate, get_settings().staging_dir / LOCAL_DIR / _local_name(c.ref) / COPY_NAME,
                Priority(background))
     cp.task = _spawn(_download_copy(c, cp), prio=cp.prio)
+
+    def done(t: asyncio.Task) -> None:
+        if t.cancelled() and not cp.settled():
+            # Cancellation before the coroutine entered its try/finally: no file was opened.
+            cp.failed = ListenError(503, "Загрузка файла прервана")
+            _stir()
+            _spawn(cp.changed())
+
+    cp.task.add_done_callback(done)
     _copies[c.ref] = cp
     _stir()
     return cp
@@ -1022,9 +1113,31 @@ async def _yield_to_played(cp: _Copy) -> None:
             pass
 
 
-def _busy_dirs() -> set[str]:
-    return ({_local_name(r) for r in _fetching}
-            | {cp.path.parent.name for cp in _copies.values() if not cp.settled()})
+async def _take_bg_slot(cp: _Copy) -> None:
+    while cp.prio.background and not cp.bg_slot:
+        if not _bg_copy_sem.locked():
+            await _bg_copy_sem.acquire()
+            cp.bg_slot = True
+            return
+        _bg_copy_changed.clear()
+        await _bg_copy_changed.wait()
+
+
+def _release_bg_slot(cp: _Copy) -> None:
+    if cp.bg_slot:
+        cp.bg_slot = False
+        _bg_copy_sem.release()
+        _bg_copy_changed.set()
+
+
+async def _copy_io(fn, *args):
+    """Wait for a file operation to finish before cancellation closes/unlinks the file on Windows."""
+    task = asyncio.create_task(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 async def _download_copy(c: Choice, cp: _Copy) -> None:
@@ -1033,25 +1146,27 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
     t0 = time.monotonic()
     f = None
     try:
+        await _take_bg_slot(cp)
         await prune_cache()
-        await asyncio.to_thread(cp.path.parent.mkdir, parents=True, exist_ok=True)
+        cp.path.parent.mkdir(parents=True, exist_ok=True)
         # Written straight to `path`, not to a `.part` file: streams read the copy while it grows, and on Windows
         # a file open for reading cannot be renamed. A half-written copy (a crash, a failed download) is simply
         # started over: a fresh `_Copy` reopens this path with "wb", and the pruner counts it by its mtime.
-        f = await asyncio.to_thread(open, cp.path, "wb", buffering=0)
+        f = open(cp.path, "wb", buffering=0)
         drops = 0
         while not cp.done:
             if not _same_file(c.candidate, cp.cand):
                 if cp.have:
                     raise ListenError(502, "Файл трека сменился")
                 cp.cand = c.candidate  # the first file didn't open: the pick moved on to the next one
+            await _take_bg_slot(cp)
             resp, src = await open_stream(c, f"bytes={cp.have}-")
             try:
                 if resp.status_code == 416:
                     raise ListenError(502, "Источник не отдаёт файл (HTTP 416)")
                 if resp.status_code == 200 and cp.have:  # the Range was ignored: start over
-                    await asyncio.to_thread(f.truncate, 0)
-                    await asyncio.to_thread(f.seek, 0)
+                    await _copy_io(f.truncate, 0)
+                    await _copy_io(f.seek, 0)
                     cp.have = 0
                 if cp.size is None:
                     cp.size = _total_size(resp)
@@ -1059,10 +1174,12 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
                     cp.media_type = ctype if ctype.startswith("audio/") else src.media_type
                     await cp.changed()
                 async for chunk in resp.aiter_raw():
+                    await _take_bg_slot(cp)
                     await _yield_to_played(cp)
+                    await _take_bg_slot(cp)  # it may have been promoted and demoted while waiting
                     if cp.size is not None and cp.have + len(chunk) > cp.size:
                         raise ListenError(502, "Источник вернул больше ожидаемого размера")
-                    await asyncio.to_thread(_write_all, f, chunk)
+                    await _copy_io(_write_all, f, chunk)
                     cp.have += len(chunk)
                     drops = 0
                     await cp.changed()
@@ -1091,12 +1208,14 @@ async def _download_copy(c: Choice, cp: _Copy) -> None:
         if f is not None:
             f.close()
         if not cp.done:
-            try:
-                await asyncio.to_thread(cp.path.unlink, missing_ok=True)
-            except OSError:
-                pass  # open by a reader (Windows): the next download truncates it
+            if f is not None or not cp.cancelled:
+                try:
+                    await asyncio.to_thread(cp.path.unlink, missing_ok=True)
+                except OSError:
+                    pass  # open by a reader (Windows): the next download truncates it
             if cp.failed is None:
                 cp.failed = ListenError(503, "Загрузка файла прервана")
+        _release_bg_slot(cp)
         _stir()
         await asyncio.shield(cp.changed())
 
@@ -1162,8 +1281,11 @@ async def _from_copy(c: Choice, cp: _Copy, range_header: str | None, *, foregrou
 async def _read_copy(c: Choice, cp: _Copy, first: int, last: int, *, foreground: bool) -> AsyncIterator[bytes]:
     """Bytes `first`..`last` of the server copy as they arrive; when the copy fails, the rest from the upstream."""
     pos = first
+    if cp.cancelled:
+        raise ListenError(503, "Предзагрузка файла отменена")
+    cp.readers += 1
     if foreground:
-        cp.readers += 1
+        cp.playing += 1
     f = None
     try:
         try:
@@ -1188,9 +1310,10 @@ async def _read_copy(c: Choice, cp: _Copy, first: int, last: int, *, foreground:
     finally:
         if f is not None:
             f.close()
+        cp.readers -= 1
         if foreground:
-            cp.readers -= 1
-            if not cp.readers and not cp.settled():
+            cp.playing -= 1
+            if not cp.playing and not cp.settled():
                 cp.prio.background = True  # nobody plays it any more (a skip): a played track's copy goes first
                 _stir()
     if pos <= last and _same_file(c.candidate, cp.cand):

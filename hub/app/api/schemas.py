@@ -826,7 +826,8 @@ class HealthOut(BaseModel):
     # id of the PWA build the Hub serves (index.html <meta name="hm-build">); pages compare it with their own
     web_build: str | None = None
     capabilities: list[str] = ["typed_favorites_v1", "favorite_compensation_chains_v1", "catalog_favorite_download_v1",
-                               "listening_checkpoints_v1", "launch_events_v1", "wave_origin_v1", "smart_shuffle_v1"]
+                               "listening_checkpoints_v1", "launch_events_v1", "wave_origin_v1", "smart_shuffle_v1",
+                               "wave_delta_v1"]
 
 
 # --- listening data (MIXES.md 3.2) -------------------------------------------------------------------------------
@@ -1052,7 +1053,7 @@ class WaveStartIn(BaseModel):
 class WaveNextIn(BaseModel):
     # the events since the previous call (`PlayEventIn` each, validated one by one); stored with context wave:<id>
     played: list[Any] = Field(default_factory=list, max_length=500)
-    # refs (as `tracks[].ref`) of the wave's tracks the client still has ahead, not started: the answer replaces them
+    # refs of the wave's tracks the client still has ahead, not started, in queue order
     queued: list[str] = Field(default_factory=list, max_length=50)
 
 
@@ -1077,7 +1078,10 @@ class WaveOut(BaseModel):
     title: str  # «Моя волна», «Волна по треку «…»», «Волна: <артист>»
     mode: MixMode
     seed: dict[str, Any] | None = None  # {ref, artist, title} or {artist_ref, artist, nd_artist_id?}
-    tracks: list[WaveTrackOut] = []  # the next ones (up to 5): they replace the client's `queued`
+    tracks: list[WaveTrackOut] = []  # the complete window: kept tracks followed by new tracks
+    keep: list[str] = []  # refs from `queued` that are still valid, in client order
+    add: list[WaveTrackOut] = []
+    target_len: int = 5
     pending: bool = False  # sources still answer: the pool grows (an empty `tracks` — ask again in a few seconds)
     recorded: PlayEventsOut | None = None  # what became of `played` (next only)
 

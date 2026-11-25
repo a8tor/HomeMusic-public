@@ -150,6 +150,8 @@ class State:
     nofile: set[str] = field(default_factory=set)  # refs no source had: a 30 s preview is no wave track
     exclusion_refs: set[str] = field(default_factory=set)
     exclusion_fps: set[str] = field(default_factory=set)
+    skipped_refs: set[str] = field(default_factory=set)  # unlike `shown`, a skip also invalidates a queued track
+    skipped_fps: set[str] = field(default_factory=set)
     no_file_fps: set[str] = field(default_factory=set)
     handed: dict[str, float] = field(default_factory=dict)  # ref -> when it was handed out (no repeat for a while)
     skips: dict[str, int] = field(default_factory=dict)  # artist key -> early skips in the session
@@ -179,6 +181,7 @@ class State:
                 "played": [p.__dict__ for p in self.played[-STATE_HISTORY_MAX:]],
                 "heard": sorted(self.heard), "handed": dict(list(self.handed.items())[-STATE_HISTORY_MAX:]),
                 "nofile": sorted(self.nofile), "exclusion_refs": sorted(self.exclusion_refs),
+                "skipped_refs": sorted(self.skipped_refs), "skipped_fps": sorted(self.skipped_fps),
                 "exclusion_fps": sorted(self.exclusion_fps), "no_file_fps": sorted(self.no_file_fps), "skips": self.skips,
                 "pos": self.pos[-STATE_HISTORY_MAX:], "neg": self.neg[-STATE_HISTORY_MAX:],
                 "radios": self.radios[-STATE_HISTORY_MAX:], "seeds_used": self.seeds_used[-STATE_HISTORY_MAX:],
@@ -216,6 +219,7 @@ class State:
                  nofile=set(d.get("nofile") or []),
                  exclusion_refs=set(d.get("exclusion_refs") or []),
                  exclusion_fps=set(d.get("exclusion_fps") or []),
+                 skipped_refs=set(d.get("skipped_refs") or []), skipped_fps=set(d.get("skipped_fps") or []),
                  no_file_fps=set(d.get("no_file_fps") or []),
                  handed={k: float(v) for k, v in (d.get("handed") or {}).items()})
         st.pool = {c.track.ref: c for c in map(cand_of, d.get("pool") or [])}
@@ -322,10 +326,6 @@ async def _runtime(sid: str, user: User) -> Runtime:
             if row is None or row.user_id != user.id or row.updated_at < utcnow() - IDLE:
                 raise WaveError(404, "Волна закончилась: запустите новую")
             rt = Runtime(user_id=user.id, mode=row.mode, state=State.load(row.state_json or {}), salt=sid)
-            if "space_b64" in (row.state_json or {}) and not rt.state.pool and rt.state.out:
-                rt.state.pool.update(rt.state.out)
-                rt.state.out.clear()
-                rt.state.handed.clear()
             if "seen" not in (row.state_json or {}):
                 # Legacy state has no event ledger. Preserve its already-saved learning
                 # rather than applying the old journal again when an offline client retries.
@@ -710,36 +710,38 @@ def value(c: build.Cand, st: State, vectors: dict[str, list[float]], pos: list[f
 
 def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: int = BATCH,
          queued: set[str] = frozenset(), first: build.Cand | None = None,
-         values: dict[str, float] | None = None) -> list[build.Cand]:
+         values: dict[str, float] | None = None, *, prefix: tuple[build.Cand, ...] = ()) -> list[build.Cand]:
     """The next `n`: the best by `value` keeping the mode's familiar share, an artist at most once in `ARTIST_GAP`
     tracks (counting the played ones; the artist of a wave by an artist — once in `SEED_ARTIST_GAP`); with nothing else left, the gap gives way (never the same artist twice in a
     row). «Не нравится» set since the candidate came in drops it. `queued` — refs the client has ahead already.
+    `prefix` is already selected and counts for deduplication, spacing and familiar share, but is not returned.
     `values` gets the `value` of every candidate ranked, by ref (the analytics of `wave_items`)."""
     pos = _weighted_center(st.positive_weights, vectors) if st.taste_model == "v2" else _center(st.pos, vectors)
     neg = None if st.taste_model == "v2" else _center(st.neg, vectors)
+    cfg = get_settings().cfg.mixes if isinstance(p, V2Profile) else None
     candidates = [c for c in [*st.out.values(), *st.pool.values()]
-                  if c is not first and c.track.ref not in st.nofile and not _disliked(c, p)]
+                  if c is not first and c.track.ref not in st.nofile and not _disliked(c, p)
+                  and (cfg is None or build.keep(c, p, cfg))]
     # Catalog and library copies can have different refs for the same song. Never put both into one wave batch,
     # re-offer a song that has already started, or substitute another ref for one still queued by the client.
-    seen = set(st.heard)
+    seen = st.heard | {fp_of(c) for c in prefix}
     seen.update(fp_of(c) for ref, c in st.out.items() if ref in queued)
     if first is not None:
         seen.add(fp_of(first))
     # A track flipped past before it started is not in `heard`: it comes back to the pool as if it were new. Keep
     # everything handed out recently out of the batch — the client still having it queued is what keeps it alive.
-    # An empty `queued` is a client that lost its queue, not one that dropped these: it gets the best ones again.
+    # Newly selected tracks still observe the handout block; the delta keeps valid queued tracks separately.
     now = time.time()  # wall clock: `handed` outlives the process (it is in the session's JSON)
     fresh = {fp_of(c) for ref, c in [*st.pool.items(), *st.out.items()]
              if now - st.handed.get(ref, -HANDED_TTL_S) < HANDED_TTL_S
              and (not queued or ref not in queued)}
-    # The active client queue is retained even when it is the only candidate, as next replaces that queue.
     pool: list[build.Cand] = []
     excluded_shown: list[build.Cand] = []
     for c in candidates:
         fp = fp_of(c)
         if not fp or fp in seen or fp in fresh:
             continue
-        if c.track.ref in st.nofile or fp in st.no_file_fps:
+        if c.track.ref in st.nofile or fp in st.no_file_fps or _skipped(st, c, fp):
             continue
         if c.track.ref in st.exclusion_refs or fp in st.exclusion_fps:
             if c.track.ref in queued:
@@ -750,20 +752,25 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
             continue
         seen.add(fp)
         pool.append(c)
-    if len(pool) < BATCH:
-        pool.extend(excluded_shown)
+    if len(pool) < n:
+        for c in excluded_shown:
+            fp = fp_of(c)
+            if fp not in seen:
+                seen.add(fp)
+                pool.append(c)
     vals = {id(c): value(c, st, vectors, pos, neg, c.track.ref in queued) for c in pool}
     if values is not None:
         values.update((c.track.ref, vals[id(c)]) for c in pool)
     ranked = sorted(pool, key=lambda c: -vals[id(c)])
     share = build.MODES.get(mode, build.MODES["normal"])
     out: list[build.Cand] = [first] if first is not None else []
-    recent = [x.artist for x in st.played]
+    recent = [x.artist for x in st.played] + [c.artist for c in prefix]
     while len(out) < n and ranked:
         seq = recent + [c.artist for c in out]
         gap = set(seq[-(ARTIST_GAP - 1):])
         seed_gap = set(seq[-(SEED_ARTIST_GAP - 1):])
-        total, fam = st.started + len(out), st.started_familiar + sum(c.familiar for c in out)
+        total = st.started + len(prefix) + len(out)
+        fam = st.started_familiar + sum(c.familiar for c in (*prefix, *out))
         want_fam = fam + 1 <= share * (total + 1) + 0.5
         ok = [c for c in ranked if c.artist not in (seed_gap if c.artist == st.seed_artist else gap)]
         eligible = [c for c in ok if c.familiar == want_fam] or ok
@@ -836,15 +843,38 @@ async def _vectors(rt: Runtime) -> dict[str, list[float]]:
 
 def _match(st: State, ref: str | None, nd: str | None) -> tuple[str, build.Cand | Played] | None:
     """The handed out track an event names (by its ref or Navidrome song; `nd:<song>` refs too)."""
+    if c := _match_out(st, ref, nd):
+        return "out", c
     if ref and ref.startswith("nd:"):
-        ref, nd = None, nd or ref[3:]
-    for c in st.out.values():
-        if (ref and c.track.ref == ref) or (nd and c.nd_song_id == nd):
-            return "out", c
+        nd = nd or ref[3:]
     for x in reversed(st.played):
         if (ref and x.ref == ref) or (nd and x.nd_song_id == nd):
             return "played", x
     return None
+
+
+def _match_out(st: State, ref: str | None, nd: str | None = None) -> build.Cand | None:
+    if ref is not None and ref in st.out:
+        return st.out[ref]
+    if ref:
+        nd = nd or (ref[3:] if ref.startswith("nd:") else ref)
+    alias = st.pool.get(ref) if ref else None
+    fp = fp_of(alias) if alias else ref  # a known alternative ref, or the fingerprint itself
+    return next((c for c in st.out.values() if (nd and c.nd_song_id == nd) or (fp and fp_of(c) == fp)), None)
+
+
+def _skipped(st: State, c: build.Cand, fp: str) -> bool:
+    return (c.track.ref in st.skipped_refs or fp in st.skipped_fps
+            or (c.nd_song_id is not None and f"nd:{c.nd_song_id}" in st.skipped_refs))
+
+
+def _remember_skip(st: State, ref: str, fp: str | None) -> None:
+    if ref:
+        st.skipped_refs.add(ref)
+        st.exclusion_refs.add(ref)
+    if fp:
+        st.skipped_fps.add(fp)
+        st.exclusion_fps.add(fp)
 
 
 def _start(st: State, c: build.Cand) -> Played:
@@ -877,13 +907,11 @@ async def _record_early_skips(rt: Runtime, events: list[PlayEvent]) -> None:
                 or (e.position_s or 0) >= EARLY_SKIP_S):
             continue
         track = rt.profile.find(ref=e.ref, nd_song_id=e.nd_song_id) if rt.profile is not None else None
-        fp = track.fp if track is not None else None
+        matched = _match_out(rt.state, e.ref, e.nd_song_id)
+        fp = fp_of(matched) if matched is not None else track.fp if track is not None else None
         ref = e.ref or (f"nd:{e.nd_song_id}" if e.nd_song_id else "")
         await _write_exclusion(rt.user_id, ref, fp, "skipped", WAVE_SKIP_TTL)
-        if ref:
-            rt.state.exclusion_refs.add(ref)
-        if fp:
-            rt.state.exclusion_fps.add(fp)
+        _remember_skip(rt.state, ref, fp)
 
 
 async def learn(sid: str, rt: Runtime, events: list[PlayEvent]) -> None:
@@ -909,12 +937,9 @@ async def learn(sid: str, rt: Runtime, events: list[PlayEvent]) -> None:
         if e.kind in ("skip", "finish"):
             x.kind, x.position_s = e.kind, e.position_s
         if e.kind == "skip" and (e.position_s or 0) < EARLY_SKIP_S:
-            await _write_exclusion(rt.user_id, x.ref,
-                                   fingerprint(x.track.get("artist", ""), x.track.get("title", ""))
-                                   if x.track else None, "skipped", WAVE_SKIP_TTL)
-            st.exclusion_refs.add(x.ref)
-            if x.track:
-                st.exclusion_fps.add(fingerprint(x.track.get("artist", ""), x.track.get("title", "")))
+            fp = fingerprint(x.track.get("artist", ""), x.track.get("title", "")) if x.track else None
+            await _write_exclusion(rt.user_id, x.ref, fp, "skipped", WAVE_SKIP_TTL)
+            _remember_skip(st, x.ref, fp)
         if (e.kind == "skip" and (e.position_s or 0) < EARLY_SKIP_S) or e.kind == "dislike":
             st.skips[x.artist] = st.skips.get(x.artist, 0) + 1
             _signal(st.neg, x.key)
@@ -1014,8 +1039,11 @@ class Batch:
     mode: str
     seed: dict[str, Any] | None
     tracks: list[build.Cand]
+    keep: list[str]
+    add: list[build.Cand]
     pending: bool  # sources still answering in the background
     recorded: Any = None
+    target_len: int = BATCH
 
 
 async def _artist_songs(nd, artist_id: str, name: str) -> list[CatalogTrack]:
@@ -1293,6 +1321,8 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
                  salt=sid)
     rt.state.exclusion_refs = {x.ref for x in exclusions if x.reason != "no_file"}
     rt.state.exclusion_fps = {x.fingerprint for x in exclusions if x.fingerprint and x.reason != "no_file"}
+    rt.state.skipped_refs = {x.ref for x in exclusions if x.reason == "skipped"}
+    rt.state.skipped_fps = {x.fingerprint for x in exclusions if x.fingerprint and x.reason == "skipped"}
     rt.state.nofile.update(x.ref for x in exclusions if x.reason == "no_file")
     rt.state.no_file_fps = {x.fingerprint for x in exclusions if x.reason == "no_file" and x.fingerprint}
     rt.state.seeds_used = [t.key for t in seeds]
@@ -1317,14 +1347,15 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     gens = list(generators(profile, seed_track, seed_artist, seeds).items())
     stage = time.monotonic()
     if first is not None:
-        rt.state.heard.add(fp_of(first))  # the radios' copies of the seed stay out
+        # The seed isn't heard until playback starts. `first` blocks duplicate picks, and once
+        # in `out` it also blocks duplicates from the late sources.
         await _start_pool(sid, rt, gens, time.monotonic())
     else:
         first = await _start_pool(sid, rt, gens, time.monotonic() + START_FIRST_TIMEOUT_S)
     timings["_gather/probe"] = time.monotonic() - stage
     async with rt.lock:
         stage = time.monotonic()
-        tracks = await _hand_out(sid, rt, set(), first, first_only=seed_track is None)
+        keep, kept, added = await _hand_out(sid, rt, [], first, first_only=seed_track is None)
         timings["_hand_out"] = time.monotonic() - stage
         pending = bool(rt.tasks)
     if isinstance(profile, V2Profile):
@@ -1346,7 +1377,7 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     log.info("wave %s: start total=%.2fs build_profile=%.2f _gather/probe=%.2f _hand_out=%.2f _save=%.2f "
              "state=%dKB", sid, timings["total"], timings["build_profile"], timings["_gather/probe"],
              timings["_hand_out"], timings["_save"], getattr(rt, "last_state_kb", 0))
-    return Batch(sid, title_of(seed_json), mode, seed_json, tracks, pending)
+    return Batch(sid, title_of(seed_json), mode, seed_json, kept + added, keep, added, pending or not added)
 
 
 async def next_batch(user: User, sid: str, played: list[Any], queued: list[str]) -> Batch:
@@ -1381,7 +1412,8 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
         if len(st.pool) < POOL_LOW:
             _refill(sid, rt)
         stage = time.monotonic()
-        tracks = await _hand_out(sid, rt, {q for q in queued if q in st.out})
+        keep, kept, added = await _hand_out(sid, rt, queued)
+        tracks = kept + added
         timings["hand_out"] = time.monotonic() - stage
         timings["_vectors"] = getattr(rt, "_wave_vector_elapsed", 0.0)
         timings["_probe"] = getattr(rt, "_wave_probe_elapsed", 0.0)
@@ -1395,12 +1427,13 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
              "_save=%.2f state=%dKB", sid, timings["total"], timings.get("_profile", 0.0),
              timings.get("_vectors", 0.0), timings.get("learn/gather", 0.0), timings.get("_probe", 0.0),
              timings.get("hand_out", 0.0), timings.get("_save", 0.0), getattr(rt, "last_state_kb", 0))
-    return Batch(sid, title_of(seed_json), rt.mode, seed_json, tracks, pending, recorded)
+    return Batch(sid, title_of(seed_json), rt.mode, seed_json, tracks, keep, added, pending, recorded)
 
 
 async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand | None,
                       vectors: dict[str, list[float]] | None = None,
-                      deadline: float | None = None, *, probe_first: bool = False) -> list[build.Cand]:
+                      deadline: float | None = None, *, probe_first: bool = False,
+                      prefix: tuple[build.Cand, ...] = (), n: int = BATCH) -> list[build.Cand]:
     from app import listen
 
     now = time.monotonic()
@@ -1463,39 +1496,51 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
         rt.state.out.pop(c.track.ref, None)
     await _write_exclusions(rt.user_id, rejected, "no_file", WAVE_NO_FILE_TTL)
     remaining = [c for c in tracks if c.track.ref not in absent]
-    if len(remaining) < BATCH and absent and time.monotonic() < deadline:
-        remaining_fps = {fp_of(c) for c in remaining}
-        extras = pick(rt.state, rt.profile, rt.mode, vectors or rt.vectors, n=BATCH - len(remaining),
-                      queued=set(), first=first)
-        for c in extras:
-            if c.track.ref in absent or fp_of(c) in remaining_fps:
-                continue
-            remaining.append(c)
-            remaining_fps.add(fp_of(c))
-        if len(remaining) > len([c for c in tracks if c.track.ref not in absent]):
-            remaining = await _probe_full(rt, remaining, first, vectors, deadline)
+    if len(remaining) < n and absent and time.monotonic() < deadline:
+        extras = pick(rt.state, rt.profile, rt.mode, vectors if vectors is not None else rt.vectors,
+                      n=n - len(remaining), prefix=(*prefix, *remaining))
+        if extras:
+            remaining += await _probe_full(rt, extras, first, vectors, deadline,
+                                           prefix=(*prefix, *remaining), n=n - len(remaining))
     return remaining
 
 
-async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand | None = None,
-                    *, first_only: bool = False) -> list[build.Cand]:
-    """Picks the next batch; it becomes the client's queue (the rest of the old one goes back to the pool). Their
-    files are picked by the Hub now."""
+async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand | None = None,
+                    *, first_only: bool = False) -> tuple[list[str], list[build.Cand], list[build.Cand]]:
+    """Keep valid queued tracks in client order, then pick and prepare only the missing tracks."""
     from app import listen
 
     assert rt.profile is not None
     st = rt.state
     if isinstance(rt.profile, V2Profile):
         cfg = get_settings().cfg.mixes
-        for pool in (st.pool, st.out):
-            for ref, c in list(pool.items()):
-                if not build.keep(c, rt.profile, cfg):
-                    del pool[ref]
+        for ref, c in list(st.pool.items()):
+            if not build.keep(c, rt.profile, cfg):
+                del st.pool[ref]
         _session_weights(st, rt.profile)
+    else:
+        cfg = None
+    keep: list[str] = []
+    kept: list[build.Cand] = []
+    seen = set(st.heard)
+    for ref in queued:
+        c = _match_out(st, ref)
+        if c is None:
+            continue
+        fp = fp_of(c)
+        if (fp in seen or _disliked(c, rt.profile) or ref in st.nofile or c.track.ref in st.nofile
+                or fp in st.no_file_fps or ref in st.skipped_refs or _skipped(st, c, fp)
+                or (cfg is not None and not build.keep(c, rt.profile, cfg))):
+            continue
+        seen.add(fp)
+        keep.append(ref)
+        kept.append(c)
+    n = (1 if first_only else BATCH) - len(kept)
     values: dict[str, float] = {}
     now = time.time()
     st.prune_handed(now)
-    if first_only:
+    rt._wave_vector_elapsed = 0.0
+    if first_only or n <= 0:
         vectors = rt.vectors
     else:
         try:
@@ -1505,14 +1550,14 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
         except TimeoutError:
             log.warning("wave: taste vectors timed out; continuing without taste weights")
             vectors = {}
-    tracks = pick(st, rt.profile, rt.mode, vectors, n=1 if first_only else BATCH,
-                  queued=queued, first=first, values=values)
+    prefix = tuple(kept)
+    added = pick(st, rt.profile, rt.mode, vectors, n=n, first=first, values=values, prefix=prefix) if n > 0 else []
     probe_started = time.monotonic()
-    if tracks and not first_only:
-        tracks = await _probe_full(rt, tracks, first, vectors,
-                                   time.monotonic() + PROBE_BATCH_TIMEOUT_S)
+    if added and not first_only:
+        added = await _probe_full(rt, added, first, vectors, probe_started + PROBE_BATCH_TIMEOUT_S,
+                                  prefix=prefix, n=n)
     rt._wave_probe_elapsed = time.monotonic() - probe_started
-    if not tracks and first is None:
+    if not kept and not added and first is None:
         # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
         # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
         # would leave the next `queued` naming tracks this session no longer knows.
@@ -1520,38 +1565,40 @@ async def _hand_out(sid: str, rt: Runtime, queued: set[str], first: build.Cand |
         save_started = time.monotonic()
         await _save(sid, rt)
         rt._wave_save_elapsed = time.monotonic() - save_started
-        return tracks
-    for ref in list(st.out):
-        st.pool[ref] = st.out.pop(ref)
-    for c in tracks:
-        st.pool.pop(c.track.ref, None)
-        st.out[c.track.ref] = c
+        return keep, kept, added
+    new_out = {c.track.ref: c for c in [*kept, *added]}
+    st.pool.update((ref, c) for ref, c in st.out.items() if ref not in new_out)
+    for ref in new_out:
+        st.pool.pop(ref, None)
+    st.out = new_out
+    for c in added:
         st.handed[c.track.ref] = now
-        if c.track.ref in queued:
-            st.exclusion_refs.discard(c.track.ref)
-            st.exclusion_fps.discard(fp_of(c))
-    await _write_exclusions(rt.user_id, tracks, "shown", WAVE_SHOWN_TTL)
+    listen.pin(rt.user_id, [*keep, *(c.track.ref for c in added)])
+    if added:
+        await _write_exclusions(rt.user_id, added, "shown", WAVE_SHOWN_TTL)
     save_started = time.monotonic()
     await _save(sid, rt, force=st.started == 0)
     rt._wave_save_elapsed = time.monotonic() - save_started
-    try:  # its own transaction after the state's: a failure here never costs the wave its answer or its state
-        async with session_scope() as s:
-            await save_items(s, sid, rt.user_id, tracks, values)
-    except Exception:
-        log.exception("wave %s: handed out tracks not recorded", sid)
-    stream = [c.track.ref for c in tracks if not c.nd_song_id and c.track.source != "nd"]
-    if stream:
-        listen.prefetch(rt.user_id, stream)
-    # the light copies for a metered network (app.light): library songs plain, the others after their files load
-    listen.warm_light([f"nd:{c.nd_song_id}" if c.nd_song_id else c.track.ref for c in tracks
-                       if c.nd_song_id or c.track.source != "nd"])
-    return tracks
+    if added:
+        try:  # an analytics failure never costs the wave its answer or state
+            async with session_scope() as s:
+                await save_items(s, sid, rt.user_id, added, values)
+        except Exception:
+            log.exception("wave %s: handed out tracks not recorded", sid)
+    stream = [c.track.ref for c in [*kept, *added] if not c.nd_song_id and c.track.source != "nd"]
+    # Keep pending resolutions for retained refs, but don't pick evicted refs later.
+    listen.prefetch(rt.user_id, stream)
+    if added:
+        # Library songs are warmed directly, others after their files load.
+        listen.warm_light([f"nd:{c.nd_song_id}" if c.nd_song_id else c.track.ref for c in added
+                           if c.nd_song_id or c.track.source != "nd"])
+    return keep, kept, added
 
 
 async def save_items(s: AsyncSession, sid: str, user_id: int, tracks: list[build.Cand],
                      values: dict[str, float], now: datetime | None = None) -> None:
     """What the wave handed out into `wave_items` (INSIGHTS.md 6.4): a track new to the session gets the next
-    position; one handed out again (it went back to the pool, or the client still has it queued) counts once more,
+    position; one newly handed out again after going back to the pool counts once more,
     with its latest score, closeness and value."""
     if not tracks:
         return
@@ -1584,7 +1631,12 @@ async def no_file(user: User, sid: str, ref: str) -> bool:
     rt = await _runtime(sid, user)
     async with rt.lock:
         st = rt.state
-        c = st.out.pop(ref, None) or st.pool.pop(ref, None)
+        c = _match_out(st, ref) or st.pool.get(ref)
+        # The client may report the alias it received in `keep`, not the canonical ref in `out`.
+        if c is not None:
+            ref = c.track.ref
+            st.out.pop(ref, None)
+            st.pool.pop(ref, None)
         if c is None and rt.profile is not None:
             taste_track = rt.profile.find(ref=ref)
             if taste_track is not None:

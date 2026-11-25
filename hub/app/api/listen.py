@@ -60,7 +60,7 @@ async def stream(ref: str, request: Request, q: str | None = None, full: bool = 
     # `start` event is (app/api/plays.py), and its server copy waits for those of played tracks
     ahead = request.headers.get("x-homemusic-prefetch") == "1"
     try:
-        m = await listen.open_media(ref, rng or None, ahead=ahead, quality=q, full_only=full)
+        m = await listen.open_media(ref, rng or None, ahead=ahead, quality=q, full_only=full, user_id=user.id)
     except listen.ListenError as e:
         raise HTTPException(e.status, str(e)) from e
     if m.choice.kind == "full" and not ahead and (not rng or rng.startswith("bytes=0-")):

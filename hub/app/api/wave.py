@@ -42,8 +42,11 @@ async def wave_out(s: AsyncSession, b: wave.Batch, user_id: int) -> WaveOut:
     if b.recorded is not None:
         r = b.recorded
         recorded = PlayEventsOut(accepted=r.accepted, duplicates=r.duplicates, rejected=r.rejected)
+    kept = [t if t.ref == ref else t.model_copy(update={"ref": ref}) for ref, t in zip(b.keep, tracks)]
+    added = tracks[len(b.keep):]
     result = WaveOut(session_id=b.session_id, title=b.title, mode=b.mode,  # type: ignore[arg-type]
-                     seed=b.seed, tracks=tracks, pending=b.pending, recorded=recorded)
+                     seed=b.seed, tracks=kept + added, keep=b.keep, add=added, target_len=b.target_len,
+                     pending=b.pending, recorded=recorded)
     log.info("wave %s: annotate_tracks/response=%.2fs tracks=%d", b.session_id, time.monotonic() - started,
              len(tracks))
     return result
@@ -72,7 +75,7 @@ async def no_file(session_id: str, body: WaveNoFileIn, user: User = Depends(curr
 @router.post("/{session_id}/next", response_model=WaveOut)
 async def next_(session_id: str, body: WaveNextIn, user: User = Depends(current_user),
                 s: AsyncSession = Depends(get_session, scope="function")):
-    """The events since the last call; the next 5 tracks, picked again with them (they replace `queued`)."""
+    """Record events, keep the valid part of `queued`, and fill the remaining slots with new tracks."""
     try:
         b = await wave.next_batch(user, session_id, body.played, body.queued)
     except wave.WaveError as e:

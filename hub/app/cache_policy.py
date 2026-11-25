@@ -29,6 +29,9 @@ from typing import Iterable
 from app.config import get_settings
 
 
+FRESH_GRACE_S = 900.0
+
+
 def _safe_files(root: Path) -> tuple[list[Path], list[Path]]:
     """Regular files under `root`, split into finished files and `.part` leftovers. Symlinks are skipped: a cache
     entry must never point outside the cache root."""
@@ -82,7 +85,8 @@ def _evict(path: Path, root: Path) -> bool:
     return True
 
 
-def prune_roots(roots: Iterable[Path], protected: set[Path] | None = None) -> None:
+def prune_roots(roots: Iterable[Path], protected: set[Path] | None = None, *,
+                fresh_grace_s: float = FRESH_GRACE_S) -> None:
     """Evict cache files until the combined size fits the soft budget and the free-space reserve is back.
 
     `protected`: files or whole folders that must stay (a copy being downloaded, a stream reading it, an encode).
@@ -131,6 +135,8 @@ def prune_roots(roots: Iterable[Path], protected: set[Path] | None = None) -> No
         modified, size, path, _ = row
         # A ref's directory name is a hash of the ref: stable across a renewed stream URL and a Hub restart.
         count, at = demand_by_dir.get(path.parent.name, (0, 0.0))
+        if now - modified < fresh_grace_s:
+            count = max(count, 1)
         age = max(0.0, (now - max(modified, at)) / 86400.0)
         # Least retention first: the lowest demand per day of age goes first, and among equals the older file
         return (count / (1.0 + age), modified, size)
@@ -189,8 +195,10 @@ def _demand_snapshot() -> dict[str, tuple[int, float]]:
         return {}
 
 
-def protected_listen_paths(copies: dict, fetching: dict, local_root: Path) -> set[Path]:
-    """The folders of server copies in use (read by a stream or still downloading) and of local downloads."""
-    paths = {cp.path.parent for cp in copies if cp.readers or not cp.settled()}
+def protected_listen_paths(copies: Iterable, fetching: Iterable[str], local_root: Path,
+                           pinned: set[Path] | None = None) -> set[Path]:
+    """Pinned paths and folders of server copies and local downloads in use."""
+    paths = set(pinned or ())
+    paths.update(cp.path.parent for cp in copies if cp.readers or not cp.settled())
     paths.update(local_root / hashlib.sha1(ref.encode()).hexdigest()[:16] for ref in fetching)
     return paths

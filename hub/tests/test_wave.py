@@ -247,7 +247,7 @@ async def test_wave_exclusions_cross_sessions_and_expire(env, monkeypatch) -> No
     first = (await client.post("/api/wave/start", json={})).json()
     await wave.settle(first["session_id"])
     first_refs = [t["ref"] for t in first["tracks"]]
-    first_refs += [t["ref"] for t in (await client.post(
+    first_refs = [t["ref"] for t in (await client.post(
         f"/api/wave/{first['session_id']}/next", json={"queued": first_refs})).json()["tracks"]]
     async with session_scope() as s:
         s.add(WaveExclusion(user_id=uid, ref=first_refs[0], fingerprint=None,
@@ -418,10 +418,14 @@ async def test_an_empty_answer_keeps_the_queue_and_asks_again(env, monkeypatch) 
     r = (await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", refs[0])], "queued": []})).json()
 
     assert [t["ref"] for t in r["tracks"]] and not set(refs) & {t["ref"] for t in r["tracks"]}
-    # No fresh track remains; asking again keeps the queue contract explicit.
-    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": [t["ref"] for t in r["tracks"]]})).json()
-    assert r["tracks"] == [] and r["pending"]
-    assert len({t["ref"] for t in r["tracks"]}) == len(r["tracks"])
+    refs = [t["ref"] for t in r["tracks"]]
+    # No fresh track remains. Known refs still produce a keep-only delta.
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": refs})).json()
+    assert r["keep"] == refs and r["add"] == []
+    # With no valid keep and no add, ask again without clearing the server's queue.
+    r = (await c.post(f"/api/wave/{sid}/next", json={"queued": ["dz:unknown"]})).json()
+    assert r["tracks"] == r["keep"] == r["add"] == [] and r["pending"]
+    assert list(wave._rt[sid].state.out) == refs
 
 
 def test_compact_state_round_trip_keeps_float32_vectors_and_pick() -> None:
@@ -631,11 +635,13 @@ async def test_nothing_to_start_from(env) -> None:
 
 
 async def test_a_wave_hands_out_five_and_learns_from_what_was_played(env, monkeypatch) -> None:
+    from app.config import get_settings
     from app.db import session_scope
     from app.library.owned import quiet
     from app.models import DownloadItem, PlayEvent
 
     c, me = env["client"], env["admin"]
+    monkeypatch.setattr(get_settings().cfg.storage, "autodownload_listened", True)
     await history(me)
     seen = fake_sources(monkeypatch, [tr(5000 + i) for i in range(30)], radio=[tr(7000, "Из радио")])
 
@@ -687,23 +693,154 @@ async def test_an_event_sent_through_plays_first_gets_the_wave_context(env, monk
     assert row.context == f"wave:{w['session_id']}"
 
 
-async def test_the_answer_replaces_the_queue(env, monkeypatch) -> None:
+async def full_wave(env, monkeypatch):
     c = env["client"]
     await history(env["admin"])
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(30)])
     w = (await c.post("/api/wave/start", json={})).json()
-    sid, refs = w["session_id"], [t["ref"] for t in w["tracks"]]
+    assert w["keep"] == [] and w["add"] == w["tracks"] and w["target_len"] == 5
+    sid = w["session_id"]
     await wave.settle(sid)
-    refs += [t["ref"] for t in (await c.post(f"/api/wave/{sid}/next", json={"queued": refs})).json()["tracks"]]
+    url = f"/api/wave/{sid}/next"
+    r = await c.post(url, json={"queued": [t["ref"] for t in w["tracks"]]})
+    assert r.status_code == 200, r.text
+    tracks = r.json()["tracks"]
+    assert len(tracks) == len({t["artist"] for t in tracks}) == 5
+    return url, sid, [t["ref"] for t in tracks]
 
-    # the client dropped its queue (nothing ahead): the same best tracks come again
-    again = [t["ref"] for t in (await c.post(f"/api/wave/{sid}/next", json={})).json()["tracks"]]
-    # it plays the first; two of the rest still queued come back, first
-    played = (await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", refs[0])],
-                                                        "queued": refs[3:]})).json()["tracks"]
 
-    assert len(again) == 5 and refs[0] not in again
-    assert played and refs[0] not in [t["ref"] for t in played]
+async def test_the_answer_keeps_the_queue_and_appends(env, monkeypatch) -> None:
+    url, sid, refs = await full_wave(env, monkeypatch)
+    st = wave._rt[sid].state
+    dropped_at = st.handed[refs[1]]
+    # Reverse the tail to check that the client's order wins over the server's.
+    queued = refs[:2] + refs[2:][::-1]
+    r = await env["client"].post(url, json={"queued": queued[2:], "played": [ev("start", refs[0])]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == queued[2:]
+    assert len(out["add"]) == out["target_len"] - len(out["keep"]) == 2
+    assert [t["ref"] for t in out["tracks"][:len(out["keep"])]] == out["keep"]
+    assert out["tracks"][len(out["keep"]):] == out["add"]
+    assert not set(refs[:2]) & {t["ref"] for t in out["tracks"]}
+    assert refs[1] in st.pool and st.handed[refs[1]] == dropped_at
+
+
+async def test_a_dislike_drops_only_the_disliked_track_from_keep(env, monkeypatch) -> None:
+    url, _, refs = await full_wave(env, monkeypatch)
+    r = await env["client"].post(url, json={"queued": refs, "played": [ev("dislike", refs[0])]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == refs[1:] and len(out["add"]) == 1
+    assert refs[0] not in {t["ref"] for t in out["tracks"]}
+
+
+async def test_kept_tracks_are_not_probed_or_counted_again(env, monkeypatch) -> None:
+    url, sid, refs = await full_wave(env, monkeypatch)
+    st = wave._rt[sid].state
+    queued = refs[1:]
+    handed = {ref: st.handed[ref] for ref in queued}
+    calls = {"probe": [], "save": [], "shown": []}
+    probe_full, save_items, write = wave._probe_full, wave.save_items, wave._write_exclusions
+
+    async def probe(rt, tracks, *args, **kwargs):
+        calls["probe"].extend(c.track.ref for c in tracks)
+        return await probe_full(rt, tracks, *args, **kwargs)
+
+    async def save(s, sid, uid, tracks, values):
+        calls["save"].extend(c.track.ref for c in tracks)
+        return await save_items(s, sid, uid, tracks, values)
+
+    async def exclusions(uid, tracks, reason, ttl):
+        if reason == "shown":
+            calls["shown"].extend(c.track.ref for c in tracks)
+        return await write(uid, tracks, reason, ttl)
+
+    monkeypatch.setattr(wave, "_probe_full", probe)
+    monkeypatch.setattr(wave, "save_items", save)
+    monkeypatch.setattr(wave, "_write_exclusions", exclusions)
+    r = await env["client"].post(url, json={"queued": queued})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    added = [t["ref"] for t in out["add"]]
+    assert out["keep"] == queued and len(added) == 1
+    assert calls == {"probe": added, "save": added, "shown": added}
+    assert env["warmed"][-1] == added
+    assert {ref: st.handed[ref] for ref in queued} == handed
+    assert all(item.handed_count == 1 for item in await wave_items(sid))
+
+
+async def test_an_empty_queued_falls_back_to_a_full_batch(env, monkeypatch) -> None:
+    url, _, refs = await full_wave(env, monkeypatch)
+    r = await env["client"].post(url, json={"queued": []})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == [] and len(out["add"]) == 5 and out["tracks"] == out["add"]
+    assert not set(refs) & {t["ref"] for t in out["add"]}
+
+
+async def test_keep_drops_a_skipped_and_a_no_file_track(env, monkeypatch) -> None:
+    url, sid, refs = await full_wave(env, monkeypatch)
+    st = wave._rt[sid].state
+    # Test a no-file fingerprint even when the candidate is still in out.
+    st.no_file_fps.add(wave.fp_of(st.out[refs[1]]))
+    r = await env["client"].post(url, json={"queued": refs, "played": [ev("skip", refs[0], 5)]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == refs[2:] and len(out["add"]) == 2
+    assert not set(refs[:2]) & {t["ref"] for t in out["tracks"]}
+
+
+async def test_keep_matches_a_navidrome_alias_after_restart(env, monkeypatch) -> None:
+    url, sid, refs = await full_wave(env, monkeypatch)
+    rt = wave._rt[sid]
+    first = rt.state.out[refs[0]]
+    first.nd_song_id = "alias-song"
+    fp = wave.fp_of(first)
+    await wave._save(sid, rt, force=True)
+    await wave.reset()
+    queued = ["nd:alias-song", "alias-song", fp, refs[0], *refs[1:]]
+    r = await env["client"].post(url, json={"queued": queued})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == [queued[0], *refs[1:]] and out["add"] == []
+    assert [t["ref"] for t in out["tracks"]] == out["keep"]
+    assert out["tracks"][0]["owned"] and out["tracks"][0]["nd_song_id"] == "alias-song"
+    for alias in ("alias-song", fp):
+        r = await env["client"].post(url, json={"queued": [alias, *refs[1:]]})
+        assert r.status_code == 200, r.text
+        assert r.json()["keep"] == [alias, *refs[1:]]
+        assert r.json()["add"] == []
+
+    r = await env["client"].post(f"/api/wave/{sid}/no_file", json={"ref": fp})
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    st = wave._rt[sid].state
+    assert refs[0] not in st.out and fp in st.no_file_fps
+    r = await env["client"].post(url, json={"queued": [fp, *refs[1:]]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["keep"] == refs[1:]
+    assert not {fp, refs[0]} & {t["ref"] for t in out["tracks"]}
+
+
+async def test_delta_pins_the_new_window(env, monkeypatch) -> None:
+    from app import listen
+
+    url, _, refs = await full_wave(env, monkeypatch)
+    calls = []
+    pin = listen.pin
+
+    def spy(uid, refs):
+        calls.append((uid, list(refs)))
+        pin(uid, refs)
+
+    monkeypatch.setattr(listen, "pin", spy)
+    r = await env["client"].post(url, json={"queued": refs[1:]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    window = out["keep"] + [t["ref"] for t in out["add"]]
+    assert calls == [(env["admin"], window)]
+    assert listen.pinned_refs() == set(window)
 
 
 async def test_dislikes_during_the_wave_keep_tracks_and_artists_out(env, monkeypatch) -> None:
@@ -715,7 +852,7 @@ async def test_dislikes_during_the_wave_keep_tracks_and_artists_out(env, monkeyp
     sid, tracks = w["session_id"], w["tracks"]
     seed = tracks[0]
     next_out = (await c.post(f"/api/wave/{w['session_id']}/next", json={"queued": [seed["ref"]]})).json()
-    tracks += next_out["tracks"]
+    tracks = next_out["tracks"]
     bad = tracks[1]
 
     # «Не нравится» the artist from the track menu, the track ahead through an event of the session
@@ -844,13 +981,16 @@ async def test_a_session_outlives_a_restart_but_not_another_user(env, monkeypatc
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(30)])
     w = (await c.post("/api/wave/start", json={})).json()
     sid, first = w["session_id"], w["tracks"][0]["ref"]
-    await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", first)]})
+    issued = await c.post(f"/api/wave/{sid}/next", json={"played": [ev("start", first)]})
+    assert issued.status_code == 200, issued.text
+    queued = [t["ref"] for t in issued.json()["tracks"]]
+    assert queued
 
     await wave.reset()  # the Hub restarted: the session loads from its row, the profile is made again
-    r = await c.post(f"/api/wave/{sid}/next", json={})
+    r = await c.post(f"/api/wave/{sid}/next", json={"queued": queued})
 
     assert r.status_code == 200, r.text
-    assert r.json()["tracks"] and first not in [t["ref"] for t in r.json()["tracks"]]
+    assert r.json()["keep"] == queued and first not in [t["ref"] for t in r.json()["tracks"]]
     assert (await c.post("/api/wave/nope/next", json={})).status_code == 404
     from app.db import session_scope
     from app.models import User
@@ -1058,7 +1198,7 @@ async def test_an_old_session_is_cleared_to_a_summary_not_deleted(env, monkeypat
     assert wave.State.load(cleared.state_json).started == 3
 
 
-async def test_handed_out_tracks_are_recorded_once_and_counted_again(env, monkeypatch) -> None:
+async def test_handed_out_tracks_are_recorded_at_consecutive_positions(env, monkeypatch) -> None:
     c = env["client"]
     await history(env["admin"])
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(30)])
@@ -1077,10 +1217,9 @@ async def test_handed_out_tracks_are_recorded_once_and_counted_again(env, monkey
     second = [t["ref"] for t in r.json()["tracks"]]
 
     items = {x.ref: x for x in await wave_items(sid)}
-    again = set(second) & set(first)
-    assert again and all(items[ref].handed_count == 2 for ref in again)
+    assert not set(second) & set(first)
     assert items[first[0]].handed_count == 1  # played: not handed out again
-    assert sorted(items[ref].position for ref in set(second) - set(first)) == list(range(5, 5 + len(set(second) - set(first))))
+    assert [items[ref].position for ref in second] == list(range(1, 1 + len(second)))
     assert (await wave_row(sid)).next_calls == 1
 
 

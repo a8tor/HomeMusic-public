@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import date
 from pathlib import Path
 
@@ -141,6 +142,20 @@ async def test_listen_picks_the_ranked_file_and_streams_ranges(env):
     assert heard is not None and heard.provider_id == "1" and heard.enriched
     assert hm.enriched == ["1"]
     assert await listened_candidate("dz:101") is None
+
+
+async def test_http_prefetch_stream_pins_the_track(env):
+    from app import listen
+
+    env["hm"].cands = [cand("1", "https://cdn.test/good.mp3")]
+    ref = "dz:100"
+    assert ref not in listen.pinned_refs()
+    r = await env["client"].get("/api/listen/stream", params={"ref": ref}, headers={
+        "X-HomeMusic-Prefetch": "1", "Range": "bytes=0-99",
+    })
+    assert r.status_code == 206, r.text
+    assert r.content == AUDIO[:100]
+    assert ref in listen.pinned_refs()
 
 
 async def test_slow_listen_releases_auth_connection_before_resolving_and_allows_likes(env, monkeypatch):
@@ -413,6 +428,126 @@ async def test_track_loaded_ahead_waits_for_the_played_one(env):
     gate.set()
     assert AUDIO[:1000] + b"".join([chunk async for chunk in played.body]) == AUDIO
     assert b"".join([chunk async for chunk in ahead.body]) == AUDIO[:10]
+
+
+async def test_ahead_prefetch_does_not_mark_the_track_heard(env, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app import listen
+    from app.catalog.cache import cache_get
+
+    after_heard = AsyncMock()
+    monkeypatch.setattr(listen, "_after_heard", after_heard)
+    env["hm"].cands = [cand("1", "https://cdn.test/good.mp3")]
+    ref = "dz:100"
+    client = env["client"]
+    url = (await client.get("/api/listen", params={"ref": ref})).json()["stream_url"]
+    response = await client.get(url, headers={"X-HomeMusic-Prefetch": "1"})
+
+    assert response.status_code == 200 and response.content == AUDIO
+    assert not (await cache_get(listen._key(ref)))["heard"]
+    assert not listen._choices[ref].heard
+    after_heard.assert_not_called()
+
+
+async def test_pinned_copy_survives_prune_while_the_next_one_downloads(env, monkeypatch):
+    from app import light, listen
+    from app.config import get_settings
+
+    storage = get_settings().cfg.storage
+    monkeypatch.setattr(storage, "listen_max_mb", 1)
+    monkeypatch.setattr(storage, "listen_min_free_mb", 0)
+    refs = [f"file:hitmoz:{i}" for i in range(1, 6)]
+    env["hm"].cands = [cand(str(i), "https://cdn.test/good.mp3") for i in range(1, 6)]
+    await search_files(env["client"])
+    for ref in refs[:4]:
+        await listen.open_media(ref, None, ahead=True, user_id=1)
+        cp = listen._copies[ref]
+        await cp.task
+        assert cp.done
+
+    # Four 256 KiB originals fit exactly; adding even a small light variant requires eviction.
+    variant = light.copy_path(light.key_of(listen._file_ident(listen._choices[refs[0]])))
+    variant.parent.mkdir(parents=True, exist_ok=True)
+    variant.write_bytes(b"opus")
+    await listen.open_media(refs[4], None, ahead=True, user_id=1)
+    await listen._copies[refs[4]].task
+    assert listen.pinned_refs() == set(refs)
+    assert all(listen._copies[ref].path.read_bytes() == AUDIO for ref in refs)
+    assert variant.read_bytes() == b"opus"
+
+    listen.pin(1, refs[1:])
+    assert listen._copies[refs[0]].path.is_file()  # releasing a completed copy does not delete it
+    await listen.prune_cache()
+    assert not listen._copies[refs[0]].path.exists()
+    assert all(listen._copies[ref].path.is_file() for ref in refs[1:])
+
+
+async def test_dropped_ref_cancels_its_background_copy(env):
+    from app import listen
+
+    ref = "file:hitmoz:1"
+    gate = asyncio.Event()
+    env["mock"].route(host="slow.test").mock(side_effect=lambda req: partway(req, 1000, gate=gate))
+    env["hm"].cands = [cand("1", "https://slow.test/a.mp3")]
+    await search_files(env["client"])
+    await listen.open_media(ref, None, ahead=True, user_id=1)
+    cp = listen._copies[ref]
+    await asyncio.wait_for(cp.until(lambda: cp.have == 1000), 2)
+    assert cp.path.stat().st_size == 1000
+
+    listen.pin(2, [ref])
+    listen.pin(1, ["dz:200"])
+    assert not cp.task.cancelling()  # another window still owns the pin
+    listen.pin(2, [])
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cp.task, 2)
+    assert cp.settled() and not cp.done
+    assert not list(cp.path.parent.iterdir())
+
+
+async def test_background_copies_go_one_at_a_time(env, monkeypatch):
+    from app import listen
+
+    active = peak = 0
+    entered, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    open_stream = listen.open_stream
+    take_bg_slot = listen._take_bg_slot
+
+    async def counted(choice, rng):
+        nonlocal active, peak
+        if rng != "bytes=0-" or choice.ref == "file:hitmoz:3":
+            return await open_stream(choice, rng)
+        active += 1
+        peak = max(active, peak)
+        entered.set()
+        try:
+            await release.wait()
+            return await open_stream(choice, rng)
+        finally:
+            active -= 1
+
+    async def observe_slot(cp):
+        if cp.cand.provider_id == "2":
+            queued.set()
+        await take_bg_slot(cp)
+
+    monkeypatch.setattr(listen, "open_stream", counted)
+    monkeypatch.setattr(listen, "_take_bg_slot", observe_slot)
+    env["hm"].cands = [cand(str(i), "https://cdn.test/good.mp3") for i in range(1, 4)]
+    await search_files(env["client"])
+    first = asyncio.create_task(listen.open_media("file:hitmoz:1", None, ahead=True))
+    await asyncio.wait_for(entered.wait(), 2)
+    second = asyncio.create_task(listen.open_media("file:hitmoz:2", None, ahead=True))
+    try:
+        await asyncio.wait_for(queued.wait(), 2)
+        played = await asyncio.wait_for(listen.open_media("file:hitmoz:3", None), 2)
+        assert played.choice.ref == "file:hitmoz:3"
+        assert active == peak == 1 and not second.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 2)
+    assert peak == 1
 
 
 async def test_seek_far_past_the_server_copy_goes_to_the_source(env, monkeypatch):
@@ -772,6 +907,33 @@ def test_local_copies_are_pruned(tmp_path, monkeypatch):
                                                "staging_dir": tmp_path, "db_path": tmp_path / "none.db"})())
     cache_policy.prune_roots([tmp_path], {busy})
     assert sorted(p.name for p in tmp_path.iterdir()) == ["busy", "c", "d"]
+
+
+def test_fresh_copy_gets_a_demand_advance(tmp_path, monkeypatch):
+    from app import cache_policy, listen
+    from app.config import get_settings
+
+    storage = get_settings().cfg.storage
+    monkeypatch.setattr(storage, "listen_max_mb", 1)
+    monkeypatch.setattr(storage, "listen_min_free_mb", 0)
+    monkeypatch.setattr(storage, "listen_keep_s", 3600)
+    now = time.time()
+
+    def copy(ref, age):
+        path = tmp_path / listen._local_name(ref) / "stream"
+        path.parent.mkdir()
+        path.write_bytes(b"x" * 2**20)
+        os.utime(path, (now - age, now - age))
+        return path
+
+    monkeypatch.setattr(cache_policy, "_demand_snapshot", lambda: {"dz:old": (1, now - 1200)})
+    fresh, old = copy("dz:fresh", 10), copy("dz:old", 1200)
+    cache_policy.prune_roots([tmp_path])
+    assert fresh.is_file() and not old.exists()
+
+    old = copy("dz:old", 1200)
+    cache_policy.prune_roots([tmp_path], fresh_grace_s=0)
+    assert old.is_file() and not fresh.exists()
 
 
 def test_prune_skips_symlinks_outside_the_cache(tmp_path, monkeypatch):
