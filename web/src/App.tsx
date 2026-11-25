@@ -8,8 +8,8 @@ import { TabBar, type Tab } from './components/TabBar';
 import { ErrorState, Spinner, cx } from './components/ui';
 import { STANDALONE } from './lib/embedded';
 import { hubEvents } from './lib/events';
-import { restoreListening, stopListening } from './lib/listen';
-import { restoreWave } from './lib/wave';
+import { mountListenPrefetch, restoreListening, stopListening } from './lib/listen';
+import { mountWave, restoreWave } from './lib/wave';
 import { resetStars } from './lib/stars';
 import { startNotificationWatcher, stopNotificationWatcher } from './lib/notify';
 import { SessionContext } from './lib/session';
@@ -127,6 +127,8 @@ export function App() {
   }, []);
 
   useEffect(boot, [boot]);
+  useEffect(mountListenPrefetch, []);
+  useEffect(mountWave, []);
 
   useEffect(() => {
     const account = me?.id ?? null;

@@ -338,8 +338,8 @@ export const api = {
     request<{ ok: boolean }>('POST', `/api/smart-shuffle/${encodeURIComponent(id)}/hide`, { json: body }),
   smartAdd: (id: string, body: { ref?: string | null; nd_song_id?: string | null }) =>
     request<SmartAddOut>('POST', `/api/smart-shuffle/${encodeURIComponent(id)}/add`, { json: body }),
-  waveStart: (body: WaveStartIn) => request<WaveOut>('POST', '/api/wave/start', { json: body }),
-  waveNext: (id: string, body: WaveNextIn) => request<WaveOut>('POST', `/api/wave/${encodeURIComponent(id)}/next`, { json: body }),
+  waveStart: (body: WaveStartIn, signal?: AbortSignal) => request<WaveOut>('POST', '/api/wave/start', { json: body, signal }),
+  waveNext: (id: string, body: WaveNextIn, signal?: AbortSignal) => request<WaveOut>('POST', `/api/wave/${encodeURIComponent(id)}/next`, { json: body, signal }),
   /** A track of the wave was a 30 s preview only (no source has its file): the Hub stops handing it out. */
   waveNoFile: (id: string, ref: string) =>
     request<{ ok: boolean }>('POST', `/api/wave/${encodeURIComponent(id)}/no_file`, { json: { ref } }),
@@ -425,7 +425,8 @@ export const api = {
 export const libraryCoverUrl = (albumId: number, size = 300, rev?: string | null) =>
   withQuery(`/api/library/albums/${albumId}/cover`, { size, v: rev });
 
-/** Audio of a catalog track for `<audio src>`; retry adds a cache-busting query parameter. */
-export const listenStreamUrl = (ref: string, retry = 0) => withQuery('/api/listen/stream', { ref, retry: retry || undefined });
+/** Audio of a catalog track; retry busts the cache, mobile selects the lower bitrate. */
+export const listenStreamUrl = (ref: string, retry = 0, mobile = false) =>
+  withQuery('/api/listen/stream', { ref, retry: retry || undefined, q: mobile ? 'mobile' : undefined });
 
 export const uploadCoverUrl = (uploadId: number) => `/api/uploads/${uploadId}/cover`;

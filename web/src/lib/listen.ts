@@ -122,14 +122,17 @@ function set(patch: Partial<ListenState>) {
   if ((patch.queue !== undefined && patch.queue !== state.queue) || (patch.index !== undefined && patch.index !== state.index)) {
     manualQueueRevision++;
   }
+  const previous = state;
   state = { ...state, ...patch };
+  if (state.queue !== previous.queue || state.index !== previous.index || state.context !== previous.context
+    || state.phase !== previous.phase || state.track?.ref !== previous.track?.ref || patch.phase === 'resolving') syncPrefetch();
   // Time updates are frequent; queue edits and controls must survive an immediate reload.
   persistListening(Object.keys(patch).some((key) => key !== 'position' && key !== 'duration'));
   if (!!state.track !== shown) webPlayerShown(!!state.track);
   for (const fn of subscribers) fn();
 }
 
-function subscribe(fn: () => void) {
+export function subscribeListen(fn: () => void) {
   subscribers.add(fn);
   return () => {
     subscribers.delete(fn);
@@ -143,7 +146,7 @@ export const getListenState = (): ListenState => state;
 
 /** A slice of the listening state; `select` must return a primitive or a stored object (not a new one). */
 export function useListen<T>(select: (s: ListenState) => T): T {
-  return useSyncExternalStore(subscribe, () => select(state));
+  return useSyncExternalStore(subscribeListen, () => select(state));
 }
 
 let audio: HTMLAudioElement | null = null;
@@ -152,7 +155,6 @@ let audio: HTMLAudioElement | null = null;
 export const listenAudio = (): HTMLAudioElement | null => audio;
 let pendingSeek = 0;
 let resolving: AbortController | null = null;
-let prefetching: { ref: string; ctl: AbortController } | null = null;
 let streamRetry: { ref: string; count: number } = { ref: '', count: 0 };
 let manualQueueRevision = 0;
 const RESOLVE_RETRY_MS = [400, 1200] as const;
@@ -247,6 +249,9 @@ function lockTab() {
 lockTab();
 setInterval(() => { checkpoint(); scanAbandoned(); }, 15_000);
 window.addEventListener('pagehide', () => {
+  prefetchPageHidden = true;
+  prefetchSample = null;
+  clearPrefetch();
   persistListening(true);
   checkpoint();
   reportEnd(false, false, true);
@@ -258,6 +263,8 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pageshow', (event) => {
   if (!event.persisted) return;
+  prefetchPageHidden = false;
+  syncPrefetch();
   lockTab();
   const t = state.track;
   if (t) {
@@ -316,19 +323,27 @@ function el(): HTMLAudioElement {
     }
     sync();
   });
-  a.addEventListener('timeupdate', sync);
+  a.addEventListener('timeupdate', () => {
+    sync();
+    measurePrefetchPlayback(a);
+  });
   a.addEventListener('durationchange', sync);
   a.addEventListener('play', pauseNative);
   a.addEventListener('playing', () => {
     set({ phase: 'playing', error: null });
+    measurePrefetchPlayback(a);
     refreshInfo();
     reportStart();
     if (played?.started && played.anchor === null) played.anchor = performance.now();
   });
-  const suspendClock = () => { if (played?.started) { accrue(played); played.anchor = null; checkpoint(); } };
+  const suspendClock = () => {
+    prefetchSample = null;
+    if (played?.started) { accrue(played); played.anchor = null; checkpoint(); }
+  };
   a.addEventListener('seeking', suspendClock);
   a.addEventListener('seeked', () => {
     if (played?.started && !a.paused && a.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) played.anchor = performance.now();
+    measurePrefetchPlayback(a);
   });
   a.addEventListener('waiting', () => {
     suspendClock();
@@ -354,7 +369,7 @@ function el(): HTMLAudioElement {
     if (code === 2 && streamRetry.ref === track.ref && streamRetry.count < STREAM_RETRIES) {
       streamRetry.count++;
       set({ phase: 'loading', error: null });
-      a.src = listenStreamUrl(track.ref, streamRetry.count);
+      a.src = listenStreamUrl(track.ref, streamRetry.count, prefetchPolicy().mobile);
       play(a);
       return;
     }
@@ -387,14 +402,14 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   const ctl = new AbortController();
   resolving = ctl;
   pendingSeek = position;
+  prefetchSample = null;
+  prefetchPlayedS = 0;
+  prefetchPlayback++;
   set({ track, queue, index, context: listContext, phase: autoplay ? 'resolving' : 'paused', info: null, error: null, position, duration: track.duration_s ?? 0 });
-  a.src = listenStreamUrl(track.ref);
+  a.src = listenStreamUrl(track.ref, 0, prefetchPolicy().mobile);
   if (autoplay) play(a);
   else a.load();
   mediaSession(track);
-  // the prefetch of this very track (it was next) is the request to wait for: don't abort it
-  if (prefetching?.ref !== track.ref) prefetching?.ctl.abort();
-  prefetching = null;
   resolveListen(track.ref, ctl.signal).then(
     (info) => {
       if (resolving !== ctl) return;
@@ -411,7 +426,6 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
       }
       set({ info, duration: info.kind === 'preview' ? (info.duration_s ?? 30) : state.duration });
       reportStart();
-      prefetchNext();
     },
     (e: unknown) => {
       if (isAbort(e) || resolving !== ctl) return;
@@ -484,16 +498,161 @@ function refreshInfo() {
   );
 }
 
-/** Asks the Hub to pick the next track's file now (it remembers the pick), so it starts at once. */
-function prefetchNext() {
-  const nextTrack = state.queue[state.index + 1] ?? (state.repeat === 'all' && !onWave() ? state.queue[0] : undefined);
-  if (!nextTrack || prefetching?.ref === nextTrack.ref) return;
-  prefetching?.ctl.abort();
+const PREFETCH_AHEAD = 5;
+const STABLE_LISTEN_S = 5;
+
+function networkConnection() {
+  return (navigator as Navigator & {
+    connection?: EventTarget & { saveData?: boolean; effectiveType?: string };
+  }).connection;
+}
+
+function prefetchPolicy() {
+  const connection = networkConnection();
+  const type = connection?.effectiveType;
+  const slow = type === '2g' || type === 'slow-2g';
+  const saveData = connection?.saveData === true;
+  return {
+    mobile: saveData || slow || type === '3g',
+    ahead: slow ? 0 : saveData ? 1 : type === '3g' ? 2 : PREFETCH_AHEAD,
+    bytes: !saveData && !slow,
+  };
+}
+
+let prefetchEnabled = false;
+let prefetchPageHidden = false; // pagehide (not visibilitychange: playback can continue in a background tab)
+let endedPrefetchContext: string | null = null;
+let prefetchPlayback = 0;
+let prefetchPlayedS = 0;
+let prefetchSample: { position: number; at: number } | null = null;
+let prefetchWindow: { refs: string[]; playback: number; mobile: boolean; bytes: boolean; ctl: AbortController } | null = null;
+const sourcePicks = new Map<string, AbortController>();
+let pickedRef: string | null = null;
+const warmed = new Set<string>();
+let byteRequest: { ref: string; ctl: AbortController; abort: () => void } | null = null;
+
+/** The app owns the player, not any particular player view or page. */
+export function mountListenPrefetch(): () => void {
+  const connection = networkConnection();
+  prefetchEnabled = true;
+  connection?.addEventListener('change', syncPrefetch);
+  syncPrefetch();
+  return () => {
+    connection?.removeEventListener('change', syncPrefetch);
+    prefetchEnabled = false;
+    prefetchSample = null;
+    clearPrefetch();
+  };
+}
+
+/** An expired wave may play out its remaining tracks without doing more background work. */
+export function endWavePrefetch(context: string) {
+  if (state.context !== context) return;
+  endedPrefetchContext = context;
+  clearPrefetch();
+}
+
+function clearPrefetch() {
+  prefetchWindow?.ctl.abort();
+  prefetchWindow = null;
+  for (const ctl of sourcePicks.values()) ctl.abort();
+  sourcePicks.clear();
+  pickedRef = null;
+  warmed.clear();
+}
+
+/** Count actual media progress while playing, not a saved position or a seek past the threshold. */
+function measurePrefetchPlayback(a: HTMLAudioElement) {
+  if (!prefetchEnabled || state.phase !== 'playing' || a.paused || a.seeking) {
+    prefetchSample = null;
+    return;
+  }
+  if (prefetchPlayedS < STABLE_LISTEN_S) {
+    const sample = { position: a.currentTime, at: performance.now() };
+    if (prefetchSample) {
+      const elapsed = (sample.at - prefetchSample.at) / 1000;
+      const advanced = sample.position - prefetchSample.position;
+      prefetchPlayedS += Math.max(0, Math.min(advanced, elapsed * a.playbackRate));
+    }
+    prefetchSample = sample;
+  }
+  if (prefetchPlayedS >= STABLE_LISTEN_S && state.position >= STABLE_LISTEN_S) syncPrefetch();
+}
+
+function syncPrefetch() {
+  if (endedPrefetchContext !== state.context) endedPrefetchContext = null;
+  const policy = prefetchPolicy();
+  const current = state.track?.ref;
+  if (!prefetchEnabled || prefetchPageHidden || endedPrefetchContext !== null || !current || !policy.ahead
+    || state.phase === 'ended' || state.phase === 'error') {
+    clearPrefetch();
+    return;
+  }
+
+  const refs = [...new Set(state.queue.slice(state.index + 1, state.index + 1 + policy.ahead).map((t) => t.ref))];
+  const nextRef = refs[0];
+  const old = prefetchWindow;
+  if (!old || old.playback !== prefetchPlayback || old.mobile !== policy.mobile || old.bytes !== policy.bytes
+    || old.refs.length !== refs.length || refs.some((ref, i) => old.refs[i] !== ref)) {
+    const ctl = new AbortController();
+    const job = byteRequest;
+    if (old && job && !job.ctl.signal.aborted && policy.bytes && old.mobile === policy.mobile && (
+      job.ref === current || (old.playback === prefetchPlayback ? refs.includes(job.ref) : job.ref === nextRef)
+    )) {
+      // Transfer an in-flight request that is still useful to the new window.
+      old.ctl.signal.removeEventListener('abort', job.abort);
+      ctl.signal.addEventListener('abort', job.abort, { once: true });
+    }
+    old?.ctl.abort();
+    if (old?.mobile !== policy.mobile) warmed.clear();
+    for (const ref of warmed) if (!refs.includes(ref)) warmed.delete(ref);
+    prefetchWindow = { refs, playback: prefetchPlayback, mobile: policy.mobile, bytes: policy.bytes, ctl };
+  }
+
+  for (const [ref, ctl] of sourcePicks) {
+    if (ref === current || ref === nextRef) continue;
+    ctl.abort();
+    sourcePicks.delete(ref);
+  }
+  if (pickedRef !== nextRef) pickedRef = null;
+  if (state.phase !== 'paused' && nextRef && nextRef !== current && pickedRef !== nextRef) {
+    pickedRef = nextRef;
+    if (!sourcePicks.has(nextRef)) {
+      const ctl = new AbortController();
+      sourcePicks.set(nextRef, ctl);
+      void api.listen(nextRef, ctl.signal).catch(() => {}).finally(() => {
+        if (sourcePicks.get(nextRef) === ctl) sourcePicks.delete(nextRef);
+      });
+    }
+  }
+
+  const window = prefetchWindow;
+  if (!window?.bytes || byteRequest || state.phase !== 'playing' || audio?.paused || audio?.seeking
+    || state.position < STABLE_LISTEN_S || prefetchPlayedS < STABLE_LISTEN_S) return;
+  const ref = window.refs.find((r) => r !== current && !warmed.has(r));
+  if (ref) void prefetchBytes(ref, window);
+}
+
+async function prefetchBytes(ref: string, window: NonNullable<typeof prefetchWindow>) {
   const ctl = new AbortController();
-  prefetching = { ref: nextTrack.ref, ctl };
-  api.listen(nextTrack.ref, ctl.signal).catch(() => {
-    /* the track itself will show the error when it is reached */
-  });
+  const job = { ref, ctl, abort: () => ctl.abort() };
+  byteRequest = job;
+  window.ctl.signal.addEventListener('abort', job.abort, { once: true });
+  try {
+    const res = await fetch(listenStreamUrl(ref, 0, window.mobile), {
+      headers: { Range: 'bytes=0-262143', 'X-HomeMusic-Prefetch': '1' }, signal: ctl.signal,
+    });
+    // A server that ignores Range must not turn this into a whole-track download.
+    if (res.status === 206) await res.arrayBuffer();
+    else await res.body?.cancel();
+  } catch { /* Background work must not surface playback errors. */ }
+  finally {
+    window.ctl.signal.removeEventListener('abort', job.abort);
+    prefetchWindow?.ctl.signal.removeEventListener('abort', job.abort);
+    byteRequest = null;
+    if (!ctl.signal.aborted && prefetchWindow?.refs.includes(ref)) warmed.add(ref);
+    syncPrefetch();
+  }
 }
 
 // --- tracks on screen -------------------------------------------------------------------------------------
@@ -619,7 +778,6 @@ export function continueCurrentInList(list: readonly ListenTrack[], context: str
   beforeStart();
   set({ queue, index: 0, context, smart: false, track: current });
   reportStart();
-  prefetchNext();
   return true;
 }
 
@@ -748,7 +906,6 @@ export function setShuffle(on: boolean) {
     unshuffled = null;
     set({ queue, index: Math.max(0, queue.indexOf(current)) });
   }
-  prefetchNext();
 }
 
 /** The shuffle button: off → shuffle → smart shuffle (only where the playing list can have one: a playlist or
@@ -787,7 +944,7 @@ export function registerSmart(hooks: SmartHooks) {
 
 /** The smart shuffle chosen (the last choice of the button); `smart` of the state is whether the playing list has it. */
 export function useSmartChosen(): boolean {
-  return useSyncExternalStore(subscribe, () => smartChosen);
+  return useSyncExternalStore(subscribeListen, () => smartChosen);
 }
 
 /** The Hub did not answer or the session is over: the plain shuffle goes on. */
@@ -810,7 +967,6 @@ export function insertAfterOwn(items: ReadonlyArray<{ after: string; track: List
   if (!added) return;
   set({ queue });
   if (state.phase === 'ended' && hasNext(state)) start(state.queue, state.index + 1, true);
-  else if (state.phase !== 'error') prefetchNext();
 }
 
 /** «+»: the recommendation became the list's own song (no ✨ any more). */
@@ -823,7 +979,6 @@ export function markOwn(ref: string) {
 /** off → all → one → off. */
 export function cycleRepeat() {
   setModes({ repeat: state.repeat === 'off' ? 'all' : state.repeat === 'all' ? 'one' : 'off' });
-  prefetchNext();
 }
 
 /** «Играть следующим»: right after the current track (when nothing plays, they start now). */
@@ -832,7 +987,6 @@ export function playNext(tracks: readonly ListenTrack[]) {
   if (!state.track) return listen(tracks[0], tracks);
   const added = tracks.map((t) => ({ ...t })); // own objects: the same track may be in the queue twice
   set({ queue: [...state.queue.slice(0, state.index + 1), ...added, ...state.queue.slice(state.index + 1)] });
-  prefetchNext();
 }
 
 /** «Добавить в очередь»: after the last track (when nothing plays, they start now). */
@@ -842,14 +996,12 @@ export function addToQueue(tracks: readonly ListenTrack[]) {
   const ended = state.phase === 'ended';
   set({ queue: [...state.queue, ...tracks.map((t) => ({ ...t }))] });
   if (ended) start(state.queue, state.index + 1, true);
-  else prefetchNext();
 }
 
 /** Takes a track that is not the current one out of the queue. */
 export function removeFromQueue(index: number) {
   if (index === state.index || index < 0 || index >= state.queue.length) return;
   set({ queue: state.queue.filter((_, i) => i !== index), index: index < state.index ? state.index - 1 : state.index });
-  prefetchNext();
 }
 
 /** Moves a track of the queue to another place (the current one too). */
@@ -860,7 +1012,6 @@ export function moveInQueue(from: number, to: number) {
   const [t] = q.splice(from, 1);
   q.splice(to, 0, t);
   set({ queue: q, index: q.indexOf(current) });
-  prefetchNext();
 }
 
 /** A tap on a track of the queue: it plays now, the queue stays as it is. */
@@ -875,7 +1026,6 @@ export function extendQueue(list: readonly ListenTrack[]) {
   // the playing queue is the list as it was: the same refs in the same order
   if (!state.track || list.length <= q.length || q.some((t, i) => t.ref !== list[i].ref)) return;
   set({ queue: [...q, ...list.slice(q.length)] });
-  if (state.phase !== 'error' && state.phase !== 'ended') prefetchNext();
 }
 
 export function getQueueRevision(): number {
@@ -888,12 +1038,35 @@ export function getQueueRevision(): number {
  * title. Other lists keep their tracks as they are. */
 export function replaceUpcoming(list: readonly ListenTrack[]) {
   if (!state.track) return;
-  const ended = state.phase === 'ended';
   const before = state.queue.slice(0, state.index + 1);
-  const fresh = onWave() ? dedupeUpcoming(before, list) : [...list];
-  set({ queue: [...before, ...fresh] });
-  if (ended && hasNext(state)) start(state.queue, state.index + 1, true);
-  else if (state.phase !== 'error') prefetchNext();
+  updateUpcoming([...before, ...(onWave() ? dedupeUpcoming(before, list) : list)]);
+}
+
+/** Apply a wave delta to the tail only, keeping the existing track objects for surviving refs. */
+export function applyUpcomingDelta(keep: readonly string[], add: readonly ListenTrack[]) {
+  if (!state.track) return;
+  const before = state.queue.slice(0, state.index + 1);
+  const upcoming = new Map(state.queue.slice(state.index + 1).map((t) => [t.ref, t]));
+  const kept: ListenTrack[] = [];
+  upcoming.delete(state.track.ref);
+  upcoming.delete(state.queue[state.index].ref);
+  for (const ref of keep) {
+    const track = upcoming.get(ref);
+    if (track) kept.push(track);
+    upcoming.delete(ref);
+  }
+  const used = new Set([...before.map((t) => t.ref), state.track.ref, ...kept.map((t) => t.ref)]);
+  const added = add.filter((t) => {
+    if (used.has(t.ref)) return false;
+    used.add(t.ref);
+    return true;
+  });
+  updateUpcoming([...before, ...kept, ...added]);
+}
+
+function updateUpcoming(queue: readonly ListenTrack[]) {
+  if (queue.length !== state.queue.length || queue.some((t, i) => t !== state.queue[i])) set({ queue });
+  if (state.phase === 'ended' && hasNext(state)) start(state.queue, state.index + 1, true);
 }
 
 /** The upcoming tracks without a repeat of one already there or of an earlier one (a wave: `dz:` and `nd:` copies
@@ -979,8 +1152,7 @@ export function stopListening() {
   reportEnd();
   resolving?.abort();
   resolving = null;
-  prefetching?.ctl.abort();
-  prefetching = null;
+  clearPrefetch();
   pendingSeek = 0;
   if (audio) {
     audio.pause();

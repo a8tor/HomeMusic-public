@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { ApiError, api, errorMessage } from '../api/client';
 import type { PlayEventIn, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
 import { EMBEDDED } from './embedded';
-import { continueCurrentInList, getListenState, getQueueRevision, listenAll, replaceUpcoming, type ListenTrack } from './listen';
+import { applyUpcomingDelta, continueCurrentInList, endWavePrefetch, getListenState, getQueueRevision, listenAll, replaceUpcoming, subscribeListen, type ListenTrack } from './listen';
 import { canPlayAll, canPlayWave, playWave } from './player';
 import { onPlayEvent } from './plays';
 import { toastError } from './ui';
@@ -12,7 +12,7 @@ import { toastError } from './ui';
  *
  * In a browser (and app versions whose player doesn't play catalog tracks) the page's own mini player plays it
  * (`lib/listen.ts`, context `wave:<id>`): each time a wave track starts, and after a ♥ of one, the events since the
- * last call go to the Hub with the refs still ahead, and the answer replaces them (`replaceUpcoming`) — so the
+ * last call go to the Hub with the refs still ahead, and the answer updates the tail with a delta — so the
  * stream is picked again after every action. The same events go to /api/plays/events as always (the Hub stores an
  * event_id once).
  *
@@ -37,7 +37,8 @@ interface Session {
   /** events of the wave's tracks not yet handed to the Hub */
   pending: PlayEventIn[];
   inFlight: PlayEventIn[];
-  busy: boolean;
+  ctl?: AbortController;
+  retry?: ReturnType<typeof setTimeout>;
   again: boolean;
 }
 
@@ -45,6 +46,7 @@ let session: Session | null = null;
 let sessionAccount: number | null = null;
 const SESSION_KEY = 'hm-wave-session:';
 let starting: string | null = null; // the seed being started ('' — the user's own wave)
+let startRequest: AbortController | null = null;
 const subscribers = new Set<() => void>();
 let snapshot: { title: string | null; starting: string | null } = { title: null, starting: null };
 
@@ -67,7 +69,7 @@ function persistWave() {
 /** Continue the same server session, including events that were still awaiting acknowledgement. */
 export function restoreWave(account: number | null) {
   if (sessionAccount === account) return;
-  session = null;
+  if (session) end();
   sessionAccount = account;
   const st = getListenState();
   if (account !== null && !canPlayAll() && st.track && st.context.startsWith('wave:')) {
@@ -79,7 +81,7 @@ export function restoreWave(account: number | null) {
       refs: new Set([...(Array.isArray(saved?.refs) ? saved.refs.filter((r) => typeof r === 'string') : []), ...st.queue.map((t) => t.ref)]),
       songs: new Set(Array.isArray(saved?.songs) ? saved.songs.filter((r) => typeof r === 'string') : []),
       pending: Array.isArray(saved?.pending) ? saved.pending.filter((e) => e && typeof e.event_id === 'string') : [],
-      inFlight: [], busy: false, again: false };
+      inFlight: [], again: false };
   }
   emit();
 }
@@ -130,8 +132,12 @@ const listenTrack = (t: WaveTrackOut): ListenTrack => ({
   duration_s: t.duration_s,
 });
 
-function remember(s: Session, w: WaveOut) {
-  for (const t of w.tracks) {
+function hasDelta(w: WaveOut): boolean {
+  return Array.isArray(w.keep) && Array.isArray(w.add);
+}
+
+function remember(s: Session, tracks: readonly WaveTrackOut[]) {
+  for (const t of tracks) {
     s.refs.add(t.ref);
     if (t.nd_song_id) s.songs.add(t.nd_song_id);
   }
@@ -140,23 +146,29 @@ function remember(s: Session, w: WaveOut) {
 /** Starts the user's own wave, or one from a track or an artist («Волна по треку»). `origin` — where it was started
  * (INSIGHTS.md 6.3: analytics only, the Hub keeps it with the session). */
 export async function startWave(seed: WaveSeedIn | null | undefined, origin: WaveOrigin): Promise<boolean> {
-  if (starting !== null) return false;
+  if (startRequest) return false;
+  const ctl = new AbortController();
+  startRequest = ctl;
   starting = seedKey(seed);
   emit();
   try {
-    const w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' });
-    if (!w.tracks.length) {
+    const w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' }, ctl.signal);
+    if (ctl.signal.aborted) return false;
+    // The native bridge still uses the full window. A web start sends no `queued`, so `add` is the whole window.
+    const native = canPlayWave();
+    const picks = !native && hasDelta(w) ? w.add : w.tracks;
+    if (!picks.length) {
       toastError('Волна пока пустая: попробуйте чуть позже');
       return false;
     }
-    if (canPlayWave()) {
+    if (native) {
       end(); // a wave the page's own player had is over: the app's player plays now
       playWave(w);
       return true;
     }
-    const s: Session = { id: w.session_id, title: w.title, context: `wave:${w.session_id}`, refs: new Set(), songs: new Set(), pending: [], inFlight: [], busy: false, again: false };
-    remember(s, w);
-    const tracks = w.tracks.map(listenTrack);
+    const s: Session = { id: w.session_id, title: w.title, context: `wave:${w.session_id}`, refs: new Set(), songs: new Set(), pending: [], inFlight: [], again: false };
+    remember(s, picks);
+    const tracks = picks.map(listenTrack);
     // Keep the current playback position when the playing song is the wave seed.
     const continued = continueCurrentInList(tracks, s.context, () => {
       end();
@@ -169,23 +181,29 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
     }
     return true;
   } catch (e) {
-    toastError(errorMessage(e));
+    if (!ctl.signal.aborted) toastError(errorMessage(e));
     return false;
   } finally {
-    starting = null;
-    emit();
+    if (startRequest === ctl) {
+      startRequest = null;
+      starting = null;
+      emit();
+    }
   }
 }
 
-/** The events since the last call and the refs still ahead go to the Hub; its picks replace them. */
+/** Send the refs still ahead with new events, then apply the delta to that same queue revision. */
 async function ask() {
   const s = session;
   if (!s) return;
-  if (s.busy) {
+  if (s.ctl) {
     s.again = true;
     return;
   }
-  s.busy = true;
+  clearTimeout(s.retry);
+  s.retry = undefined;
+  const ctl = new AbortController();
+  s.ctl = ctl;
   const played = s.pending.splice(0);
   s.inFlight = played;
   persistWave();
@@ -193,36 +211,81 @@ async function ask() {
   const queueRevision = getQueueRevision();
   const queued = st.queue.slice(st.index + 1).map((t) => t.ref);
   try {
-    const w = await api.waveNext(s.id, { played, queued });
-    if (session !== s || getListenState().context !== s.context) return;
+    const w = await api.waveNext(s.id, { played, queued }, ctl.signal);
+    if (session !== s || ctl.signal.aborted || getListenState().context !== s.context) return;
     if (getQueueRevision() !== queueRevision) {
-      s.pending.unshift(...played);
+      // The server acknowledged the events, but the delta was for a different queue snapshot.
+      s.again = true;
       return;
     }
-    remember(s, w);
-    if (w.tracks.length) replaceUpcoming(w.tracks.map(listenTrack));
-    else if (w.pending) setTimeout(() => void ask(), RETRY_MS);
+    if (hasDelta(w)) {
+      remember(s, w.add);
+      applyUpcomingDelta(w.keep, w.add.map(listenTrack));
+    } else {
+      remember(s, w.tracks);
+      if (w.tracks.length || !w.pending) replaceUpcoming(w.tracks.map(listenTrack));
+    }
+    const current = getListenState();
+    if (session === s && w.pending && current.queue.length - current.index - 1 < (w.target_len ?? 5)) {
+      s.retry = setTimeout(() => { if (session === s) void ask(); }, RETRY_MS);
+    }
   } catch (e) {
+    if (session !== s || ctl.signal.aborted) return;
     if (e instanceof ApiError && e.status === 404) {
       end(); // the session is over (a day without it): the queue plays out
     } else s.pending.unshift(...played); // offline: with the next call
   } finally {
-    s.inFlight = [];
-    persistWave();
-    s.busy = false;
-    if (s.again && session === s) {
-      s.again = false;
-      void ask();
+    if (s.ctl === ctl) {
+      s.ctl = undefined;
+      s.inFlight = [];
+      persistWave();
+      if (s.again && session === s) {
+        s.again = false;
+        void ask();
+      }
     }
   }
 }
 
+function cancelWork(s: Session) {
+  clearTimeout(s.retry);
+  s.retry = undefined;
+  s.ctl?.abort();
+  s.ctl = undefined;
+  s.pending.unshift(...s.inFlight);
+  s.inFlight = [];
+  s.again = false;
+}
+
 function end() {
+  const s = session;
   session = null;
+  if (s) {
+    cancelWork(s);
+    endWavePrefetch(s.context);
+  }
   emit();
 }
 
-onPlayEvent((e) => {
+/** Own the wave's subscriptions and retry work at the app level, across player views. */
+export function mountWave(): () => void {
+  const unsubscribeEvents = onPlayEvent(handlePlayEvent);
+  const unsubscribeListen = subscribeListen(() => {
+    const st = getListenState();
+    if (session && (!st.track || st.context !== session.context)) end();
+  });
+  return () => {
+    unsubscribeEvents();
+    unsubscribeListen();
+    startRequest?.abort();
+    startRequest = null;
+    starting = null;
+    if (session) cancelWork(session);
+    emit();
+  };
+}
+
+function handlePlayEvent(e: PlayEventIn) {
   if (e.kind === 'progress' || e.kind === 'interrupted' || e.kind === 'error') return;
   if ((e.target_type && e.target_type !== 'track') || e.reverts_event_id) return;
   const s = session;
@@ -232,4 +295,4 @@ onPlayEvent((e) => {
   s.pending.push(e);
   persistWave();
   if (e.kind === 'start' || e.kind === 'like' || e.kind === 'dislike') void ask();
-});
+}

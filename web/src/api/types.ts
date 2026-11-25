@@ -1160,9 +1160,13 @@ export interface WaveOut {
   title: string;
   mode: MixMode;
   seed?: { ref?: string; artist_ref?: string; nd_artist_id?: string; artist?: string; title?: string } | null;
-  /** up to 5: they replace `queued` */
+  /** Surviving refs from `queued`, in order, followed by new picks in `add`. */
+  keep: string[];
+  add: WaveTrackOut[];
+  target_len: number;
+  /** The full window for older clients: kept tracks, then new picks. */
   tracks: WaveTrackOut[];
-  /** sources still answer: an empty `tracks` — ask again in a few seconds */
+  /** Sources are still answering; retry in a few seconds. */
   pending: boolean;
   recorded?: PlayEventsOut | null;
 }
