@@ -24,6 +24,16 @@ if (homemusicKeystoreFile.exists()) {
     homemusicKeystoreFile.withInputStream { homemusicKeystoreProperties.load(it) }
 }
 
+def releaseVersionProperty = providers.gradleProperty('releaseVersion').orNull
+def releaseVersionCodeProperty = providers.gradleProperty('releaseVersionCode').orNull
+if ((releaseVersionProperty == null) != (releaseVersionCodeProperty == null)) {
+    throw new GradleException('Pass both -PreleaseVersion and -PreleaseVersionCode, or neither.')
+}
+if (releaseVersionProperty != null && !(releaseVersionProperty ==~ /\d+\.\d+\.\d+/)) {
+    throw new GradleException("Invalid -PreleaseVersion '${releaseVersionProperty}'; expected X.Y.Z.")
+}
+def releaseVersionCode = releaseVersionCodeProperty == null ? null : Integer.parseInt(releaseVersionCodeProperty)
+
 android {
     namespace = 'com.eddyizm.tempus'
     //noinspection GradleDependency
@@ -35,8 +45,8 @@ android {
         //noinspection OldTargetApi
         targetSdk = 37
 
-        versionCode 50
-        versionName '4.29.0'
+        versionCode releaseVersionCode ?: 50
+        versionName releaseVersionProperty ?: '4.29.0'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
 
         // HomeMusic integration (Hub tabs, share target, notifications, updates) is off by default.
@@ -114,9 +124,9 @@ android {
         homemusic {
             dimension = "default"
             applicationId = "app.homemusic.selfhost"
-            // Own version line; -PhmVersionCode / -PhmVersionName override it for test builds.
-            versionCode Integer.parseInt((project.findProperty('hmVersionCode') ?: '1').toString())
-            versionName((project.findProperty('hmVersionName') ?: '1.0.0').toString())
+            // Own version line; release properties take precedence while existing test overrides remain supported.
+            versionCode releaseVersionCode ?: Integer.parseInt((project.findProperty('hmVersionCode') ?: '1').toString())
+            versionName(releaseVersionProperty ?: (project.findProperty('hmVersionName') ?: '1.0.0').toString())
             buildConfigField 'boolean', 'HOMEMUSIC', 'true'
             buildConfigField 'String', 'HUB_URL', homemusicUrl('hmHubUrl', 'hubUrl')
             buildConfigField 'String', 'HUB_LOCAL_URL', homemusicUrl('hmHubLocalUrl', 'hubLocalUrl')
@@ -292,6 +302,63 @@ tasks.register("recordHomeMusicTestsPassed") {
 }
 tasks.configureEach { task ->
     if (task.name == "testHomemusicDebugUnitTest") task.finalizedBy("recordHomeMusicTestsPassed")
+}
+
+// One-shot HomeMusic release: reserve the next patch, invoke an isolated Gradle build with explicit version properties,
+// then give the signed universal APK its versioned filename. Ordinary assemble tasks never touch release-version.txt.
+tasks.register('releaseHomemusicRelease') {
+    group = 'release'
+    description = 'Builds the next versioned, signed HomeMusic release APK and advances release-version.txt.'
+    doLast {
+        def versionFile = rootProject.file('release-version.txt')
+        if (!versionFile.exists()) throw new GradleException("Missing release counter: ${versionFile}")
+        def channel = java.nio.channels.FileChannel.open(versionFile.toPath(),
+                java.nio.file.StandardOpenOption.READ, java.nio.file.StandardOpenOption.WRITE)
+        def lock = channel.lock()
+        String version
+        int nextPatch
+        try {
+            channel.position(0)
+            def buffer = java.nio.ByteBuffer.allocate((int) channel.size())
+            while (buffer.hasRemaining() && channel.read(buffer) != -1) { }
+            buffer.flip()
+            def currentText = java.nio.charset.StandardCharsets.UTF_8.decode(buffer).toString().trim()
+            if (!(currentText ==~ /\d+/)) throw new GradleException("Invalid patch counter in ${versionFile}: '${currentText}'")
+            int patch = Integer.parseInt(currentText)
+            if (patch < 0 || patch >= 1000) throw new GradleException('Patch counter must be between 0 and 999.')
+            version = "1.0.${patch}"
+            nextPatch = patch + 1
+            def updated = java.nio.ByteBuffer.wrap("${nextPatch}\n".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            channel.truncate(0)
+            channel.position(0)
+            while (updated.hasRemaining()) channel.write(updated)
+            channel.force(true)
+        } finally {
+            lock.release()
+            channel.close()
+        }
+
+        int patch = Integer.parseInt(version.substring(version.lastIndexOf('.') + 1))
+        int versionCode = 1 * 100000 + 0 * 1000 + patch * 10
+        def windows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+        def command = windows ? ['cmd.exe', '/c', 'gradlew.bat'] : ['./gradlew']
+        command.addAll([':app:assembleHomemusicRelease', "-PreleaseVersion=${version}", "-PreleaseVersionCode=${versionCode}"])
+        def processBuilder = new ProcessBuilder().directory(rootProject.projectDir).redirectErrorStream(true)
+        command.each { processBuilder.command().add(it.toString()) }
+        def process = processBuilder.start()
+        process.inputStream.withReader('UTF-8') { reader -> reader.eachLine { println(it) } }
+        int exitCode = process.waitFor()
+        if (exitCode != 0) throw new GradleException("Nested HomeMusic release build failed with exit code ${exitCode}; reserved version ${version} remains consumed.")
+
+        def apkDir = project.file('build/outputs/apk/homemusic/release')
+        def candidates = apkDir.listFiles()?.findAll { it.name.startsWith('app-homemusic') && it.name.endsWith('-release.apk') } ?: []
+        def source = candidates.find { it.name == 'app-homemusic-universal-release.apk' } ?: candidates.find { it.name == 'app-homemusic-release.apk' }
+        if (source == null) throw new GradleException("Could not find the HomeMusic release APK in ${apkDir}; found: ${candidates*.name}")
+        def target = new File(apkDir, "app-homemusic-release-${version}.apk")
+        if (target.exists() && !target.delete()) throw new GradleException("Could not replace ${target}")
+        if (!source.renameTo(target)) throw new GradleException("Could not rename ${source} to ${target}")
+        logger.lifecycle("Versioned HomeMusic APK: ${target}")
+    }
 }
 
 // Passes Room's -Aroom.schemaLocation so that the build cache key depends on the schema files and their relative paths,
