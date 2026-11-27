@@ -81,8 +81,9 @@ import { waveFiltersSupported } from '../lib/capabilities';
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, readonly responseBody?: string, cause?: unknown) {
     super(message);
+    if (cause instanceof Error && cause.stack) this.stack = cause.stack;
     this.status = status;
     this.name = 'ApiError';
   }
@@ -100,7 +101,15 @@ function detailToMessage(detail: unknown, status: number): string {
   if (Array.isArray(detail)) {
     // FastAPI validation errors: [{loc, msg, type}]
     const msgs = detail
-      .map((d) => (d && typeof d === 'object' && 'msg' in d ? String((d as { msg: unknown }).msg) : ''))
+      .map((d) => {
+        if (!d || typeof d !== 'object') return '';
+        const { loc, msg } = d as { loc?: unknown; msg?: unknown };
+        const field = status === 422 && Array.isArray(loc)
+          ? loc.filter((part, i) => (typeof part === 'string' || typeof part === 'number') && !(i === 0 && part === 'body')).join('.')
+          : '';
+        const text = typeof msg === 'string' && msg ? msg : '';
+        return field ? `${field}: ${text || 'недопустимое значение'}` : text;
+      })
       .filter(Boolean);
     if (msgs.length) return `Неверные данные: ${msgs.join('; ')}`;
   }
@@ -108,19 +117,22 @@ function detailToMessage(detail: unknown, status: number): string {
   if (status === 403) return 'Нет доступа';
   if (status === 404) return 'Не найдено';
   if (status === 413) return 'Файл слишком большой';
+  if (status === 422) return 'Не удалось проверить данные запроса';
   if (status === 429) return 'Слишком много запросов, попробуйте позже';
   if (status >= 500) return 'Ошибка сервера';
   return `Ошибка ${status}`;
 }
 
 async function errorFromResponse(res: Response): Promise<ApiError> {
+  const body = await res.text();
   let detail: unknown;
   try {
-    detail = ((await res.json()) as { detail?: unknown }).detail;
+    const data = JSON.parse(body) as { detail?: unknown } | null;
+    detail = data?.detail ?? (res.status === 422 && Array.isArray(data) ? data : undefined);
   } catch {
     /* not JSON */
   }
-  return new ApiError(res.status, detailToMessage(detail, res.status));
+  return new ApiError(res.status, detailToMessage(detail, res.status), body);
 }
 
 type Query = Record<string, string | number | boolean | null | undefined>;
@@ -155,14 +167,25 @@ export async function request<T>(method: string, path: string, opts: RequestOpts
     res = await fetch(path, { method, headers, body, credentials: 'include', signal: opts.signal });
   } catch (e) {
     if ((e as Error).name === 'AbortError') throw e;
-    throw new ApiError(0, 'Нет связи с сервером');
+    throw new ApiError(0, 'Нет связи с сервером', undefined, e);
   }
   if (res.status === 401) onUnauthorized(path);
   if (!res.ok) throw await errorFromResponse(res);
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get('content-type') ?? '';
-  if (!ct.includes('json')) return undefined as T;
-  return (await res.json()) as T;
+  const wave = path === '/api/wave/start' || (path.startsWith('/api/wave/') && path.endsWith('/next'));
+  if (!wave) return ct.includes('json') ? (await res.json()) as T : undefined as T;
+  const responseBody = await res.text();
+  try {
+    if (!ct.includes('json')) throw new TypeError('Expected JSON');
+    const data = JSON.parse(responseBody) as WaveOut | null;
+    if (!data || typeof data.session_id !== 'string' || !Array.isArray(data.tracks)) {
+      throw new TypeError('Invalid wave response');
+    }
+    return data as unknown as T;
+  } catch (e) {
+    throw new ApiError(res.status, 'Сервер вернул некорректный ответ волны', responseBody, e);
+  }
 }
 
 // Short-lived cache for GET pages (back navigation feels instant).
@@ -230,7 +253,7 @@ export function errorMessage(e: unknown): string {
   return 'Неизвестная ошибка';
 }
 
-export const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
+export const isAbort = (e: unknown) => (e instanceof DOMException || e instanceof Error) && e.name === 'AbortError';
 
 const enc = encodeURIComponent;
 
@@ -433,7 +456,7 @@ export const libraryCoverUrl = (albumId: number, size = 300, rev?: string | null
   withQuery(`/api/library/albums/${albumId}/cover`, { size, v: rev });
 
 /** Audio of a catalog track; retry busts the cache, mobile selects the lower bitrate. */
-export const listenStreamUrl = (ref: string, retry = 0, mobile = false) =>
-  withQuery('/api/listen/stream', { ref, retry: retry || undefined, q: mobile ? 'mobile' : undefined });
+export const listenStreamUrl = (ref: string, retry = 0, mobile = false, full = false) =>
+  withQuery('/api/listen/stream', { ref, retry: retry || undefined, q: mobile ? 'mobile' : undefined, full: full ? 1 : undefined });
 
 export const uploadCoverUrl = (uploadId: number) => `/api/uploads/${uploadId}/cover`;

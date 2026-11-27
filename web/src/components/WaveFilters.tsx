@@ -94,7 +94,7 @@ export function WaveFilters({ panel, origin }: { panel: Panel; origin: WaveOrigi
   const { filters, filterRelaxed } = panel;
   const change = (next: Filters) => setWaveFilters(next, origin);
   const reset = () => change(EMPTY_WAVE_FILTERS);
-  const exhausted = filterRelaxed.length === 1 && filterRelaxed[0] === 'exhausted';
+  const exhausted = filterRelaxed.includes('exhausted');
   const axes = filterRelaxed.map((axis) => RELAXED_LABELS[axis]).filter(Boolean).join(', ');
 
   return (

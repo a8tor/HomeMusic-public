@@ -1,11 +1,11 @@
 import { useSyncExternalStore } from 'react';
-import { ApiError, api, errorMessage } from '../api/client';
+import { ApiError, api, isAbort } from '../api/client';
 import type { PlayEventIn, WaveFilters, WaveGenre, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
 import { EMBEDDED } from './embedded';
 import { applyUpcomingDelta, continueCurrentInList, endWavePrefetch, getListenState, getQueueRevision, listenAll, replaceUpcoming, subscribeListen, type ListenTrack } from './listen';
 import { canPlayAll, canPlayWave, playWave } from './player';
 import { onPlayEvent } from './plays';
-import { toastError } from './ui';
+import { toast, toastError } from './ui';
 
 /** «Моя волна» (MIXES.md 7): an endless stream the Hub picks for the user, 5 tracks at a time
  * (`POST /api/wave/start`, then `POST /api/wave/{id}/next`).
@@ -113,12 +113,13 @@ export function setWaveFilters(filters: WaveFilters, origin: WaveOrigin) {
   if (sessionAccount !== null) {
     try { localStorage.setItem(FILTERS_KEY + sessionAccount, JSON.stringify(next)); } catch { /* Keep the selection in memory. */ }
   }
+  const restarting = starting === '' || filterRestart !== undefined;
   cancelFilterRestart();
-  if (!canPlayWave() && (starting === '' || (starting === null && ownWaveRunning()))) {
+  if (!canPlayWave() && (restarting || (starting === null && ownWaveRunning()))) {
+    if (restarting) cancelStart();
     filterRestart = setTimeout(() => {
       filterRestart = undefined;
-      if (starting === '') cancelStart();
-      else if (starting !== null || !ownWaveRunning() || (session && sameFilters(session.requestedFilters, next))) return;
+      if (starting !== null || (!restarting && (!ownWaveRunning() || (session && sameFilters(session.requestedFilters, next))))) return;
       void startWave(null, origin, next);
     }, FILTER_RESTART_MS);
   }
@@ -219,6 +220,30 @@ function remember(s: Session, tracks: readonly WaveTrackOut[]) {
   }
 }
 
+function waitForRetry(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, RETRY_MS);
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function logWaveError(operation: 'start' | 'next', error: unknown) {
+  console.error(`Моя волна: ${operation}`, {
+    status: error instanceof ApiError ? error.status : undefined,
+    body: error instanceof ApiError ? error.responseBody : undefined,
+    stack: error instanceof Error ? error.stack : undefined,
+    error,
+  });
+}
+
 /** Starts the user's own wave, or one from a track or an artist («Волна по треку»). `origin` — where it was started
  * (INSIGHTS.md 6.3: analytics only, the Hub keeps it with the session). */
 export async function startWave(seed: WaveSeedIn | null | undefined, origin: WaveOrigin, filters?: WaveFilters): Promise<boolean> {
@@ -231,18 +256,24 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
   starting = seedKey(seed);
   emit();
   try {
-    const w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' }, ctl.signal, selected);
-    if (ctl.signal.aborted) return false;
-    // The native bridge still uses the full window. A web start sends no `queued`, so `add` is the whole window.
+    let w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' }, ctl.signal, selected);
     const native = canPlayWave();
-    const picks = !native && hasDelta(w) ? w.add : w.tracks;
     const requestedFilters = selected ?? EMPTY_WAVE_FILTERS;
+    // No queue has started yet: poll the same session without queued refs.
+    const picksOf = (batch: WaveOut) => !native && hasDelta(batch) ? batch.add : batch.tracks;
+    while (!ctl.signal.aborted && !picksOf(w).length && w.pending && !w.filter_relaxed?.includes('exhausted')) {
+      await waitForRetry(ctl.signal);
+      w = await api.waveNext(w.session_id, { played: [], queued: [] }, ctl.signal);
+    }
+    if (ctl.signal.aborted) return false;
+    const picks = picksOf(w);
     const relaxed = w.filter_relaxed ?? [];
     if (!picks.length) {
-      if (own && sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
-      if (!own || relaxed.length !== 1 || relaxed[0] !== 'exhausted') {
-        toastError('Волна пока пустая: попробуйте чуть позже');
-      }
+      const panelOwnsMessage = own && sameFilters(requestedFilters, ownFilters);
+      if (panelOwnsMessage) filterRelaxed = relaxed;
+      if (relaxed.includes('exhausted')) {
+        if (!panelOwnsMessage) toast('По этим фильтрам треки закончились');
+      } else toast('Волна пока пустая');
       return false;
     }
     if (native) {
@@ -267,7 +298,10 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
     if (own && sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
     return true;
   } catch (e) {
-    if (!ctl.signal.aborted) toastError(errorMessage(e));
+    if (!ctl.signal.aborted && !isAbort(e)) {
+      logWaveError('start', e);
+      toastError(e);
+    }
     return false;
   } finally {
     if (startRequest === ctl) {
@@ -311,19 +345,30 @@ async function ask() {
       remember(s, w.tracks);
       if (w.tracks.length || !w.pending) replaceUpcoming(w.tracks.map(listenTrack));
     }
-    if (session === s && s.own && sameFilters(s.requestedFilters, ownFilters)) {
-      filterRelaxed = w.filter_relaxed ?? [];
+    if (session !== s) return;
+    const relaxed = w.filter_relaxed ?? [];
+    const exhausted = relaxed.includes('exhausted');
+    const panelOwnsMessage = s.own && sameFilters(s.requestedFilters, ownFilters);
+    if (panelOwnsMessage) {
+      filterRelaxed = relaxed;
       emit();
     }
     const current = getListenState();
-    if (session === s && w.pending && current.queue.length - current.index - 1 < (w.target_len ?? 5)) {
+    if (!exhausted && w.pending && current.queue.length - current.index - 1 < (w.target_len ?? 5)) {
       s.retry = setTimeout(() => { if (session === s) void ask(); }, RETRY_MS);
+    } else if (!w.tracks.length) {
+      if (exhausted) {
+        if (!panelOwnsMessage) toast('По этим фильтрам треки закончились');
+      } else if (!w.pending) toast('Волна пока пустая');
     }
   } catch (e) {
     if (session !== s || ctl.signal.aborted) return;
     if (e instanceof ApiError && e.status === 404) {
       end(); // the session is over (a day without it): the queue plays out
-    } else s.pending.unshift(...played); // offline: with the next call
+    } else {
+      if (!isAbort(e)) logWaveError('next', e);
+      s.pending.unshift(...played); // retry with the next call
+    }
   } finally {
     if (s.ctl === ctl) {
       s.ctl = undefined;
@@ -363,9 +408,13 @@ function end(keepFilterRestart = false) {
 export function mountWave(): () => void {
   window.addEventListener('pagehide', persistWave);
   const unsubscribeEvents = onPlayEvent(handlePlayEvent);
+  let previousPhase = getListenState().phase;
   const unsubscribeListen = subscribeListen(() => {
     const st = getListenState();
+    const justEnded = previousPhase !== 'ended' && st.phase === 'ended';
+    previousPhase = st.phase;
     if (session && (!st.track || st.context !== session.context)) end();
+    else if (session && justEnded) void ask();
   });
   return () => {
     window.removeEventListener('pagehide', persistWave);

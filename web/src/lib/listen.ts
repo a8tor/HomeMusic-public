@@ -369,7 +369,7 @@ function el(): HTMLAudioElement {
     if (code === 2 && streamRetry.ref === track.ref && streamRetry.count < STREAM_RETRIES) {
       streamRetry.count++;
       set({ phase: 'loading', error: null });
-      a.src = listenStreamUrl(track.ref, streamRetry.count, prefetchPolicy().mobile);
+      loadStream(a, track.ref, streamRetry.count, resolving);
       play(a);
       return;
     }
@@ -406,7 +406,7 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   prefetchPlayedS = 0;
   prefetchPlayback++;
   set({ track, queue, index, context: listContext, phase: autoplay ? 'resolving' : 'paused', info: null, error: null, position, duration: track.duration_s ?? 0 });
-  a.src = listenStreamUrl(track.ref, 0, prefetchPolicy().mobile);
+  loadStream(a, track.ref, 0, ctl);
   if (autoplay) play(a);
   else a.load();
   mediaSession(track);
@@ -414,35 +414,14 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
     (info) => {
       if (resolving !== ctl) return;
       // A wave plays full tracks only: when no source has this one, it goes on instead of stopping at 30 seconds.
-      if (info.kind === 'preview' && onWave()) {
-        const failedContext = state.context;
-        void skipNoFile(track.ref, failedContext).finally(() => {
-          if (resolving !== ctl) return;
-          playEvent('skip', { ref: track.ref }, { context: failedContext });
-          if (hasNext(state)) start(state.queue, state.index + 1, true);
-          else set({ phase: 'ended' });
-        });
-        return;
-      }
+      if (info.kind === 'preview' && onWave()) return skipWaveTrack(ctl, true);
       set({ info, duration: info.kind === 'preview' ? (info.duration_s ?? 30) : state.duration });
       reportStart();
     },
     (e: unknown) => {
       if (isAbort(e) || resolving !== ctl) return;
-      if (e instanceof ApiError && e.status === 503 && onWave()) {
-        const failedContext = state.context;
-        void skipNoFile(track.ref, failedContext).finally(() => {
-          if (resolving !== ctl) return;
-          playEvent('skip', { ref: track.ref }, { context: failedContext });
-          if (hasNext(state)) start(state.queue, state.index + 1, true);
-          else set({ phase: 'ended' });
-        });
-        return;
-      }
-      if (auto && e instanceof ApiError && e.status === 404 && onWave()) {
-        if (hasNext(state)) return void start(state.queue, state.index + 1, true);
-        set({ phase: 'ended' });
-        return;
+      if (e instanceof ApiError && (e.status === 503 || (auto && e.status === 404)) && onWave()) {
+        return skipWaveTrack(ctl, false);
       }
       if (auto && e instanceof ApiError && e.status === 404 && hasNext(state)) return void start(state.queue, state.index + 1, true);
       set({ phase: 'error', error: errorMessage(e) });
@@ -451,8 +430,42 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   );
 }
 
-/** A wave track no source has (the Hub answered with a 30 s preview): tell it so it is not handed out again.
- * Nothing is reported as a listen: a preview is no playback of the track. */
+function loadStream(a: HTMLAudioElement, ref: string, retry: number, ctl: AbortController | null) {
+  const wave = onWave();
+  const url = listenStreamUrl(ref, retry, prefetchPolicy().mobile, wave);
+  a.src = url;
+  // The media element cannot expose HTTP headers. Read them with a bounded range request, not a full download.
+  if (!wave || !ctl) return;
+  void fetch(url, { headers: { Range: 'bytes=0-0', 'X-HomeMusic-Prefetch': '1' }, signal: ctl.signal }).then((res) => {
+    if (res.headers.get('X-HomeMusic-Listen-Kind') === 'preview' && streamRetry.count === retry) {
+      skipWaveTrack(ctl, true);
+    }
+    return res.body?.cancel();
+  }).catch(() => { /* full=1 and the metadata check still protect playback. */ });
+}
+
+function skipWaveTrack(ctl: AbortController, preview: boolean) {
+  const { track, context } = state;
+  if (resolving !== ctl || ctl.signal.aborted || !track || !onWave()) return;
+  ctl.abort();
+  reportEnd(false, true);
+  pendingSeek = 0;
+  if (audio) {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  }
+  const advance = () => {
+    if (resolving !== ctl || state.context !== context) return;
+    if (preview) playEvent('skip', { ref: track.ref }, { context });
+    if (hasNext(state)) start(state.queue, state.index + 1, true);
+    else set({ phase: 'ended' });
+  };
+  if (preview) void skipNoFile(track.ref, context).then(advance);
+  else advance();
+}
+
+/** Tell the Hub that a confirmed preview should not be handed out again. */
 function skipNoFile(ref: string, context: string): Promise<void> {
   const sid = context.startsWith('wave:') ? context.slice(5) : null;
   if (!sid) return Promise.resolve();
@@ -492,8 +505,13 @@ function refreshInfo() {
   const ref = state.track?.ref;
   if (!ref || refreshed === ref || state.info?.kind !== 'full') return;
   refreshed = ref;
-  resolveListen(ref).then(
-    (info) => state.track?.ref === ref && set({ info }),
+  const ctl = resolving;
+  resolveListen(ref, ctl?.signal).then(
+    (info) => {
+      if (resolving !== ctl || ctl?.signal.aborted || state.track?.ref !== ref) return;
+      if (info.kind === 'preview' && ctl && onWave()) return skipWaveTrack(ctl, true);
+      set({ info });
+    },
     () => {},
   );
 }
@@ -525,7 +543,7 @@ let endedPrefetchContext: string | null = null;
 let prefetchPlayback = 0;
 let prefetchPlayedS = 0;
 let prefetchSample: { position: number; at: number } | null = null;
-let prefetchWindow: { refs: string[]; playback: number; mobile: boolean; bytes: boolean; ctl: AbortController } | null = null;
+let prefetchWindow: { refs: string[]; playback: number; mobile: boolean; full: boolean; bytes: boolean; ctl: AbortController } | null = null;
 const sourcePicks = new Map<string, AbortController>();
 let pickedRef: string | null = null;
 const warmed = new Set<string>();
@@ -592,11 +610,12 @@ function syncPrefetch() {
   const refs = [...new Set(state.queue.slice(state.index + 1, state.index + 1 + policy.ahead).map((t) => t.ref))];
   const nextRef = refs[0];
   const old = prefetchWindow;
-  if (!old || old.playback !== prefetchPlayback || old.mobile !== policy.mobile || old.bytes !== policy.bytes
+  const full = onWave();
+  if (!old || old.playback !== prefetchPlayback || old.mobile !== policy.mobile || old.full !== full || old.bytes !== policy.bytes
     || old.refs.length !== refs.length || refs.some((ref, i) => old.refs[i] !== ref)) {
     const ctl = new AbortController();
     const job = byteRequest;
-    if (old && job && !job.ctl.signal.aborted && policy.bytes && old.mobile === policy.mobile && (
+    if (old && job && !job.ctl.signal.aborted && policy.bytes && old.mobile === policy.mobile && old.full === full && (
       job.ref === current || (old.playback === prefetchPlayback ? refs.includes(job.ref) : job.ref === nextRef)
     )) {
       // Transfer an in-flight request that is still useful to the new window.
@@ -604,9 +623,9 @@ function syncPrefetch() {
       ctl.signal.addEventListener('abort', job.abort, { once: true });
     }
     old?.ctl.abort();
-    if (old?.mobile !== policy.mobile) warmed.clear();
+    if (old?.mobile !== policy.mobile || old?.full !== full) warmed.clear();
     for (const ref of warmed) if (!refs.includes(ref)) warmed.delete(ref);
-    prefetchWindow = { refs, playback: prefetchPlayback, mobile: policy.mobile, bytes: policy.bytes, ctl };
+    prefetchWindow = { refs, playback: prefetchPlayback, mobile: policy.mobile, full, bytes: policy.bytes, ctl };
   }
 
   for (const [ref, ctl] of sourcePicks) {
@@ -639,11 +658,11 @@ async function prefetchBytes(ref: string, window: NonNullable<typeof prefetchWin
   byteRequest = job;
   window.ctl.signal.addEventListener('abort', job.abort, { once: true });
   try {
-    const res = await fetch(listenStreamUrl(ref, 0, window.mobile), {
+    const res = await fetch(listenStreamUrl(ref, 0, window.mobile, window.full), {
       headers: { Range: 'bytes=0-262143', 'X-HomeMusic-Prefetch': '1' }, signal: ctl.signal,
     });
     // A server that ignores Range must not turn this into a whole-track download.
-    if (res.status === 206) await res.arrayBuffer();
+    if (res.status === 206 && !(window.full && res.headers.get('X-HomeMusic-Listen-Kind') === 'preview')) await res.arrayBuffer();
     else await res.body?.cancel();
   } catch { /* Background work must not surface playback errors. */ }
   finally {
@@ -723,7 +742,8 @@ export function touchTrack(ref: string) {
 /** Tap on a catalog track: starts it (with `queue`, the list it belongs to, playing on after it), or
  * pauses/resumes it if it is the current one. `origin` — where the list was launched (by default by `context`). */
 export function listen(track: ListenTrack, queue?: readonly ListenTrack[], context?: string, origin?: LaunchOrigin) {
-  if (state.track?.ref === track.ref && state.phase !== 'error') return toggle();
+  if (state.track?.ref === track.ref && state.phase !== 'error'
+    && (!context?.startsWith('wave:') || context === state.context)) return toggle();
   startList(track, queue, context, origin);
 }
 
@@ -763,6 +783,8 @@ function sameSong(a: ListenTrack, b: ListenTrack): boolean {
 export function continueCurrentInList(list: readonly ListenTrack[], context: string, beforeStart: () => void): boolean {
   const current = state.track;
   if (!current || state.phase === 'error') return false;
+  if (context.startsWith('wave:') && (!audio?.getAttribute('src')
+    || (state.info?.kind !== 'full' && state.info?.kind !== 'library'))) return false;
   const identity = { ...current, nd_song_id: current.nd_song_id ?? state.info?.nd_song_id ?? null };
   const at = list.findIndex((t) => sameSong(identity, t));
   if (at < 0) return false;
