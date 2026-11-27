@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { ApiError, api, errorMessage } from '../api/client';
-import type { PlayEventIn, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
+import type { PlayEventIn, WaveFilters, WaveGenre, WaveOrigin, WaveOut, WaveSeedIn, WaveTrackOut } from '../api/types';
 import { EMBEDDED } from './embedded';
 import { applyUpcomingDelta, continueCurrentInList, endWavePrefetch, getListenState, getQueueRevision, listenAll, replaceUpcoming, subscribeListen, type ListenTrack } from './listen';
 import { canPlayAll, canPlayWave, playWave } from './player';
@@ -27,9 +27,14 @@ export function canWave(): boolean {
 }
 
 const RETRY_MS = 4000;
+const FILTER_RESTART_MS = 600;
+export const WAVE_GENRES: readonly WaveGenre[] = ['rock', 'metal', 'electronic', 'hiphop', 'pop', 'indie', 'jazz', 'classical'];
+export const EMPTY_WAVE_FILTERS: WaveFilters = { genres: [], lang: null, familiarity: null, energy: null };
 
 interface Session {
   id: string;
+  own: boolean;
+  requestedFilters: WaveFilters;
   title: string;
   context: string;
   refs: Set<string>;
@@ -45,15 +50,79 @@ interface Session {
 let session: Session | null = null;
 let sessionAccount: number | null = null;
 const SESSION_KEY = 'hm-wave-session:';
+const FILTERS_KEY = 'hm-wave-filters:';
 let starting: string | null = null; // the seed being started ('' — the user's own wave)
 let startRequest: AbortController | null = null;
+let filterRestart: ReturnType<typeof setTimeout> | undefined;
+let ownFilters = EMPTY_WAVE_FILTERS;
+let filterRelaxed: string[] = [];
 const subscribers = new Set<() => void>();
-let snapshot: { title: string | null; starting: string | null } = { title: null, starting: null };
+
+function normalizeFilters(value: unknown): WaveFilters {
+  if (!value || typeof value !== 'object') return EMPTY_WAVE_FILTERS;
+  const { genres, lang, familiarity, energy } = value as Partial<Record<keyof WaveFilters, unknown>>;
+  return {
+    genres: Array.isArray(genres) ? WAVE_GENRES.filter((genre) => genres.includes(genre)) : [],
+    lang: lang === 'ru' || lang === 'foreign' ? lang : null,
+    familiarity: familiarity === 'known' || familiarity === 'new' ? familiarity : null,
+    energy: energy === 'high' || energy === 'low' ? energy : null,
+  };
+}
+
+function sameFilters(a: WaveFilters, b: WaveFilters): boolean {
+  return a.lang === b.lang && a.familiarity === b.familiarity && a.energy === b.energy
+    && a.genres.length === b.genres.length && a.genres.every((genre) => b.genres.includes(genre));
+}
+
+function waveSnapshot() {
+  return {
+    title: session?.title ?? null, starting, filters: ownFilters, filterRelaxed,
+    filtersChanged: !!session?.own && !sameFilters(session.requestedFilters, ownFilters),
+  };
+}
+let snapshot = waveSnapshot();
 
 function emit() {
   persistWave();
-  snapshot = { title: session?.title ?? null, starting };
+  snapshot = waveSnapshot();
   for (const fn of subscribers) fn();
+}
+
+function cancelFilterRestart() {
+  clearTimeout(filterRestart);
+  filterRestart = undefined;
+}
+
+function cancelStart() {
+  startRequest?.abort();
+  startRequest = null;
+  starting = null;
+}
+
+function ownWaveRunning(): boolean {
+  const { context, phase } = getListenState();
+  return !!session?.own && context === session.context
+    && (phase === 'playing' || phase === 'loading' || phase === 'resolving');
+}
+
+export function setWaveFilters(filters: WaveFilters, origin: WaveOrigin) {
+  const next = normalizeFilters(filters);
+  if (sameFilters(next, ownFilters)) return;
+  ownFilters = next;
+  filterRelaxed = [];
+  if (sessionAccount !== null) {
+    try { localStorage.setItem(FILTERS_KEY + sessionAccount, JSON.stringify(next)); } catch { /* Keep the selection in memory. */ }
+  }
+  cancelFilterRestart();
+  if (!canPlayWave() && (starting === '' || (starting === null && ownWaveRunning()))) {
+    filterRestart = setTimeout(() => {
+      filterRestart = undefined;
+      if (starting === '') cancelStart();
+      else if (starting !== null || !ownWaveRunning() || (session && sameFilters(session.requestedFilters, next))) return;
+      void startWave(null, origin, next);
+    }, FILTER_RESTART_MS);
+  }
+  emit();
 }
 
 function persistWave() {
@@ -62,6 +131,7 @@ function persistWave() {
     const key = SESSION_KEY + sessionAccount;
     if (!session) localStorage.removeItem(key);
     else localStorage.setItem(key, JSON.stringify({ id: session.id, title: session.title,
+      own: session.own, requestedFilters: session.requestedFilters,
       refs: [...session.refs], songs: [...session.songs], pending: [...session.inFlight, ...session.pending] }));
   } catch { /* The current wave can still play without storage. */ }
 }
@@ -69,15 +139,23 @@ function persistWave() {
 /** Continue the same server session, including events that were still awaiting acknowledgement. */
 export function restoreWave(account: number | null) {
   if (sessionAccount === account) return;
-  if (session) end();
+  cancelStart();
+  end();
   sessionAccount = account;
+  ownFilters = EMPTY_WAVE_FILTERS;
+  if (account !== null) {
+    try { ownFilters = normalizeFilters(JSON.parse(localStorage.getItem(FILTERS_KEY + account) ?? 'null')); } catch { /* Use defaults. */ }
+  }
   const st = getListenState();
   if (account !== null && !canPlayAll() && st.track && st.context.startsWith('wave:')) {
     const id = st.context.slice('wave:'.length);
-    let saved: { id?: string; title?: string; refs?: string[]; songs?: string[]; pending?: PlayEventIn[] } | null = null;
+    let saved: { id?: string; title?: string; own?: boolean; requestedFilters?: unknown;
+      refs?: string[]; songs?: string[]; pending?: PlayEventIn[] } | null = null;
     try { saved = JSON.parse(localStorage.getItem(SESSION_KEY + account) ?? 'null'); } catch { /* rebuild from the queue */ }
     if (saved?.id !== id) saved = null;
-    session = { id, title: typeof saved?.title === 'string' ? saved.title : 'Моя волна', context: st.context,
+    const title = typeof saved?.title === 'string' ? saved.title : 'Моя волна';
+    session = { id, title, own: saved?.own ?? (title === 'Моя волна'), context: st.context,
+      requestedFilters: normalizeFilters(saved?.requestedFilters),
       refs: new Set([...(Array.isArray(saved?.refs) ? saved.refs.filter((r) => typeof r === 'string') : []), ...st.queue.map((t) => t.ref)]),
       songs: new Set(Array.isArray(saved?.songs) ? saved.songs.filter((r) => typeof r === 'string') : []),
       pending: Array.isArray(saved?.pending) ? saved.pending.filter((e) => e && typeof e.event_id === 'string') : [],
@@ -85,8 +163,6 @@ export function restoreWave(account: number | null) {
   }
   emit();
 }
-
-window.addEventListener('pagehide', persistWave);
 
 function subscribe(fn: () => void) {
   subscribers.add(fn);
@@ -145,20 +221,28 @@ function remember(s: Session, tracks: readonly WaveTrackOut[]) {
 
 /** Starts the user's own wave, or one from a track or an artist («Волна по треку»). `origin` — where it was started
  * (INSIGHTS.md 6.3: analytics only, the Hub keeps it with the session). */
-export async function startWave(seed: WaveSeedIn | null | undefined, origin: WaveOrigin): Promise<boolean> {
+export async function startWave(seed: WaveSeedIn | null | undefined, origin: WaveOrigin, filters?: WaveFilters): Promise<boolean> {
   if (startRequest) return false;
+  cancelFilterRestart();
+  const own = !seed;
+  const selected = filters ?? (own && !canPlayWave() ? ownFilters : undefined);
   const ctl = new AbortController();
   startRequest = ctl;
   starting = seedKey(seed);
   emit();
   try {
-    const w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' }, ctl.signal);
+    const w = await api.waveStart({ seed: seed ?? null, origin, client: EMBEDDED ? 'pwa-app' : 'pwa' }, ctl.signal, selected);
     if (ctl.signal.aborted) return false;
     // The native bridge still uses the full window. A web start sends no `queued`, so `add` is the whole window.
     const native = canPlayWave();
     const picks = !native && hasDelta(w) ? w.add : w.tracks;
+    const requestedFilters = selected ?? EMPTY_WAVE_FILTERS;
+    const relaxed = w.filter_relaxed ?? [];
     if (!picks.length) {
-      toastError('Волна пока пустая: попробуйте чуть позже');
+      if (own && sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
+      if (!own || relaxed.length !== 1 || relaxed[0] !== 'exhausted') {
+        toastError('Волна пока пустая: попробуйте чуть позже');
+      }
       return false;
     }
     if (native) {
@@ -166,19 +250,21 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
       playWave(w);
       return true;
     }
-    const s: Session = { id: w.session_id, title: w.title, context: `wave:${w.session_id}`, refs: new Set(), songs: new Set(), pending: [], inFlight: [], again: false };
+    const s: Session = { id: w.session_id, title: w.title, own, requestedFilters, context: `wave:${w.session_id}`,
+      refs: new Set(), songs: new Set(), pending: [], inFlight: [], again: false };
     remember(s, picks);
     const tracks = picks.map(listenTrack);
     // Keep the current playback position when the playing song is the wave seed.
     const continued = continueCurrentInList(tracks, s.context, () => {
-      end();
+      end(true);
       session = s;
     });
     if (!continued) {
-      end();
+      end(true);
       listenAll(tracks, { shuffle: false, context: s.context });
       session = s;
     }
+    if (own && sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
     return true;
   } catch (e) {
     if (!ctl.signal.aborted) toastError(errorMessage(e));
@@ -225,6 +311,10 @@ async function ask() {
       remember(s, w.tracks);
       if (w.tracks.length || !w.pending) replaceUpcoming(w.tracks.map(listenTrack));
     }
+    if (session === s && s.own && sameFilters(s.requestedFilters, ownFilters)) {
+      filterRelaxed = w.filter_relaxed ?? [];
+      emit();
+    }
     const current = getListenState();
     if (session === s && w.pending && current.queue.length - current.index - 1 < (w.target_len ?? 5)) {
       s.retry = setTimeout(() => { if (session === s) void ask(); }, RETRY_MS);
@@ -257,9 +347,11 @@ function cancelWork(s: Session) {
   s.again = false;
 }
 
-function end() {
+function end(keepFilterRestart = false) {
+  if (!keepFilterRestart) cancelFilterRestart();
   const s = session;
   session = null;
+  filterRelaxed = [];
   if (s) {
     cancelWork(s);
     endWavePrefetch(s.context);
@@ -269,17 +361,18 @@ function end() {
 
 /** Own the wave's subscriptions and retry work at the app level, across player views. */
 export function mountWave(): () => void {
+  window.addEventListener('pagehide', persistWave);
   const unsubscribeEvents = onPlayEvent(handlePlayEvent);
   const unsubscribeListen = subscribeListen(() => {
     const st = getListenState();
     if (session && (!st.track || st.context !== session.context)) end();
   });
   return () => {
+    window.removeEventListener('pagehide', persistWave);
     unsubscribeEvents();
     unsubscribeListen();
-    startRequest?.abort();
-    startRequest = null;
-    starting = null;
+    cancelFilterRestart();
+    cancelStart();
     if (session) cancelWork(session);
     emit();
   };

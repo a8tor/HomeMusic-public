@@ -72,10 +72,12 @@ import type {
   SmartNextIn,
   SmartOut,
   SmartStartIn,
+  WaveFilters,
   WaveNextIn,
   WaveOut,
   WaveStartIn,
 } from './types';
+import { waveFiltersSupported } from '../lib/capabilities';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -338,7 +340,12 @@ export const api = {
     request<{ ok: boolean }>('POST', `/api/smart-shuffle/${encodeURIComponent(id)}/hide`, { json: body }),
   smartAdd: (id: string, body: { ref?: string | null; nd_song_id?: string | null }) =>
     request<SmartAddOut>('POST', `/api/smart-shuffle/${encodeURIComponent(id)}/add`, { json: body }),
-  waveStart: (body: WaveStartIn, signal?: AbortSignal) => request<WaveOut>('POST', '/api/wave/start', { json: body, signal }),
+  waveStart: async (body: WaveStartIn, signal?: AbortSignal, filters?: WaveFilters) => {
+    const { filters: bodyFilters, ...input } = body;
+    const selected = filters ?? bodyFilters;
+    const json = selected && await waveFiltersSupported() ? { ...input, filters: selected } : input;
+    return request<WaveOut>('POST', '/api/wave/start', { json, signal });
+  },
   waveNext: (id: string, body: WaveNextIn, signal?: AbortSignal) => request<WaveOut>('POST', `/api/wave/${encodeURIComponent(id)}/next`, { json: body, signal }),
   /** A track of the wave was a 30 s preview only (no source has its file): the Hub stops handing it out. */
   waveNoFile: (id: string, ref: string) =>

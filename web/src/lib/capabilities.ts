@@ -2,6 +2,7 @@ import type { HealthOut, PlayEventIn } from '../api/types';
 
 let supported = false;
 let checkpointsSupported = false;
+let waveFilters = false;
 let checkedAt = 0;
 let checking: Promise<boolean | null> | null = null;
 
@@ -17,17 +18,24 @@ export async function typedFavoritesSupported(): Promise<boolean | null> {
       const caps = ((await r.json()) as HealthOut).capabilities ?? [];
       supported = caps.includes('typed_favorites_v1');
       checkpointsSupported = caps.includes('listening_checkpoints_v1');
+      waveFilters = caps.includes('wave_filters_v1');
       checkedAt = Date.now();
       result = supported;
     } catch {
       supported = false;
       checkpointsSupported = false;
+      waveFilters = false;
     } finally {
       checking = null;
     }
     return result;
   })();
   return checking;
+}
+
+export async function waveFiltersSupported(): Promise<boolean> {
+  await typedFavoritesSupported();
+  return waveFilters;
 }
 
 export function canSendPlayEvent(event: PlayEventIn): boolean {

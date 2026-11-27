@@ -1082,8 +1082,18 @@ export interface WaveSeedIn {
   by_artist?: boolean;
 }
 
+export type WaveGenre = 'rock' | 'metal' | 'electronic' | 'hiphop' | 'pop' | 'indie' | 'jazz' | 'classical';
+
+export interface WaveFilters {
+  genres: WaveGenre[];
+  lang: 'ru' | 'foreign' | null;
+  familiarity: 'known' | 'new' | null;
+  energy: 'high' | 'low' | null;
+}
+
 export interface WaveStartIn {
   seed?: WaveSeedIn | null;
+  filters?: WaveFilters;
   mode?: MixMode | null;
   /** analytics only: where it was started (`home_card`, `catalog_card`, `track_menu`, `artist_menu`, `player`,
    * `artist_page`, `radio`, `search_file`; the app's `restart`), the client (`pwa`, `pwa-app`) */
@@ -1159,6 +1169,8 @@ export interface WaveOut {
   session_id: string;
   title: string;
   mode: MixMode;
+  filters: WaveFilters;
+  filter_relaxed?: string[];
   seed?: { ref?: string; artist_ref?: string; nd_artist_id?: string; artist?: string; title?: string } | null;
   /** Surviving refs from `queued`, in order, followed by new picks in `add`. */
   keep: string[];
