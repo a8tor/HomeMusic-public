@@ -1,12 +1,17 @@
 package com.eddyizm.tempus.homemusic
 
+import android.app.Activity
+import android.app.Application
+import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.widget.Toast
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.lifecycle.Lifecycle
 import androidx.media3.common.util.UnstableApi
+import androidx.preference.PreferenceManager
 import com.eddyizm.tempus.App
 import com.eddyizm.tempus.R
 import com.eddyizm.tempus.lan.LanRemoteSession
@@ -16,7 +21,11 @@ import com.eddyizm.tempus.subsonic.models.Child
 import com.eddyizm.tempus.subsonic.utils.CacheUtil
 import com.eddyizm.tempus.ui.activity.MainActivity
 import com.eddyizm.tempus.util.MappingUtil
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.gson.JsonParser
+import okhttp3.Request
 import java.lang.ref.WeakReference
+import java.util.concurrent.TimeUnit
 
 /**
  * «Моя волна» in the app's player (MIXES.md 7): plays a wave's first tracks and keeps the queue going by itself —
@@ -35,6 +44,47 @@ object HubWave {
     private var retry: Runnable? = null
     private var emptyQueueSessionId: String? = null
 
+    private var startGeneration = 0
+    private var foreground = WeakReference<MainActivity>(null)
+    private var observingActivities = false
+    private var exhaustedDialog: (() -> Unit)? = null
+    private var exhaustedDialogWave: WaveSession? = null
+
+    internal const val FILTERS_KEY = "homemusic_wave_filters"
+    internal val filterPreferences by lazy { PreferenceManager.getDefaultSharedPreferences(App.getContext()) }
+
+    fun savedFilters(): WaveFilters = runCatching {
+        val json = filterPreferences.getString(FILTERS_KEY, null) ?: return WaveFilters()
+        HubClient.gson.fromJson(json, WaveFilters::class.java)?.let { it.copy(genres = it.genres.orEmpty()) }
+    }.getOrNull() ?: WaveFilters()
+
+    fun applyFilters(activity: MainActivity, filters: WaveFilters) {
+        storeFilters(filters)
+        val wave = session ?: return
+        if (!sameFilters(wave.filters, filters) && player(wave)?.isPlaying == true) {
+            startNew(activity, wave.seed, wave.mode, filters, origin = WaveOrigin.RESTART)
+        }
+    }
+
+    private fun storeFilters(filters: WaveFilters) {
+        filterPreferences.edit().apply {
+            if (filters.isEmpty()) remove(FILTERS_KEY) else putString(FILTERS_KEY, HubClient.gson.toJson(filters))
+        }.apply()
+    }
+
+    // HubClient's cached capabilities() is private; keep the scoped probe bounded like its /healthz probe.
+    private val filterProbe by lazy { HubClient.http.newBuilder().callTimeout(2500, TimeUnit.MILLISECONDS).build() }
+
+    private fun filterCapabilities(filters: WaveFilters): Set<String> {
+        if (filters.isEmpty()) return emptySet()
+        return runCatching {
+            filterProbe.newCall(Request.Builder().url("${HubClient.baseUrl()}/healthz").build()).execute().use { response ->
+                if (!response.isSuccessful) emptySet() else JsonParser.parseString(response.body?.string().orEmpty())
+                    .asJsonObject.getAsJsonArray("capabilities")?.map { it.asString }?.toSet().orEmpty()
+            }
+        }.getOrDefault(emptySet())
+    }
+
     /** The playback service: the wave edits its player. */
     @JvmStatic
     fun attach(service: MediaManager.QueueTarget) {
@@ -45,6 +95,16 @@ object HubWave {
 
     /** `HomeMusicAndroid.playWave`: the page started a wave (`POST /api/wave/start`) and hands over its answer. */
     fun play(activity: MainActivity, out: WaveOut) {
+        ++startGeneration
+        observeActivity(activity)
+        playStarted(activity, out, out.filters ?: WaveFilters())
+    }
+
+    private fun playStarted(activity: MainActivity, out: WaveOut, filters: WaveFilters) {
+        if (out.filterRelaxed.orEmpty().contains("exhausted")) {
+            reportExhausted() { host -> startNew(host, out.seed, out.mode, WaveFilters(), origin = WaveOrigin.RESTART) }
+            return
+        }
         val id = out.sessionId?.takeIf { it.isNotBlank() }
         val batch = out.newTracks()
         val refs = batch.map { it.ref.orEmpty() }
@@ -56,9 +116,12 @@ object HubWave {
             return
         }
         cancelRetry()
-        val wave = WaveSession(id, out.title, out.seed, out.mode)
+        clearExhaustedDialog()
+        emptyQueueSessionId = null
+        val wave = WaveSession(id, out.title, out.seed, out.mode, filters)
         wave.register(tracks)
         session = wave
+        reportRelaxations(wave, out)
         // the start of its first track asks for what follows
         HubPlayer.playQueue(activity, tracks.map { it.item(wave.context) }, 0)
     }
@@ -69,26 +132,41 @@ object HubWave {
      * failed: [fallback] when given, else a toast. [origin] — where it was started from ([WaveOrigin]).
      */
     fun start(activity: MainActivity, seed: Map<String, String>?, fallback: Runnable? = null, origin: String? = null) {
+        observeActivity(activity)
+        val filters = savedFilters()
         val wave = session
-        val livePlayer = target.get()?.livePlayer()
-        if (wave != null && livePlayer != null && isSameSeed(wave.seed, seed) && wave.isWave(livePlayer.currentMediaItem?.mediaId)) {
+        val livePlayer = wave?.let(::player)
+        if (wave != null && livePlayer != null && !wave.exhausted &&
+            isSameSeed(wave.seed, seed, wave.filters, filters) && wave.isWave(livePlayer.currentMediaItem?.mediaId)) {
+            ++startGeneration
             if (!livePlayer.isPlaying) {
                 livePlayer.play()
             }
             activity.expandBottomSheet()
             return
         }
+        startNew(activity, seed, null, filters, fallback, origin)
+    }
 
+    private fun startNew(
+        activity: MainActivity, seed: Map<String, Any?>?, mode: String?, filters: WaveFilters,
+        fallback: Runnable? = null, origin: String? = null,
+    ) {
+        observeActivity(activity)
+        clearExhaustedDialog()
+        val generation = ++startGeneration
         Toast.makeText(activity, R.string.homemusic_wave_starting, Toast.LENGTH_SHORT).show()
         HomeMusic.io.execute {
             val result = runCatching {
                 // origin and client only for a Hub that knows them (wave_origin_v1)
                 val known = HubClient.supportsWaveOrigin()
-                HubClient.waveStart(WaveSession.startBody(seed, null, origin.takeIf { known }, null, HubPlays.client.takeIf { known }))
+                val body = WaveSession.startBody(seed, mode, origin.takeIf { known }, client = HubPlays.client.takeIf { known },
+                    filters = filters, capabilities = filterCapabilities(filters))
+                HubClient.waveStart(body)
             }
             HomeMusic.main.post {
-                if (activity.isFinishing || activity.isDestroyed) return@post
-                result.onSuccess { play(activity, it) }.onFailure { e ->
+                if (generation != startGeneration || activity.isFinishing || activity.isDestroyed) return@post
+                result.onSuccess { playStarted(activity, it, filters) }.onFailure { e ->
                     Log.w(TAG, "start", e)
                     if (fallback != null) return@onFailure fallback.run()
                     val text = (e as? HubException)?.message ?: activity.getString(R.string.homemusic_wave_failed)
@@ -239,6 +317,7 @@ object HubWave {
     }
 
     private fun end() {
+        if (exhaustedDialogWave != null) clearExhaustedDialog()
         session = null
         emptyQueueSessionId = null
         cancelRetry()
@@ -266,6 +345,7 @@ object HubWave {
 
     private fun ask() {
         val wave = session ?: return
+        if (wave.exhausted) return
         if (wave.inFlight) {
             wave.again = true
             return
@@ -311,6 +391,7 @@ object HubWave {
             wave.failures = 0
             apply(wave, out, prepared)
             wave.settledFor = wave.askedFor
+            if (reportRelaxations(wave, out)) return
             if (wave.again) {
                 ask()
                 return
@@ -374,7 +455,7 @@ object HubWave {
         }
     }
 
-    /** The Hub forgot the session (24 h, a long offline): a new one with the same seed carries the queue on. */
+    /** The Hub forgot the session (24 h, a long offline): reuse the original seed and requested filters. */
     private fun renew(wave: WaveSession) {
         val oldId = wave.id
         wave.inFlight = true
@@ -382,7 +463,7 @@ object HubWave {
             val result = runCatching {
                 val known = HubClient.supportsWaveOrigin()
                 val body = WaveSession.startBody(wave.seed, wave.mode, WaveOrigin.RESTART.takeIf { known }, oldId.takeIf { known },
-                    HubPlays.client.takeIf { known })
+                    HubPlays.client.takeIf { known }, wave.filters, filterCapabilities(wave.filters))
                 val out = HubClient.waveStart(body)
                 // a track's wave starts with that track again: it has played already
                 val tracks = out.newTracks().filter { it.generator != WaveTrack.SEED }
@@ -399,6 +480,7 @@ object HubWave {
                     HubPlays.addContexts(wave.ids().associateWith { wave.context }, launchesOf(wave))
                     wave.settledFor = player(wave)?.currentMediaItem?.mediaId
                     apply(wave, out, prepared)
+                    if (reportRelaxations(wave, out)) return@post
                     if (wave.again) ask() else kickPreload(wave)
                 }.onFailure { e ->
                     Log.w(TAG, "renew: ${e.message}")
@@ -430,7 +512,86 @@ object HubWave {
         retry = null
     }
 
-    fun isSameSeed(s1: Map<String, Any?>?, s2: Map<String, String>?): Boolean {
+    private fun observeActivity(activity: MainActivity) {
+        foreground = WeakReference(activity)
+        if (observingActivities) return
+        observingActivities = true
+        activity.application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) {
+                if (activity is MainActivity) {
+                    foreground = WeakReference(activity)
+                    HomeMusic.main.post { exhaustedDialog?.invoke() }
+                }
+            }
+            override fun onActivityPaused(activity: Activity) {
+                if (foreground.get() === activity) foreground.clear()
+            }
+            override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, state: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
+    }
+
+    /** Return true when the session has run out and should no longer poll. */
+    private fun reportRelaxations(wave: WaveSession, out: WaveOut): Boolean {
+        val axes = out.filterRelaxed.orEmpty().toSet()
+        if ("exhausted" in axes) {
+            wave.exhausted = true
+            reportExhausted(wave) { activity ->
+                startNew(activity, wave.seed, wave.mode, WaveFilters(), origin = WaveOrigin.RESTART)
+            }
+            return true
+        }
+        val relaxed = (axes - wave.reportedFilterRelaxations).map {
+            when (it) {
+                "genres" -> "по жанру"
+                "familiarity" -> "по знакомости"
+                "energy" -> "по энергии"
+                "lang" -> "по языку"
+                else -> "по одному из параметров"
+            }
+        }.distinct()
+        wave.reportedFilterRelaxations = axes
+        if (relaxed.isNotEmpty()) {
+            Toast.makeText(App.getContext(), "Фильтр узковат — ослабили ${relaxed.joinToString(", ")}", Toast.LENGTH_LONG).show()
+        }
+        return false
+    }
+
+    private fun reportExhausted(wave: WaveSession? = null, restart: (MainActivity) -> Unit) {
+        exhaustedDialogWave = wave
+        exhaustedDialog = show@{
+            val activity = foreground.get()?.takeUnless { it.isFinishing || it.isDestroyed } ?: return@show
+            if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@show
+            clearExhaustedDialog()
+            MaterialAlertDialogBuilder(activity)
+                .setMessage("По этим фильтрам треки закончились")
+                .setNegativeButton("Закрыть", null)
+                .setPositiveButton("Сбросить") { _, _ ->
+                    storeFilters(WaveFilters())
+                    if (wave == null || session === wave) restart(activity)
+                }
+                .show()
+        }
+        exhaustedDialog?.invoke()
+    }
+
+    private fun clearExhaustedDialog() {
+        exhaustedDialog = null
+        exhaustedDialogWave = null
+    }
+
+    private fun sameFilters(first: WaveFilters, second: WaveFilters): Boolean =
+        first.genres.orEmpty().toSet() == second.genres.orEmpty().toSet() &&
+            first.lang == second.lang && first.familiarity == second.familiarity && first.energy == second.energy
+
+    fun isSameSeed(
+        s1: Map<String, Any?>?, s2: Map<String, String>?,
+        filters1: WaveFilters = WaveFilters(), filters2: WaveFilters = WaveFilters(),
+    ): Boolean {
+        if (!sameFilters(filters1, filters2)) return false
         val empty1 = s1.isNullOrEmpty() || s1.values.all { it == null || it == "" }
         val empty2 = s2.isNullOrEmpty() || s2.values.all { it.isBlank() }
         if (empty1 && empty2) return true

@@ -75,6 +75,16 @@ open class WaveTrack {
     }
 }
 
+/** User-selected constraints for `POST /api/wave/start`. */
+data class WaveFilters(
+    val genres: List<String> = emptyList(),
+    val lang: String? = null,
+    val familiarity: String? = null,
+    val energy: String? = null,
+) {
+    fun isEmpty(): Boolean = genres.isEmpty() && lang == null && familiarity == null && energy == null
+}
+
 /** `WaveOut` of `POST /api/wave/start` and `/api/wave/{id}/next`. */
 class WaveOut {
     @SerializedName("session_id") var sessionId: String? = null
@@ -85,6 +95,8 @@ class WaveOut {
     var tracks: List<WaveTrack>? = null
     var keep: List<String>? = null
     var add: List<WaveTrack>? = null
+    var filters: WaveFilters? = null
+    @SerializedName("filter_relaxed") var filterRelaxed: List<String>? = null
     @SerializedName("target_len") val targetLen: Int = 5
     var pending: Boolean = false
 
@@ -103,7 +115,14 @@ class WaveNextIn(val played: List<PlayEvent>, val queued: List<String>) {
  * is under way. [onEvent] says when to ask again: on the start of a wave track (the Hub picks after every one), on
  * a ♥ or «Не нравится» of one.
  */
-class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, val mode: String?) {
+class WaveSession(
+    id: String, val title: String?, val seed: Map<String, Any?>?, val mode: String?,
+    // Keep the request, not the possibly relaxed filters returned by `start` or `next`.
+    val filters: WaveFilters = WaveFilters(),
+) {
+    var reportedFilterRelaxations: Set<String> = emptySet()
+    var exhausted = false
+
     var id: String = id
         private set
 
@@ -180,6 +199,7 @@ class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, 
 
     companion object {
         const val CONTEXT_PREFIX = "wave:"
+        const val FILTERS_CAPABILITY = "wave_filters_v1"
         private val ASKING = setOf(PlayEvent.START, PlayEvent.LIKE, PlayEvent.DISLIKE)
         private const val MAX_EVENTS = 500
         private const val MAX_QUEUED = 50
@@ -190,11 +210,12 @@ class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, 
         /**
          * The body of `POST /api/wave/start`: a wave like [seed] (also to start it again, [renew]). [origin],
          * [restartOf] and [client] are for a Hub that has `wave_origin_v1`; null leaves them out (an older Hub, or
-         * a value its pattern would refuse).
+         * a value its pattern would refuse). Empty filters are omitted, like filters on a legacy Hub.
          */
         fun startBody(
             seed: Map<String, Any?>?, mode: String?,
             origin: String? = null, restartOf: String? = null, client: String? = null,
+            filters: WaveFilters? = null, capabilities: Set<String> = emptySet(),
         ): Map<String, Any> {
             val body = HashMap<String, Any>()
             val ref = seed?.get("ref") as? String
@@ -219,6 +240,7 @@ class WaveSession(id: String, val title: String?, val seed: Map<String, Any?>?, 
             Launch.validOrigin(origin)?.let { body["origin"] = it }
             restartOf?.takeIf { it.isNotBlank() }?.let { body["restart_of"] = it.take(32) }
             client?.takeIf { it.isNotBlank() }?.let { body["client"] = it.take(32) }
+            if (FILTERS_CAPABILITY in capabilities && filters != null && !filters.isEmpty()) body["filters"] = filters
             return body
         }
     }

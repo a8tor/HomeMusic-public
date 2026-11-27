@@ -1,5 +1,6 @@
 package com.eddyizm.tempus.homemusic
 
+import android.content.SharedPreferences
 import android.os.Bundle
 import android.util.Log
 import android.view.LayoutInflater
@@ -28,13 +29,50 @@ object HomeMixCards {
     fun create(fragment: Fragment, parent: ViewGroup): View? {
         if (!HubConfig.isEnabled()) return null
         val root = LayoutInflater.from(parent.context).inflate(R.layout.homemusic_home_mixes, parent, false)
-        root.findViewById<View>(R.id.homemusic_wave_card).setOnClickListener {
+        val waveCard = root.findViewById<View>(R.id.homemusic_wave_card)
+        waveCard.setOnClickListener {
             (fragment.activity as? MainActivity)?.let { HubWave.start(it, null, null, WaveOrigin.HOME_CARD) }
         }
+        waveCard.setOnLongClickListener { openWaveFilters(fragment); true }
+        root.findViewById<View>(R.id.homemusic_wave_filter_button).setOnClickListener { openWaveFilters(fragment) }
+        bindWaveSummary(root)
         root.findViewById<View>(R.id.homemusic_mix_card).setOnClickListener { openMix(fragment, root.tag as? HubMixToday) }
         root.findViewById<View>(R.id.homemusic_mix_play).setOnClickListener { playMix(fragment, (root.tag as? HubMixToday)?.mix) }
         show(root, null)
         return root
+    }
+
+    private fun openWaveFilters(fragment: Fragment) {
+        val manager = fragment.childFragmentManager
+        if (!manager.isStateSaved && manager.findFragmentByTag(WaveFilterSheet.TAG) == null) {
+            WaveFilterSheet().showNow(manager, WaveFilterSheet.TAG)
+        }
+    }
+
+    private fun bindWaveSummary(root: View) {
+        val summary = root.findViewById<TextView>(R.id.homemusic_wave_filter_summary)
+        val card = root.findViewById<View>(R.id.homemusic_wave_card)
+        fun render() {
+            val text = WaveFilterSheet.summary(HubWave.savedFilters())
+            summary.text = text
+            summary.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+            val title = root.resources.getString(R.string.homemusic_wave_title)
+            card.contentDescription = if (text.isEmpty()) title else "$title. $text"
+        }
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == HubWave.FILTERS_KEY) render()
+        }
+        render()
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) {
+                HubWave.filterPreferences.registerOnSharedPreferenceChangeListener(listener)
+                render()
+            }
+
+            override fun onViewDetachedFromWindow(view: View) {
+                HubWave.filterPreferences.unregisterOnSharedPreferenceChangeListener(listener)
+            }
+        })
     }
 
     /** Asks the Hub for today's mix (on every return to Главная: it is replaced each morning). */

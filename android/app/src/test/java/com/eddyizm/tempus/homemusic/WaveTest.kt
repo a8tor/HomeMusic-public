@@ -212,12 +212,14 @@ class WaveTest {
 
     @Test
     fun aRenewedSessionTakesOverTheTracksWithItsOwnContext() {
-        val wave = session()
+        val filters = WaveFilters(genres = listOf("rock"), lang = "ru")
+        val wave = WaveSession("w1", "Моя волна", null, "normal", filters)
         wave.register(listOf(track("dz:1")))
         wave.onEvent(event(PlayEvent.START, "hub:dz:1", "wave:w1"))
         wave.failures = 3
         wave.renew("w2")
         assertEquals("wave:w2", wave.context)
+        assertEquals(filters, wave.filters)
         assertTrue(wave.isWave("hub:dz:1"))
         assertTrue(wave.request(emptyList()).played.isEmpty())
         assertEquals(0, wave.failures)
@@ -239,6 +241,36 @@ class WaveTest {
         assertEquals(mapOf("seed" to mapOf("ref" to "dz:7", "by_artist" to true)), WaveSession.startBody(mapOf("ref" to "dz:7", "by_artist" to true), null))
         assertEquals(mapOf("seed" to mapOf("nd_song_id" to "s1", "by_artist" to true)), WaveSession.startBody(mapOf("nd_song_id" to "s1", "by_artist" to "true"), null))
         assertEquals(mapOf("seed" to mapOf("nd_song_id" to "s1", "by_artist" to true)), WaveSession.startBody(mapOf("nd_song_id" to "s1", "by_artist" to true), null))
+    }
+
+    @Test
+    fun startBodyIncludesFiltersOnlyForSupportingHubs() {
+        val filters = WaveFilters(listOf("rock", "electronic"), lang = "foreign")
+        assertFalse(WaveSession.startBody(null, null, filters = filters, capabilities = setOf("wave_origin_v1"))
+            .containsKey("filters"))
+        val body = WaveSession.startBody(null, null, filters = filters, capabilities = setOf("wave_filters_v1"))
+        assertEquals(filters, body["filters"])
+        val json = JsonParser.parseString(Gson().toJson(body)).asJsonObject.getAsJsonObject("filters")
+        assertEquals(listOf("rock", "electronic"), json.getAsJsonArray("genres").map { it.asString })
+        assertEquals("foreign", json.get("lang").asString)
+    }
+
+    @Test
+    fun startBodyOmitsEmptyFiltersEvenOnSupportingHubs() {
+        val body = WaveSession.startBody(null, null, filters = WaveFilters(), capabilities = setOf("wave_filters_v1"))
+        assertFalse(JsonParser.parseString(Gson().toJson(body)).asJsonObject.has("filters"))
+    }
+
+    @Test
+    fun waveFiltersRoundTripAndResponseRelaxationsAreRead() {
+        val gson = Gson()
+        val filters = WaveFilters(listOf("rock", "jazz"), "ru", "known", "low")
+        val json = gson.toJson(filters)
+        assertEquals(filters, gson.fromJson(json, WaveFilters::class.java))
+        assertEquals(WaveFilters(), gson.fromJson("{}", WaveFilters::class.java))
+        val out = gson.fromJson("""{"filters":$json,"filter_relaxed":["genres","familiarity"]}""", WaveOut::class.java)
+        assertEquals(filters, out.filters)
+        assertEquals(listOf("genres", "familiarity"), out.filterRelaxed)
     }
 
     // --- retries ------------------------------------------------------------------------------
@@ -335,5 +367,17 @@ class WaveTest {
         assertTrue(HubWave.isSameSeed(mapOf("ref" to "dz:1", "by_artist" to true), mapOf("ref" to "dz:1", "by_artist" to "true")))
         assertFalse(HubWave.isSameSeed(null, mapOf("ref" to "dz:1")))
         assertFalse(HubWave.isSameSeed(mapOf("ref" to "dz:1"), mapOf("ref" to "dz:2")))
+    }
+    @Test
+    fun isSameSeedAlsoIdentifiesTheRequestedFilters() {
+        val filters = WaveFilters(listOf("rock", "indie"), "ru", "new", "high")
+        val seed = mapOf("ref" to "dz:1")
+        assertTrue(HubWave.isSameSeed(seed, seed, filters, filters.copy()))
+        assertTrue(HubWave.isSameSeed(seed, seed, filters, filters.copy(genres = filters.genres.reversed())))
+        assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(genres = listOf("pop"))))
+        assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(lang = null)))
+        assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(familiarity = "known")))
+        assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(energy = "low")))
+        assertFalse(HubWave.isSameSeed(null, null, filters, WaveFilters()))
     }
 }
