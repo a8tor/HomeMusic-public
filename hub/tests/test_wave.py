@@ -107,6 +107,7 @@ def test_genres_are_or_within_and_axes_are_and():
     st.pool["dz:1"].track = st.pool["dz:1"].track.model_copy(
         update={"artist": "Foreign", "title": "Song", "artists": ["Foreign"]})
     st.filters = WaveFilters(genres=["rock", "jazz"], lang="ru", familiarity="known", energy="high")
+    st.energy = {c.key: (0.1 if c.track.ref == "dz:2" else 0.8) for c in st.pool.values()}
     assert {c.track.ref for c in wave.pick(st, profile(), "normal", {})} == {"dz:0", "dz:4"}
 
 
@@ -116,9 +117,8 @@ def test_an_empty_filter_behaves_exactly_as_before():
         expected = wave.pick(st, profile(), mode, {})
         st.filters = WaveFilters()
         assert wave.pick(st, profile(), mode, {}) == expected
-        st.filters = WaveFilters(energy="high")
+        st.energy = {c.key: 0.1 for c in st.pool.values()}
         assert wave.pick(st, profile(), mode, {}) == expected
-        st.filters = WaveFilters()
 
 
 def test_filters_survive_the_state_round_trip():
@@ -679,7 +679,7 @@ async def test_a_too_narrow_filter_relaxes_and_reports_it(env, monkeypatch):
     wrong = tr(8102).model_copy(update={"genre": "Jazz"})
     fake_sources(monkeypatch, [wrong, unknown])
     client = env["client"]
-    r = await client.post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru", "energy": "high"}})
+    r = await client.post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru"}})
     assert r.status_code == 200, r.text
     w = r.json()
     assert [t["ref"] for t in w["tracks"]] == [unknown.ref]
@@ -692,6 +692,90 @@ async def test_a_too_narrow_filter_relaxes_and_reports_it(env, monkeypatch):
     assert batch["keep"] == [unknown.ref]
     assert [t["ref"] for t in batch["add"]] == [wrong.ref]
     assert batch["filter_relaxed"] == ["genres"]
+
+
+@pytest.fixture
+def energy_embedder(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    spy = AsyncMock()
+    monkeypatch.setattr(wave.embedder, "configured", lambda: True)
+    monkeypatch.setattr(wave.embedder.EmbedderClient, "energies", spy)
+    monkeypatch.setattr(wave, "_sound", AsyncMock())
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    return spy
+
+
+async def _start_energy_wave(env, monkeypatch, mode, values):
+    await history(env["admin"])
+    tracks = [tr(8200 + i) for i in range(len(values))]
+    fake_sources(monkeypatch, tracks)
+    r = await env["client"].post("/api/wave/start", json={"filters": {"energy": mode}})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+async def _assert_strict_energy(env, monkeypatch, energy_embedder, mode, passing, failing):
+    scores = {f"dz:{8200 + i}": score for i, score in enumerate(passing + failing)}
+    energy_embedder.side_effect = lambda keys: {k: scores[k] for k in keys}
+    start = await _start_energy_wave(env, monkeypatch, mode, scores)
+    sid = start["session_id"]
+    await wave.settle(sid)
+    queued = [t["ref"] for t in start["tracks"]]
+    assert len(queued) == 1 and start["filter_relaxed"] == []
+    r = await env["client"].post(f"/api/wave/{sid}/next", json={"queued": queued})
+    assert r.status_code == 200, r.text
+    assert {t["ref"] for t in r.json()["tracks"]} == set(list(scores)[:len(passing)])
+    assert r.json()["filter_relaxed"] == []
+    energy_embedder.assert_awaited_once_with(list(scores))
+
+
+async def test_energy_high_passes_only_above_the_threshold(env, monkeypatch, energy_embedder):
+    await _assert_strict_energy(env, monkeypatch, energy_embedder, "high", [0.55, 0.6, 0.7, 0.8, 0.9], [0.549, 0.2, None])
+
+
+async def test_energy_low_passes_only_below_the_threshold(env, monkeypatch, energy_embedder):
+    await _assert_strict_energy(env, monkeypatch, energy_embedder, "low", [0.45, 0.4, 0.3, 0.2, 0.1], [0.451, 0.8, None])
+
+
+async def test_unknown_energy_is_not_fetched_twice(env, energy_embedder):
+    energy_embedder.return_value = {"dz:8200": None}
+    st = wave.State(filters=WaveFilters(energy="high"))
+    rt = wave.Runtime(user_id=env["admin"], mode="normal", state=st, profile=profile())
+    result = [build.GenResult("ytm_radio", [tr(8200)])]
+    assert await wave.absorb(rt, result) == 1
+    assert st.energy == {"dz:8200": None}
+    st.remove("dz:8200")  # Not a pool duplicate: only the energy cache prevents a second call.
+    assert await wave.absorb(rt, result) == 1
+    assert "dz:8200" in st.pool_relaxed
+    energy_embedder.assert_awaited_once_with(["dz:8200"])
+
+
+async def test_a_dead_embedder_does_not_break_the_wave(env, monkeypatch, energy_embedder, caplog):
+    energy_embedder.side_effect = wave.embedder.EmbedderDown("offline")
+    out = await _start_energy_wave(env, monkeypatch, "high", [None])
+    assert [t["ref"] for t in out["tracks"]] == ["dz:8200"]
+    assert out["filter_relaxed"] == ["energy"]
+    assert "energy lookup failed" in caplog.text
+
+
+async def test_energy_relaxation_is_reported(env, monkeypatch, energy_embedder):
+    energy_embedder.return_value = {"dz:8200": 0.5, "dz:8201": None}
+    out = await _start_energy_wave(env, monkeypatch, "low", energy_embedder.return_value)
+    sid = out["session_id"]
+    await wave.settle(sid)
+    queued = [t["ref"] for t in out["tracks"]]
+    r = await env["client"].post(f"/api/wave/{sid}/next", json={"queued": queued})
+    assert r.status_code == 200, r.text
+    assert {t["ref"] for t in r.json()["tracks"]} == {"dz:8200", "dz:8201"}
+    assert r.json()["filter_relaxed"] == ["energy"]
+    assert not wave._rt[sid].state.pool
+
+
+def test_energy_survives_the_state_round_trip():
+    st = wave.State(energy={"nd:track": 0.63, "dz:1": None})
+    assert wave.State.load(st.dump()).energy == st.energy
+    assert wave.State.load({}).energy == {}
 
 
 async def test_lang_is_never_relaxed(env, monkeypatch):

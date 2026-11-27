@@ -1047,7 +1047,7 @@ class WaveFilters(BaseModel):
     genres: list[GenreId] = Field(default_factory=list, max_length=8)
     lang: Literal["ru", "foreign"] | None = None
     familiarity: Literal["known", "new"] | None = None
-    energy: Literal["high", "low"] | None = None  # Reserved for stage D; not applied yet.
+    energy: Literal["high", "low"] | None = None
 
 
 class WaveStartIn(BaseModel):

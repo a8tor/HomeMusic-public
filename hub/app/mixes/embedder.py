@@ -7,6 +7,7 @@ term.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,8 @@ from app.config import get_settings
 log = logging.getLogger(__name__)
 
 MAX_ITEMS = 5000  # the service's limit per request
+ENERGY_BATCH = 200
+ENERGY_TIMEOUT_S = 1.0  # total budget for all batches: the wave can continue without energy
 
 
 class EmbedderDown(Exception):
@@ -182,6 +185,28 @@ class EmbedderClient:
         if not keys:
             return {}
         return dict((await self._post("/vectors", {"keys": keys[:MAX_ITEMS]})).get("vectors") or {})
+
+    async def energies(self, keys: list[str]) -> dict[str, float | None]:
+        """Stored energy by vector key; an explicit null means not indexed yet."""
+        scores: dict[str, float | None] = {}
+        keys = list(dict.fromkeys(keys))
+        if not keys or not self.base_url:
+            return scores
+        try:
+            async with asyncio.timeout(ENERGY_TIMEOUT_S):
+                for i in range(0, len(keys), ENERGY_BATCH):
+                    batch = keys[i:i + ENERGY_BATCH]
+                    body = await self._post("/energy", {"keys": batch})
+                    if not isinstance(body, dict) or body.keys() != set(batch):
+                        raise ValueError("response does not cover the requested keys")
+                    for key, value in body.items():
+                        if value is not None and (type(value) not in (int, float) or not 0 <= value <= 1):
+                            raise ValueError("invalid energy score")
+                        scores[key] = None if value is None else float(value)
+        except (EmbedderDown, TimeoutError, ValueError) as e:
+            log.warning("embedder: energy unavailable: %s", e or type(e).__name__)
+            return {}
+        return scores
 
     async def _geometry(self, path: str, body: dict[str, Any], schema, *, space: GeometrySpace | None = None):
         try:

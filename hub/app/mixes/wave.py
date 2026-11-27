@@ -149,6 +149,7 @@ class State:
     positive_weights: dict[str, float] = field(default_factory=dict)
     space: dict[str, Any] | None = None
     pool: dict[str, build.Cand] = field(default_factory=dict)  # by ref: not handed out
+    energy: dict[str, float | None] = field(default_factory=dict)  # key -> stored energy; None is cached unknown
     out: dict[str, build.Cand] = field(default_factory=dict)  # handed out, not started (the client's queue)
     played: list[Played] = field(default_factory=list)
     heard: set[str] = field(default_factory=set)  # fingerprints of every track started: never again
@@ -194,7 +195,7 @@ class State:
                 "radios": self.radios[-STATE_HISTORY_MAX:], "seeds_used": self.seeds_used[-STATE_HISTORY_MAX:],
                 "started": self.started, "started_familiar": self.started_familiar,
                 "downloads": self.downloads[-STATE_HISTORY_MAX:], "gens": self.gens, "seed_artist": self.seed_artist,
-                "filters": self.filters.model_dump(mode="json")}
+                "energy": self.energy, "filters": self.filters.model_dump(mode="json")}
 
     @classmethod
     def load(cls, d: dict[str, Any]) -> State:
@@ -223,6 +224,7 @@ class State:
                  radios=list(d.get("radios") or []), seeds_used=list(d.get("seeds_used") or []),
                  started=int(d.get("started") or 0), started_familiar=int(d.get("started_familiar") or 0),
                  downloads=list(d.get("downloads") or []), gens=dict(d.get("gens") or {}),
+                 energy={k: (None if v is None else float(v)) for k, v in (d.get("energy") or {}).items()},
                  heard=set(d.get("heard") or []), seed_artist=d.get("seed_artist"),
                  nofile=set(d.get("nofile") or []), filters=WaveFilters.model_validate(d.get("filters") or {}),
                  exclusion_refs=set(d.get("exclusion_refs") or []),
@@ -244,13 +246,15 @@ class State:
 
     def put(self, c: build.Cand) -> None:
         self.remove(c.track.ref)
-        pool = self.pool if wf.matches(c, self.filters) else self.pool_relaxed
+        pool = self.pool if wf.matches(c, self.filters, energy=self.energy) else self.pool_relaxed
         pool[c.track.ref] = c
 
     def trim_reserve(self) -> None:
         if len(self.pool_relaxed) > RELAXED_MAX:
             def priority(c: build.Cand) -> tuple[int, float]:
-                return (next((level for level in (1, 3, 4) if wf.fit(c, self.filters, level)), 5), -c.score)
+                level = next((level for level in (1, 2, 3, 4)
+                              if wf.fit(c, self.filters, level, energy=self.energy)), 5)
+                return level, -c.score
 
             top = sorted(self.pool_relaxed.values(), key=priority)[:RELAXED_MAX]
             self.pool_relaxed = {c.track.ref: c for c in top}
@@ -414,7 +418,9 @@ async def _prioritize_seeds(p: Profile, seeds: list[TasteTrack], filters: WaveFi
     for c in cands:
         build.keep(c, p, cfg)
     await wf.prepare(cands, filters)
-    return [t for t, _ in sorted(zip(seeds, cands, strict=True), key=lambda x: not wf.matches(x[1], filters))]
+    # The energy of a radio seed does not describe the tracks its radio returns.
+    metadata_filters = filters.model_copy(update={"energy": None})
+    return [t for t, _ in sorted(zip(seeds, cands, strict=True), key=lambda x: not wf.matches(x[1], metadata_filters))]
 
 
 def generators(p: Profile, seed: CatalogTrack | None, seed_artist: dict[str, Any] | None,
@@ -484,6 +490,21 @@ def weights() -> dict[str, float]:
     return {**get_settings().cfg.mixes.weights, **SESSION_WEIGHTS}
 
 
+async def _fetch_energy(st: State, candidates: list[build.Cand]) -> None:
+    if not st.filters.energy or not embedder.configured():
+        return
+    keys = list(dict.fromkeys(c.key for c in candidates if c.key not in st.energy))
+    if not keys:
+        return
+    try:
+        async with embedder.EmbedderClient() as client:
+            scores = await client.energies(keys)
+    except Exception as e:
+        log.warning("wave: energy lookup failed: %s", e)
+        return
+    st.energy.update({key: scores[key] for key in keys if key in scores})
+
+
 async def absorb(rt: Runtime, results: list[build.GenResult]) -> int:
     """New candidates into the pool: one per song (a song already there adds the generator), library songs marked,
     the mix's filters, its score with the closeness to the taste by sound. Returns how many were added."""
@@ -513,6 +534,7 @@ async def absorb(rt: Runtime, results: list[build.GenResult]) -> int:
     await build.link_library(fresh)
     cfg = get_settings().cfg.mixes
     kept = [c for c in fresh.values() if not (rt.blocked and rt.blocked(c)) and build.keep(c, p, cfg)]
+    await _fetch_energy(st, kept)
     await wf.prepare(kept, st.filters)
     if not isinstance(p, V2Profile):
         try:
@@ -787,12 +809,12 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     pos = _weighted_center(st.positive_weights, vectors) if st.taste_model == "v2" else _center(st.pos, vectors)
     neg = None if st.taste_model == "v2" else _center(st.neg, vectors)
     cfg = get_settings().cfg.mixes if isinstance(p, V2Profile) else None
-    if first is not None and not wf.fit(first, st.filters, filter_level):
+    if first is not None and not wf.fit(first, st.filters, filter_level, energy=st.energy):
         first = None
     pools = (st.out, st.pool, st.pool_relaxed) if filter_level or st.filters.familiarity else (st.out, st.pool)
     candidates = [c for pool in pools for c in pool.values()
                   if c is not first and c.track.ref not in st.nofile and not _disliked(c, p)
-                  and (cfg is None or build.keep(c, p, cfg)) and wf.fit(c, st.filters, filter_level)]
+                  and (cfg is None or build.keep(c, p, cfg)) and wf.fit(c, st.filters, filter_level, energy=st.energy)]
     # Catalog and library copies can have different refs for the same song. Never put both into one wave batch,
     # re-offer a song that has already started, or substitute another ref for one still queued by the client.
     seen = st.heard | {fp_of(c) for c in prefix}
@@ -1431,7 +1453,8 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
             first.score = build.score(first, weights(), profile)
             if active:
                 await wf.prepare([first], filters)
-                if not wf.matches(first, filters):
+                await _fetch_energy(rt.state, [first])
+                if not wf.matches(first, filters, energy=rt.state.energy):
                     rt.state.put(first)
                     first = None
     gens = list((generators(profile, seed_track, seed_artist, seeds, filters=filters) if active
@@ -1660,7 +1683,7 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
         added = await _probe_full(rt, added, first, vectors, probe_started + PROBE_BATCH_TIMEOUT_S,
                                   prefix=prefix, n=n)
     if active and not rt.tasks:
-        for level in (1, 3, 4):  # Stage A does not apply energy; level 2 is a no-op.
+        for level in ((1, 2, 3, 4) if st.filters.energy else (1, 3, 4)):
             missing = n - len(added)
             if missing <= 0 or rt.tasks:
                 break
@@ -1672,7 +1695,7 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
                                            prefix=selected, n=missing, filter_level=level)
             added.extend(extras)
     if active:
-        rt.filter_relaxed = wf.relaxed_axes(kept + added, st.filters)
+        rt.filter_relaxed = wf.relaxed_axes(kept + added, st.filters, energy=st.energy)
         if not kept and not added and not rt.tasks:
             rt.filter_relaxed.append("exhausted")
     rt._wave_probe_elapsed = time.monotonic() - probe_started

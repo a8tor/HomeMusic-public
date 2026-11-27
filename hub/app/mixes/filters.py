@@ -7,6 +7,7 @@ import logging
 import re
 import unicodedata
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Literal
 
@@ -29,6 +30,11 @@ log = logging.getLogger(__name__)
 LANG_TTL = 86400
 GENRE_TTL = 7 * 86400
 ENRICH_TIMEOUT = 2.0
+
+# Leave a neutral band around 0.5 to avoid classifying weak projections on the uncalibrated scale.
+# Revisit these cutoffs after backfilling and inspecting a real library.
+ENERGY_HIGH_MIN = 0.55
+ENERGY_LOW_MAX = 0.45
 
 # Match English words (rap != trap's substring, ost != post-punk) and Russian stems.
 GENRES: dict[GenreId, str] = {
@@ -68,12 +74,19 @@ def track_genres(c: build.Cand) -> set[GenreId]:
 
 
 def active(f: WaveFilters) -> bool:
-    return bool(f.genres or f.lang or f.familiarity)
+    return bool(f.genres or f.lang or f.familiarity or f.energy)
 
 
-def fit(c: build.Cand, f: WaveFilters, level: int) -> bool:
-    """0: strict, 1: unknowns, 2: energy (reserved), 3: any genre, 4: any familiarity."""
+def _matches_energy(c: build.Cand, mode: Literal["high", "low"], energy: Mapping[str, float | None] | None) -> bool:
+    value = energy.get(c.key) if energy is not None else None
+    return value is not None and (value >= ENERGY_HIGH_MIN if mode == "high" else value <= ENERGY_LOW_MAX)
+
+
+def fit(c: build.Cand, f: WaveFilters, level: int, *, energy: Mapping[str, float | None] | None = None) -> bool:
+    """0: strict, 1: unknown genre/familiarity, 2: any energy, 3: any genre, 4: any familiarity."""
     if f.lang and detect_lang(c) != f.lang:
+        return False
+    if f.energy and level < 2 and not _matches_energy(c, f.energy, energy):
         return False
     if f.genres and level < 3:
         genres = track_genres(c)
@@ -85,12 +98,14 @@ def fit(c: build.Cand, f: WaveFilters, level: int) -> bool:
     return True
 
 
-def matches(c: build.Cand, f: WaveFilters) -> bool:
-    return fit(c, f, 0)
+def matches(c: build.Cand, f: WaveFilters, *, energy: Mapping[str, float | None] | None = None) -> bool:
+    return fit(c, f, 0, energy=energy)
 
 
-def relaxed_axes(cands: list[build.Cand], f: WaveFilters) -> list[str]:
+def relaxed_axes(cands: list[build.Cand], f: WaveFilters, *, energy: Mapping[str, float | None] | None = None) -> list[str]:
     axes = []
+    if f.energy and any(not _matches_energy(c, f.energy, energy) for c in cands):
+        axes.append("energy")
     if f.genres and any(not track_genres(c).intersection(f.genres) for c in cands):
         axes.append("genres")
     if f.familiarity and any(c.familiar is not (f.familiarity == "known") for c in cands):
