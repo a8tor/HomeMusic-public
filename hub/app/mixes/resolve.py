@@ -21,6 +21,7 @@ from app.imports.resolve import Resolution, _remember, _remembered
 from app.library.owned import find_existing
 from app.matching.select import classify_scores, match_catalog
 from app.mixes.sources import Hit
+from app.models import Album
 from app.services import svc
 
 log = logging.getLogger(__name__)
@@ -29,15 +30,13 @@ TRACK_TTL_S = 30 * 86400
 PARALLEL = 4
 
 
-def library_track(t) -> CatalogTrack:
+def library_track(t, album_genre: str | None = None) -> CatalogTrack:
     """A library song as a catalog-like track: its Deezer record when it has one, else `nd:<song>`."""
+    data = dict(title=t.title, artist=t.artist, artists=[t.artist], album_title=t.album,
+                duration_s=t.duration_s, isrc=t.isrc, explicit=t.explicit, genre=t.genre or album_genre)
     if t.deezer_track_id:
-        return CatalogTrack(ref=f"dz:{t.deezer_track_id}", source="dz", id=str(t.deezer_track_id), title=t.title,
-                            artist=t.artist, artists=[t.artist], album_title=t.album, duration_s=t.duration_s,
-                            isrc=t.isrc, explicit=t.explicit)
-    return CatalogTrack(ref=f"nd:{t.nd_song_id}", source="nd", id=str(t.nd_song_id), title=t.title, artist=t.artist,
-                        artists=[t.artist], album_title=t.album, duration_s=t.duration_s, isrc=t.isrc,
-                        explicit=t.explicit)
+        return CatalogTrack(ref=f"dz:{t.deezer_track_id}", source="dz", id=str(t.deezer_track_id), **data)
+    return CatalogTrack(ref=f"nd:{t.nd_song_id}", source="nd", id=str(t.nd_song_id), **data)
 
 
 def external_id(hit: Hit) -> str:
@@ -84,7 +83,8 @@ async def resolve_hit(source: str, hit: Hit) -> CatalogTrack | None:
     async with session_scope() as s:
         lib = await find_existing(s, artist=hit.artist, title=hit.title, duration_s=hit.duration_s)
         if lib is not None and lib.nd_song_id:
-            return library_track(lib)
+            album = await s.get(Album, lib.album_id) if not lib.genre and lib.album_id is not None else None
+            return library_track(lib, album.genre if album else None)
         known = await _remembered(s, source, "track", external_id(hit))
     if known is None:
         r = await _search(hit)

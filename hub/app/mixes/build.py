@@ -23,7 +23,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -66,7 +66,7 @@ WEEKDAYS_ACC = ["понедельник", "вторник", "среду", "че�
 class Cand:
     track: CatalogTrack
     gens: dict[str, int] = field(default_factory=dict)  # generator -> best position in its list
-    familiar: bool = False
+    familiar: bool | None = False
     nd_song_id: str | None = None
     library_track_id: int | None = None
     sim: float | None = None
@@ -74,6 +74,9 @@ class Cand:
     # analytics of a mix's song (INSIGHTS.md 6.6), set by `build`: the parts of its score, what the profile knew of it
     parts: dict[str, Any] | None = None
     known: dict[str, Any] | None = None
+    # Precomputed only for waves with active filters; never shared through the catalog track cache.
+    wave_lang: Literal["ru", "foreign"] | None = None
+    wave_genres: set[str] | None = None
 
     @property
     def key(self) -> str:

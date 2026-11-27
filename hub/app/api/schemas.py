@@ -827,7 +827,7 @@ class HealthOut(BaseModel):
     web_build: str | None = None
     capabilities: list[str] = ["typed_favorites_v1", "favorite_compensation_chains_v1", "catalog_favorite_download_v1",
                                "listening_checkpoints_v1", "launch_events_v1", "wave_origin_v1", "smart_shuffle_v1",
-                               "wave_delta_v1"]
+                               "wave_delta_v1", "wave_filters_v1"]
 
 
 # --- listening data (MIXES.md 3.2) -------------------------------------------------------------------------------
@@ -1040,7 +1040,18 @@ class WaveSeedIn(BaseModel):
         return self
 
 
+GenreId = Literal["rock", "metal", "electronic", "hiphop", "pop", "indie", "jazz", "classical"]
+
+
+class WaveFilters(BaseModel):
+    genres: list[GenreId] = Field(default_factory=list, max_length=8)
+    lang: Literal["ru", "foreign"] | None = None
+    familiarity: Literal["known", "new"] | None = None
+    energy: Literal["high", "low"] | None = None  # Reserved for stage D; not applied yet.
+
+
 class WaveStartIn(BaseModel):
+    filters: WaveFilters | None = None
     seed: WaveSeedIn | None = None  # none: the user's own wave, from the taste profile
     mode: MixMode | None = None  # the familiar share, as a mix's; none — the user's mix mode
     # analytics only (INSIGHTS.md 6.3): where it was started (`home_card`, `track_menu`... `restart`), the client
@@ -1078,6 +1089,8 @@ class WaveOut(BaseModel):
     title: str  # «Моя волна», «Волна по треку «…»», «Волна: <артист>»
     mode: MixMode
     seed: dict[str, Any] | None = None  # {ref, artist, title} or {artist_ref, artist, nd_artist_id?}
+    filters: WaveFilters = Field(default_factory=WaveFilters)
+    filter_relaxed: list[str] = Field(default_factory=list)
     tracks: list[WaveTrackOut] = []  # the complete window: kept tracks followed by new tracks
     keep: list[str] = []  # refs from `queued` that are still valid, in client order
     add: list[WaveTrackOut] = []

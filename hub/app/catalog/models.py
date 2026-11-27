@@ -50,6 +50,7 @@ class CatalogTrack(BaseModel):
     album_ref: str | None = None
     album_title: str | None = None
     album_artist: str | None = None
+    genre: str | None = None
     duration_s: int | None = None
     track_no: int | None = None
     disc_no: int | None = None

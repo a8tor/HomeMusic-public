@@ -17,6 +17,7 @@ import pytest
 import respx
 from sqlalchemy import select
 
+from app.api.schemas import WaveFilters
 from app.catalog.models import CatalogTrack
 from app.mixes import build, wave
 from app.mixes.taste import Profile, artist_key
@@ -80,6 +81,50 @@ def test_the_mode_keeps_the_familiar_share(mode: str, familiar: int) -> None:
     got = wave.pick(st, profile(), mode, {}, n=5)
 
     assert sum(c.familiar for c in got) == familiar
+
+
+@pytest.mark.parametrize(("lang", "ref"), [("ru", "dz:1"), ("foreign", "dz:2")])
+def test_a_lang_filter_drops_the_other_language(lang, ref):
+    st = state(cand(1), cand(2, "Foreign", score=99))
+    st.pool["dz:2"].track.title = "Song"
+    st.filters = WaveFilters(lang=lang)
+    assert [c.track.ref for c in wave.pick(st, profile(), "normal", {})] == [ref]
+
+
+@pytest.mark.parametrize(("familiarity", "expected"), [("known", True), ("new", False)])
+def test_a_familiarity_filter_is_hard(familiarity, expected):
+    st = state(cand(1, familiar=True), cand(2, score=99), cand(3, score=999))
+    st.pool["dz:3"].familiar = None
+    st.filters = WaveFilters(familiarity=familiarity)
+    got = wave.pick(st, profile(), "favorites" if not expected else "discover", {})
+    assert len(got) == 1 and got[0].familiar is expected
+
+
+def test_genres_are_or_within_and_axes_are_and():
+    st = state(*(cand(i, familiar=i != 3) for i in range(5)))
+    for c, genre in zip(st.pool.values(), ("Rock", "Jazz", None, "Jazz", "Jazz"), strict=True):
+        c.track.genre = genre
+    st.pool["dz:1"].track = st.pool["dz:1"].track.model_copy(
+        update={"artist": "Foreign", "title": "Song", "artists": ["Foreign"]})
+    st.filters = WaveFilters(genres=["rock", "jazz"], lang="ru", familiarity="known", energy="high")
+    assert {c.track.ref for c in wave.pick(st, profile(), "normal", {})} == {"dz:0", "dz:4"}
+
+
+def test_an_empty_filter_behaves_exactly_as_before():
+    st = state(*(cand(i, familiar=i < 10) for i in range(20)))
+    for mode in build.MODES:
+        expected = wave.pick(st, profile(), mode, {})
+        st.filters = WaveFilters()
+        assert wave.pick(st, profile(), mode, {}) == expected
+        st.filters = WaveFilters(energy="high")
+        assert wave.pick(st, profile(), mode, {}) == expected
+        st.filters = WaveFilters()
+
+
+def test_filters_survive_the_state_round_trip():
+    st = wave.State(filters=WaveFilters(genres=["jazz", "rock"], lang="ru", familiarity="new", energy="low"))
+    assert wave.State.load(st.dump()).filters == st.filters
+    assert wave.State.load({}).filters == WaveFilters()
 
 
 def test_the_artist_of_a_wave_by_an_artist_plays_once_in_three() -> None:
@@ -605,7 +650,7 @@ def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
     """The pool's generators give `tracks`; the radio of a liked track gives `radio`."""
     seen: dict[str, Any] = {"seed": [], "radio": []}
 
-    def gens(p, seed, seed_artist, seeds):
+    def gens(p, seed, seed_artist, seeds, **kwargs):
         seen["seed"].append(seed.ref if seed else seed_artist["ref"] if seed_artist else None)
 
         async def g():
@@ -619,13 +664,55 @@ def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
 
     monkeypatch.setattr(wave, "generators", gens)
     monkeypatch.setattr(wave, "radio_of", radio_of)
-    monkeypatch.setattr(wave, "refill_generators", lambda p, st: {})
+    monkeypatch.setattr(wave, "refill_generators", lambda p, st, **kwargs: {})
     return seen
 
 
 def ev(kind: str, ref: str, position: float | None = None) -> dict[str, Any]:
     return {"event_id": uuid.uuid4().hex, "ts": datetime.now(UTC).isoformat(), "kind": kind, "ref": ref,
             "position_s": position, "duration_s": 200, "client": "pwa"}
+
+
+async def test_a_too_narrow_filter_relaxes_and_reports_it(env, monkeypatch):
+    await history(env["admin"])
+    unknown = tr(8101)
+    wrong = tr(8102).model_copy(update={"genre": "Jazz"})
+    fake_sources(monkeypatch, [wrong, unknown])
+    client = env["client"]
+    r = await client.post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru", "energy": "high"}})
+    assert r.status_code == 200, r.text
+    w = r.json()
+    assert [t["ref"] for t in w["tracks"]] == [unknown.ref]
+    assert w["filter_relaxed"] == ["genres"]
+    await wave.settle(w["session_id"])
+    r = await client.post(f'/api/wave/{w["session_id"]}/next', json={"queued": [unknown.ref]})
+    assert r.status_code == 200, r.text
+    batch = r.json()
+    assert batch["filters"] == w["filters"]
+    assert batch["keep"] == [unknown.ref]
+    assert [t["ref"] for t in batch["add"]] == [wrong.ref]
+    assert batch["filter_relaxed"] == ["genres"]
+
+
+async def test_lang_is_never_relaxed(env, monkeypatch):
+    await history(env["admin"])
+    ru = tr(8103)
+    fake_sources(monkeypatch, [ru])
+    client = env["client"]
+    r = await client.post("/api/wave/start", json={"filters": {"lang": "foreign"}})
+    assert r.status_code == 200, r.text
+    w = r.json()
+    rt = wave._rt[w["session_id"]]
+    assert ru.ref in rt.state.pool_relaxed
+    # Make source exhaustion deterministic independently of real profile seed radios.
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    await wave.settle(w["session_id"])
+    r = await client.post(f'/api/wave/{w["session_id"]}/next', json={"filters": {"lang": "ru"}})
+    assert r.status_code == 200, r.text
+    batch = r.json()
+    assert batch["filters"]["lang"] == "foreign"
+    assert batch["tracks"] == [] and batch["pending"] is False
+    assert batch["filter_relaxed"] == ["exhausted"]
 
 
 async def test_nothing_to_start_from(env) -> None:

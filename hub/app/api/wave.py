@@ -30,7 +30,7 @@ async def track_outs(s: AsyncSession, cands: list, user_id: int) -> list[WaveTra
         if c.nd_song_id:
             d.update(owned=True, nd_song_id=c.nd_song_id, library_track_id=c.library_track_id or d.get("library_track_id"))
         g = wave.top_generator(c)
-        tracks.append(WaveTrackOut(**d, generator=g, generator_title=wave.generator_title(g), familiar=c.familiar,
+        tracks.append(WaveTrackOut(**d, generator=g, generator_title=wave.generator_title(g), familiar=bool(c.familiar),
                                    sim=c.sim))
     return tracks
 
@@ -46,7 +46,7 @@ async def wave_out(s: AsyncSession, b: wave.Batch, user_id: int) -> WaveOut:
     added = tracks[len(b.keep):]
     result = WaveOut(session_id=b.session_id, title=b.title, mode=b.mode,  # type: ignore[arg-type]
                      seed=b.seed, tracks=kept + added, keep=b.keep, add=added, target_len=b.target_len,
-                     pending=b.pending, recorded=recorded)
+                     pending=b.pending, recorded=recorded, filters=b.filters, filter_relaxed=b.filter_relaxed)
     log.info("wave %s: annotate_tracks/response=%.2fs tracks=%d", b.session_id, time.monotonic() - started,
              len(tracks))
     return result
@@ -59,7 +59,7 @@ async def start(body: WaveStartIn | None = None, user: User = Depends(current_us
     body = body or WaveStartIn()
     try:
         b = await wave.start(user, body.seed.model_dump(exclude_none=True) if body.seed else None, body.mode,
-                             origin=body.origin, client=body.client, restart_of=body.restart_of,
+                             origin=body.origin, client=body.client, restart_of=body.restart_of, filters=body.filters,
                              request=body.model_dump(mode="json", exclude_none=True))
     except wave.WaveError as e:
         raise HTTPException(e.status, str(e)) from e
