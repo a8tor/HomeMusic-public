@@ -256,6 +256,14 @@ class WaveTest {
     }
 
     @Test
+    fun startBodyIncludesEnergyWhenItIsTheOnlySelectedFilter() {
+        val body = WaveSession.startBody(null, null, filters = WaveFilters(energy = "high"),
+            capabilities = setOf(WaveSession.FILTERS_CAPABILITY))
+        val filters = JsonParser.parseString(Gson().toJson(body)).asJsonObject.getAsJsonObject("filters")
+        assertEquals("high", filters.get("energy").asString)
+    }
+
+    @Test
     fun startBodyOmitsEmptyFiltersEvenOnSupportingHubs() {
         val body = WaveSession.startBody(null, null, filters = WaveFilters(), capabilities = setOf("wave_filters_v1"))
         assertFalse(JsonParser.parseString(Gson().toJson(body)).asJsonObject.has("filters"))
@@ -264,13 +272,14 @@ class WaveTest {
     @Test
     fun waveFiltersRoundTripAndResponseRelaxationsAreRead() {
         val gson = Gson()
-        val filters = WaveFilters(listOf("rock", "jazz"), "ru", "known", "low")
+        val filters = WaveFilters(listOf("rock", "jazz"), "ru", "known", energy = "low")
         val json = gson.toJson(filters)
+        assertEquals("low", JsonParser.parseString(json).asJsonObject.get("energy").asString)
         assertEquals(filters, gson.fromJson(json, WaveFilters::class.java))
         assertEquals(WaveFilters(), gson.fromJson("{}", WaveFilters::class.java))
-        val out = gson.fromJson("""{"filters":$json,"filter_relaxed":["genres","familiarity"]}""", WaveOut::class.java)
+        val out = gson.fromJson("""{"filters":$json,"filter_relaxed":["genres","familiarity","energy"]}""", WaveOut::class.java)
         assertEquals(filters, out.filters)
-        assertEquals(listOf("genres", "familiarity"), out.filterRelaxed)
+        assertEquals(listOf("genres", "familiarity", "energy"), out.filterRelaxed)
     }
 
     // --- retries ------------------------------------------------------------------------------
@@ -378,6 +387,7 @@ class WaveTest {
         assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(lang = null)))
         assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(familiarity = "known")))
         assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(energy = "low")))
+        assertFalse(HubWave.isSameSeed(seed, seed, filters, filters.copy(energy = null)))
         assertFalse(HubWave.isSameSeed(null, null, filters, WaveFilters()))
     }
 }

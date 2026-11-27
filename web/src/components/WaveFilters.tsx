@@ -29,9 +29,9 @@ export function useWaveFilterPanel(enabled: boolean) {
   }, [enabled]);
   const labels = [
     ...filters.genres.map((genre) => GENRE_LABELS[genre]),
-    ...(filters.familiarity ? [FAMILIARITY_LABELS[filters.familiarity]] : []),
     ...(filters.energy ? [ENERGY_LABELS[filters.energy]] : []),
     ...(filters.lang ? [LANG_LABELS[filters.lang]] : []),
+    ...(filters.familiarity ? [FAMILIARITY_LABELS[filters.familiarity]] : []),
   ];
   return { available: enabled && available, open, setOpen, panelId, filters, filterRelaxed, labels };
 }
@@ -71,18 +71,17 @@ export function WaveFilterSummary({ panel }: { panel: Panel }) {
   return <span className="mt-1 block break-words text-xs leading-snug text-muted">{panel.labels.join(' · ')}</span>;
 }
 
-function Chip({ active, disabled, onClick, children }: {
-  active: boolean; disabled?: boolean; onClick?: () => void; children: ReactNode;
+function Chip({ active, onClick, children }: {
+  active: boolean; onClick: () => void; children: ReactNode;
 }) {
   return (
     <button
       type="button"
       aria-pressed={active}
-      disabled={disabled}
       onClick={onClick}
       className={cx(
-        'min-h-11 rounded-full border px-3 text-sm transition disabled:opacity-50',
-        active ? 'border-accent bg-accent/15 text-accent' : 'border-line bg-raised text-fg enabled:hover:bg-hover',
+        'min-h-11 rounded-full border px-3 text-sm transition',
+        active ? 'border-accent bg-accent/15 text-accent' : 'border-line bg-raised text-fg hover:bg-hover',
       )}
     >
       {children}
@@ -143,11 +142,16 @@ export function WaveFilters({ panel, origin }: { panel: Panel; origin: WaveOrigi
             ))}
           </div>
         </fieldset>
-        <fieldset className="min-w-0" disabled>
-          <legend className="mb-1 text-sm font-semibold">Энергия <span className="font-normal text-muted">· скоро</span></legend>
+        <fieldset className="min-w-0">
+          <legend className="mb-1 text-sm font-semibold">Энергия</legend>
           <div className="flex flex-wrap gap-1.5">
-            <Chip active={false} disabled>{ENERGY_LABELS.high}</Chip>
-            <Chip active={false} disabled>{ENERGY_LABELS.low}</Chip>
+            {(['high', 'low'] as const).map((energy) => (
+              <Chip key={energy} active={filters.energy === energy} onClick={() => change({
+                ...filters, energy: filters.energy === energy ? null : energy,
+              })}>
+                {ENERGY_LABELS[energy]}
+              </Chip>
+            ))}
           </div>
         </fieldset>
         {panel.labels.length > 0 && <Button variant="ghost" className="text-muted" onClick={reset}>Сбросить</Button>}

@@ -39,7 +39,9 @@ class WaveFilterSheet : BottomSheetDialogFragment(R.layout.bottom_sheet_wave_fil
         bindChips(view, R.id.homemusic_wave_filter_familiarity, familiarity, listOfNotNull(draft.familiarity)) {
             update(draft.copy(familiarity = it.singleOrNull()))
         }
-        bindChips(view, R.id.homemusic_wave_filter_energy, energy, listOfNotNull(draft.energy), enabled = false) {}
+        bindChips(view, R.id.homemusic_wave_filter_energy, energy, listOfNotNull(draft.energy)) {
+            update(draft.copy(energy = it.singleOrNull()))
+        }
         update(draft)
         view.findViewById<View>(R.id.homemusic_wave_filter_apply).setOnClickListener { finish(draft) }
         view.findViewById<View>(R.id.homemusic_wave_filter_reset).setOnClickListener { finish(WaveFilters()) }
@@ -52,7 +54,7 @@ class WaveFilterSheet : BottomSheetDialogFragment(R.layout.bottom_sheet_wave_fil
 
     private fun bindChips(
         view: View, groupId: Int, labels: Map<String, String>, checked: List<String>,
-        enabled: Boolean = true, changed: (List<String>) -> Unit,
+        changed: (List<String>) -> Unit,
     ) {
         val group = view.findViewById<ChipGroup>(groupId)
         val chips = labels.mapValues { (key, label) ->
@@ -62,7 +64,6 @@ class WaveFilterSheet : BottomSheetDialogFragment(R.layout.bottom_sheet_wave_fil
                 isCheckable = true
                 isCheckedIconVisible = true
                 isChecked = key in checked
-                isEnabled = enabled
                 group.addView(this)
             }
         }
@@ -80,11 +81,15 @@ class WaveFilterSheet : BottomSheetDialogFragment(R.layout.bottom_sheet_wave_fil
         )
         private val languages = mapOf("ru" to "Русская", "foreign" to "Иностранная")
         private val familiarity = mapOf("known" to "Знакомое", "new" to "Незнакомое")
-        private val energy = mapOf("high" to "Высокая", "low" to "Низкая")
+        private val energy = mapOf("high" to "Энергичная", "low" to "Спокойная")
 
         fun summary(filters: WaveFilters): String = (
             genres.filterKeys { it in filters.genres.orEmpty() }.values +
-                listOfNotNull(filters.lang?.let(languages::get), filters.familiarity?.let(familiarity::get))
+                listOfNotNull(
+                    filters.energy?.let(energy::get),
+                    filters.lang?.let(languages::get),
+                    filters.familiarity?.let(familiarity::get),
+                )
             ).joinToString(" · ")
     }
 }
