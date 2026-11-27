@@ -1,19 +1,30 @@
 """Metadata classification and filtered wave discovery."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.api.schemas import WaveFilters
-from app.catalog.models import CatalogTrack, SearchResults
+from app.catalog.deezer import BASE_URL, DeezerClient
+from app.catalog.models import CatalogArtist, CatalogTrack, SearchResults
+from app.config import get_settings
 from app.db import session_scope
 from app.matching.normalize import fingerprint
 from app.mixes import wave
 from app.mixes.build import Cand
-from app.mixes.filters import detect_lang, fit, matches, normalize_genres, relaxed_axes, track_genres
+from app.mixes.filters import deezer_genre_ids, detect_lang, fit, matches, normalize_genres, relaxed_axes, track_genres
 from app.models import Album, Track
 from app.services import svc
-from tests.test_wave import env, fake_sources, history, tr
+from tests.test_wave import env as wave_env, fake_sources, history, tr
+
+
+@pytest.fixture
+async def env(wave_env, monkeypatch):
+    monkeypatch.setattr(svc.deezer, "get_genres", AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr(svc.deezer, "genre_chart_tracks", AsyncMock(return_value=[]), raising=False)
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: False)
+    return wave_env
 
 
 @pytest.mark.parametrize(("metadata", "cached", "expected"), [
@@ -242,3 +253,140 @@ async def test_discovery_failure_does_not_break_the_wave(env, monkeypatch, caplo
     assert any(r.levelname == "WARNING" and "filter discovery" in r.message and "offline" in r.message
                for r in caplog.records)
     await wave.settle(start["session_id"])
+
+
+async def test_deezer_genre_mapping_is_normalized_and_cached(env, respx_mock):
+    route = respx_mock.get(f"{BASE_URL}/genre").respond(json={"data": [
+        {"id": 0, "name": "All"}, {"id": 11, "name": "Alternative"},
+        {"id": 21, "name": "Classical", "picture": "https://picture.test/classical"},
+        {"id": 22, "name": "Rock"}, {"id": 23, "name": "Pop"}, {"id": 24, "name": "Indie"},
+    ]})
+    chart = respx_mock.get(f"{BASE_URL}/chart/21/tracks").respond(json={"data": [
+        {"id": 801, "title": "Piece", "artist": {"id": 71, "name": "Soloist"}},
+    ]})
+    client = DeezerClient(get_settings().cfg.catalog)
+    try:
+        ids = await deezer_genre_ids(client)
+        assert ids == await deezer_genre_ids(client) == {"classical": 21, "rock": 22, "pop": 23, "indie": 24}
+        tracks = await client.genre_chart_tracks(ids["classical"], limit=7)
+        assert [(t.ref, t.artist, t.genre) for t in tracks] == [("dz:801", "Soloist", None)]
+    finally:
+        await client.aclose()
+    assert route.call_count == 1
+    assert route.calls.last.request.headers["accept-language"].startswith("en")
+    assert chart.calls.last.request.url.params["limit"] == "7"
+
+
+async def test_discovery_skips_missing_deezer_genre(env, monkeypatch, caplog):
+    fake_sources(monkeypatch, [])
+    svc.deezer.get_genres.return_value = [{"id": 23, "name": "Pop"}]
+    fallback = tr(8701).model_copy(update={"genre": "Indie"})
+    monkeypatch.setattr(svc.deezer, "search", AsyncMock(return_value=SearchResults(tracks=[fallback])))
+
+    response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["indie"]}})
+    assert response.status_code == 200, response.text
+    start = response.json()
+    assert [t["ref"] for t in start["tracks"]] == [fallback.ref]
+    await wave.settle(start["session_id"])
+    svc.deezer.genre_chart_tracks.assert_not_awaited()
+    assert not any("filter discovery" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("failed", [None, "chart", "lastfm"])
+async def test_genre_discovery_is_strict_and_survives_source_failure(env, monkeypatch, caplog, failed):
+    fake_sources(monkeypatch, [])
+    filters = {"genres": ["classical"]}
+    rock = tr(8800, "Not classical").model_copy(update={"genre": "Rock"})
+    chart = [tr(8810 + i, "Chart soloist").model_copy(update={"genre": "Classical"}) for i in range(4)]
+    tag = tr(8820, "Tag soloist").model_copy(update={"genre": "Classical"})
+    fallback = tr(8830, "Text soloist").model_copy(update={"genre": "Classical"})
+    svc.deezer.get_genres.return_value = [{"id": 21, "name": "Classical"}]
+    svc.deezer.genre_chart_tracks.return_value = [*chart, rock] if failed != "lastfm" else [rock]
+    if failed == "chart":
+        svc.deezer.genre_chart_tracks.side_effect = RuntimeError("chart offline")
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: True)
+    names = AsyncMock(return_value=[tag.artist], side_effect=RuntimeError("lastfm offline") if failed == "lastfm" else None)
+    monkeypatch.setattr(wave.sources, "lastfm_tag_top_artists", names)
+    top = AsyncMock(return_value=[tag, rock])
+    monkeypatch.setattr(svc.deezer, "get_artist_top", top, raising=False)
+    search = AsyncMock(side_effect=lambda q, *, kinds, limit: SearchResults(
+        artists=[CatalogArtist(ref="dz:75", source="dz", id="75", name=tag.artist)]) if kinds == ("artist",)
+        else SearchResults(tracks=[fallback]))
+    monkeypatch.setattr(svc.deezer, "search", search)
+
+    response = await env["client"].post("/api/wave/start", json={"filters": filters})
+    assert response.status_code == 200, response.text
+    start = response.json()
+    first_refs = {tag.ref} if failed == "chart" else {fallback.ref} if failed == "lastfm" else {t.ref for t in chart}
+    assert len(start["tracks"]) == 1 and start["tracks"][0]["ref"] in first_refs
+    assert start["filter_relaxed"] == []
+    sid = start["session_id"]
+    await wave.settle(sid)
+    rt = wave._rt[sid]
+    assert sum(c.track.artist == "Chart soloist" for c in (*rt.state.pool.values(), *rt.state.out.values())) <= 2
+    response = await env["client"].post(f"/api/wave/{sid}/next", json={"queued": [start["tracks"][0]["ref"]]})
+    assert response.status_code == 200, response.text
+    batch = response.json()
+    assert all(t["ref"] in {tag.ref, fallback.ref, *(t.ref for t in chart)} for t in batch["tracks"])
+    assert batch["filter_relaxed"] == []
+    svc.deezer.genre_chart_tracks.assert_awaited_once_with(21, limit=wave.POOL_LOW)
+    names.assert_awaited_once_with("classical")
+    if failed != "lastfm":
+        top.assert_awaited_once_with("75", limit=wave.DISCOVERY_ARTIST_TOP)
+    if failed:
+        assert any(r.levelname == "WARNING" and f"{failed} offline" in r.message for r in caplog.records)
+    await wave.settle(sid)
+
+
+async def test_lastfm_discovery_caps_unique_artists_across_genres(env, monkeypatch):
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: True)
+    genres = WaveFilters(genres=["classical", "jazz"])
+    tags = AsyncMock(side_effect=lambda tag: ["Shared soloist", *(f"{tag} artist {i}" for i in range(12))])
+    monkeypatch.setattr(wave.sources, "lastfm_tag_top_artists", tags)
+
+    def search(name, *, kinds, limit):
+        assert kinds == ("artist",)
+        return SearchResults(artists=[
+            CatalogArtist(ref="dz:71", source="dz", id="71", name="Unrelated"),
+            CatalogArtist(ref="dz:72", source="dz", id="72", name=name),
+        ])
+
+    lookup = AsyncMock(side_effect=search)
+    top = AsyncMock(return_value=[])
+    monkeypatch.setattr(svc.deezer, "search", lookup)
+    monkeypatch.setattr(svc.deezer, "get_artist_top", top, raising=False)
+    assert await wave._discovery_lastfm(genres) == []
+    queried = [c.args[0] for c in lookup.await_args_list]
+    assert len(queried) == len(set(queried)) == wave.DISCOVERY_LASTFM_ARTISTS
+    assert all(any(name.startswith(tag) for name in queried) for tag in ("classical", "jazz"))
+    assert [c.args[0] for c in top.await_args_list] == ["72"] * wave.DISCOVERY_LASTFM_ARTISTS
+
+
+async def test_discovery_continues_after_start_deadline(env, monkeypatch):
+    fake_sources(monkeypatch, [])
+    started, release = asyncio.Event(), asyncio.Event()
+    svc.deezer.get_genres.return_value = [{"id": 21, "name": "Classical"}]
+    classical = tr(8900).model_copy(update={"genre": "Classical"})
+
+    async def slow_chart(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return []
+
+    svc.deezer.genre_chart_tracks.side_effect = slow_chart
+    search = AsyncMock(return_value=SearchResults(tracks=[classical]))
+    monkeypatch.setattr(svc.deezer, "search", search)
+    monkeypatch.setattr(wave, "START_FIRST_TIMEOUT_S", 0.5)
+    response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["classical"]}})
+    try:
+        assert response.status_code == 200, response.text
+        start = response.json()
+        assert started.is_set() and start["pending"] and not start["tracks"]
+        search.assert_not_awaited()
+    finally:
+        release.set()
+    sid = start["session_id"]
+    await wave.settle(sid)
+    assert classical.ref in wave._rt[sid].state.pool
+    svc.deezer.genre_chart_tracks.assert_awaited_once()
+    search.assert_awaited_once()

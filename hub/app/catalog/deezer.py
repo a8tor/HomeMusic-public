@@ -191,11 +191,13 @@ class DeezerClient:
 
     # --- transport -------------------------------------------------------------------------------------------
 
-    async def _get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _get(self, path_or_url: str, params: dict[str, Any] | None = None, *,
+                   headers: dict[str, str] | None = None) -> dict[str, Any]:
         """GET a Deezer endpoint (path or absolute `next` URL); handle in-body errors."""
         url = path_or_url if path_or_url.startswith("http") else f"{BASE_URL}/{path_or_url.lstrip('/')}"
         for attempt in range(self.quota_retries + 1):
-            resp = await request_with_backoff(self._client, "GET", url, limiter=self._limiter, params=params)
+            resp = await request_with_backoff(self._client, "GET", url, limiter=self._limiter, params=params,
+                                              headers=headers)
             if resp.status_code == 404:
                 raise CatalogNotFound(url)
             if resp.status_code != 200:
@@ -370,6 +372,20 @@ class DeezerClient:
             return [map_artist(x) for x in data.get("data") or []]
 
         return await self._cached_list(f"dz:chart_artists:{limit}", self.cfg.ttl_search_s, CatalogArtist, produce)
+
+    async def get_genres(self) -> list[dict[str, Any]]:
+        """Genre records (id, name, picture); ask for English labels for matching."""
+        data = await self._get("genre", headers={"Accept-Language": "en-US,en;q=0.9"})
+        return data["data"]
+
+    async def genre_chart_tracks(self, id_: int, limit: int = 25) -> list[CatalogTrack]:
+        """The track chart for a genre from /genre, not the general artist chart."""
+        async def produce() -> list[CatalogTrack]:
+            data = await self._get(f"chart/{id_}/tracks", {"limit": limit})
+            return [map_track(x) for x in data["data"][:limit]]
+
+        return await self._cached_list(f"dz:genre_chart_tracks:{id_}:{limit}", self.cfg.ttl_search_s,
+                                       CatalogTrack, produce)
 
     async def get_artist_albums(self, id_: str | int) -> list[CatalogAlbum]:
         """All releases (every page), clean/explicit twins merged, newest first."""

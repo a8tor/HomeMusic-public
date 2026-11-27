@@ -86,6 +86,8 @@ QUEUED_BONUS = 0.3  # a track the client has queued already is not swapped for a
 SESSION_RADIO = "session_radio"
 FILTER_DISCOVERY = "filter_discovery"
 DISCOVERY_ARTIST_MAX = 2
+DISCOVERY_LASTFM_ARTISTS = 8  # total per discovery pass, across all requested tags
+DISCOVERY_ARTIST_TOP = 5
 DISCOVERY_RETRY_S = 30.0  # don't keep the wave pending when sources have nothing new
 ARTIST_SONGS = "artist_songs"
 ARTIST_SONGS_MAX = 60  # the seed artist's library songs put in the pool
@@ -517,11 +519,72 @@ async def _discovery_deezer(filters: WaveFilters) -> list[CatalogTrack]:
     return [t for batch in batches for t in batch]
 
 
-def _discovery_gen(rt: Runtime, source: str) -> build.Gen | None:
+async def _discovery_chart(filters: WaveFilters) -> list[CatalogTrack]:
+    client = svc.deezer
+    if client is None:
+        return []
+    genre_ids = await wf.deezer_genre_ids(client)
+
+    async def tracks(id_: int) -> list[CatalogTrack]:
+        try:
+            return await client.genre_chart_tracks(id_, limit=POOL_LOW)
+        except Exception as e:
+            log.warning("wave: filter discovery (Deezer chart %s) failed: %r", id_, e)
+            return []
+
+    ids = dict.fromkeys(genre_ids[g] for g in filters.genres if g in genre_ids)
+    return [t for batch in await asyncio.gather(*(tracks(id_) for id_ in ids)) for t in batch]
+
+
+async def _discovery_lastfm(filters: WaveFilters) -> list[CatalogTrack]:
+    client = svc.deezer
+    if client is None or not sources.lastfm_configured():
+        return []
+
+    async def names(tag: str) -> list[str]:
+        try:
+            return await sources.lastfm_tag_top_artists(tag)
+        except Exception as e:
+            log.warning("wave: filter discovery (Last.fm tag %s) failed: %r", tag, e)
+            return []
+
+    async def tracks(name: str) -> list[CatalogTrack]:
+        try:
+            found = await client.search(name, kinds=("artist",), limit=5)
+            # Avoid pulling the top tracks of an unrelated first search hit.
+            key = artist_key(name)
+            for artist in found.artists:
+                if artist_key(artist.name) == key:
+                    return await client.get_artist_top(artist.id, limit=DISCOVERY_ARTIST_TOP)
+        except Exception as e:
+            log.warning("wave: filter discovery (Last.fm artist %s via Deezer) failed: %r", name, e)
+        return []
+
+    batches = await asyncio.gather(*(names(wf.LASTFM_GENRE_TAGS[g]) for g in filters.genres))
+    artists: dict[str, str] = {}
+    # Walk the ranks across tags so the first tag cannot take the whole request budget.
+    for rank in range(max(map(len, batches), default=0)):
+        for batch in batches:
+            if rank < len(batch) and (key := artist_key(batch[rank])):
+                artists.setdefault(key, batch[rank])
+        if len(artists) >= DISCOVERY_LASTFM_ARTISTS:
+            break
+    selected = list(artists.values())[:DISCOVERY_LASTFM_ARTISTS]
+    return [t for batch in await asyncio.gather(*(tracks(name) for name in selected)) for t in batch]
+
+
+def _discovery_loaders(filters: WaveFilters) -> dict[str, Callable[[WaveFilters], Awaitable[list[CatalogTrack]]]]:
+    loaders = {"library": _discovery_library}
+    if filters.genres and svc.deezer is not None:
+        loaders.update(chart=_discovery_chart, lastfm=_discovery_lastfm, deezer=_discovery_deezer)
+    return loaders
+
+
+def _discovery_gen(rt: Runtime, source: str, load: Callable[[WaveFilters], Awaitable[list[CatalogTrack]]]
+                   ) -> build.Gen | None:
     st = rt.state
     now = time.monotonic()
-    if (not wf.active(st.filters) or len(st.pool) >= POOL_LOW or now < rt.discovery_after.get(source, 0)
-            or (source == "deezer" and (not st.filters.genres or svc.deezer is None))):
+    if not wf.active(st.filters) or len(st.pool) >= POOL_LOW or now < rt.discovery_after.get(source, 0):
         return None
     rt.discovery_after[source] = now + DISCOVERY_RETRY_S
     # Snapshot before awaiting the provider so a background fetch doesn't depend on mutable pool state.
@@ -534,7 +597,6 @@ def _discovery_gen(rt: Runtime, source: str) -> build.Gen | None:
 
     async def fetch() -> list[CatalogTrack]:
         try:
-            load = _discovery_library if source == "library" else _discovery_deezer
             tracks = await asyncio.wait_for(load(st.filters), SOURCE_WAIT_S)
             random.shuffle(tracks)
             out: list[CatalogTrack] = []
@@ -669,34 +731,42 @@ async def _gather(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]], enou
         late.add_done_callback(rt.tasks.discard)
 
 
-async def _late(sid: str, rt: Runtime, task: asyncio.Task) -> None:
+async def _late(sid: str, rt: Runtime, task: asyncio.Task, *, discovery: bool = False) -> None:
     try:
         results = await task
         async with rt.lock:
             added = await absorb(rt, results)
             await (rt.save or _save)(sid, rt)
+            if discovery:
+                rt.discovering = False
+                _refill_discovery(sid, rt)
         log.info("wave %s: %s joined later (+%s)", sid, [r.name for r in results], added)
     except asyncio.CancelledError:
         task.cancel()
+        if discovery:
+            rt.discovering = False
         raise
     except Exception:
         log.exception("wave %s: a late source failed", sid)
+        if discovery:
+            rt.discovering = False
+            _refill_discovery(sid, rt)
 
 
 def _refill_discovery(sid: str, rt: Runtime) -> None:
     st = rt.state
-    sources = ("library", "deezer") if st.filters.genres and svc.deezer is not None else ("library",)
+    loaders = _discovery_loaders(st.filters)
     now = time.monotonic()
     if (rt.discovering or not wf.active(st.filters) or len(st.pool) >= POOL_LOW
-            or all(now < rt.discovery_after.get(source, 0) for source in sources)):
+            or all(now < rt.discovery_after.get(source, 0) for source in loaders)):
         return
     rt.discovering = True
 
     async def run() -> None:
         try:
-            for source in sources:
+            for source, load in loaders.items():
                 async with rt.lock:
-                    gen = _discovery_gen(rt, source)
+                    gen = _discovery_gen(rt, source, load)
                 if gen is not None:
                     results = await build.run_generators({FILTER_DISCOVERY: gen})
                     async with rt.lock:
@@ -1409,10 +1479,18 @@ async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
                       deadline: float) -> build.Cand | None:
     """Absorb sources as they answer; prefer a local candidate or verify a catalog pick by the deadline."""
     pending = {asyncio.create_task(build.run_generators({name: gen})) for name, gen in gens}
-    library_task = None
-    if deadline > time.monotonic() and (gen := _discovery_gen(rt, "library")) is not None:
-        library_task = asyncio.create_task(build.run_generators({FILTER_DISCOVERY: gen}))
-        pending.add(library_task)
+    loaders = iter(_discovery_loaders(rt.state.filters).items())
+
+    def start_discovery() -> asyncio.Task | None:
+        if time.monotonic() < deadline:
+            for source, load in loaders:
+                if (gen := _discovery_gen(rt, source, load)) is not None:
+                    task = asyncio.create_task(build.run_generators({FILTER_DISCOVERY: gen}))
+                    pending.add(task)
+                    return task
+        return None
+
+    discovery_task = start_discovery()
     first = None
     probe_task: asyncio.Task | None = None
     try:
@@ -1443,8 +1521,8 @@ async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
                 if local:
                     first = local[0]
                     break
-                if library_task in source_done and (gen := _discovery_gen(rt, "deezer")) is not None:
-                    pending.add(asyncio.create_task(build.run_generators({FILTER_DISCOVERY: gen})))
+                if discovery_task in source_done:
+                    discovery_task = start_discovery()
             if probe_task in done:
                 checked = probe_task.result()
                 probe_task = None
@@ -1456,7 +1534,10 @@ async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
             probe_task.cancel()
             await asyncio.gather(probe_task, return_exceptions=True)
         for task in pending:
-            late = asyncio.create_task(_late(sid, rt, task))
+            is_discovery = task is discovery_task
+            if is_discovery:
+                rt.discovering = True
+            late = asyncio.create_task(_late(sid, rt, task, discovery=is_discovery))
             rt.tasks.add(late)
             late.add_done_callback(rt.tasks.discard)
     return first

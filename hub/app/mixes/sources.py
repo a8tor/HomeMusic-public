@@ -209,6 +209,15 @@ async def lastfm_artist_tags(artist: str, limit: int = 5) -> list[str]:
     return await cached(f"mix:lfm_artist_tags:{_key(artist)}", TTL_S, produce) or []
 
 
+async def lastfm_tag_top_artists(tag: str, limit: int = 30) -> list[str]:
+    """Names in a Last.fm tag's top-artist list (one cached page per tag)."""
+    async def produce() -> list[str]:
+        body = await _lastfm("tag.gettopartists", tag=" ".join(tag.split()), limit=limit)
+        return [a["name"] for a in _as_list((body.get("topartists") or {}).get("artist")) if a.get("name")]
+
+    return (await cached(f"mix:lfm_tag_artists:{_key(tag)}", TTL_S, produce) or [])[:limit]
+
+
 # --- Yandex Music ------------------------------------------------------------------------------------------------
 
 

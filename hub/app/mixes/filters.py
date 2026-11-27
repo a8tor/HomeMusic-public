@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal
 from sqlalchemy import or_, select
 
 from app.api.schemas import GenreId, WaveFilters
-from app.catalog.cache import cache_set_many
+from app.catalog.cache import cache_set_many, cached
 from app.catalog.yandex import cis_release
 from app.db import session_scope
 from app.matching.normalize import has_cyrillic
@@ -24,11 +24,18 @@ from app.models import Album, CatalogCache, Track, utcnow
 from app.services import svc
 
 if TYPE_CHECKING:
+    from app.catalog.deezer import DeezerClient
     from app.mixes import build
 
 log = logging.getLogger(__name__)
 LANG_TTL = 86400
 GENRE_TTL = 7 * 86400
+DEEZER_GENRE_MAP_TTL = 30 * 86400
+# Last.fm's common English tag names, not translated UI labels or internal IDs (e.g. hiphop).
+LASTFM_GENRE_TAGS: dict[GenreId, str] = {
+    "rock": "rock", "metal": "metal", "electronic": "electronic", "hiphop": "hip hop",
+    "pop": "pop", "indie": "indie", "jazz": "jazz", "classical": "classical",
+}
 ENRICH_TIMEOUT = 2.0
 
 # Leave a neutral band around 0.5 to avoid classifying weak projections on the uncalibrated scale.
@@ -60,6 +67,23 @@ def normalize_genres(*labels: str | None) -> set[GenreId]:
     text = " ".join(unicodedata.normalize("NFKC", label).casefold() for label in labels if label)
     text = " ".join(re.findall(r"[^\W_]+", text))
     return {genre for genre, pattern in _PATTERNS.items() if pattern.search(text)}
+
+
+async def deezer_genre_ids(client: DeezerClient) -> dict[GenreId, int]:
+    """Select a chart ID per filter; prefer the canonical label over related labels (e.g. Jazz over Blues)."""
+    async def produce() -> dict[GenreId, int]:
+        matches: dict[GenreId, tuple[bool, int]] = {}
+        for row in await client.get_genres():
+            if not row["id"]:  # Deezer's aggregate genre is not a match for any filter.
+                continue
+            name = row["name"]
+            for genre in normalize_genres(name):
+                exact = name.casefold() == genre
+                if genre not in matches or (exact and not matches[genre][0]):
+                    matches[genre] = exact, row["id"]
+        return {genre: id_ for genre, (_, id_) in matches.items()}
+
+    return await cached("mix:dz_genre_ids", DEEZER_GENRE_MAP_TTL, produce)
 
 
 def _direct_ru(c: build.Cand) -> bool:

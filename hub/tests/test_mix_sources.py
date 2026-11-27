@@ -132,6 +132,34 @@ async def test_lastfm_similar_artists_and_tags(db, respx_mock: respx.MockRouter)
     assert await sources.lastfm_artist_tags("Кино") == ["russian rock", "post-punk", "rock", "russian", "80s"]
 
 
+async def test_lastfm_tag_top_artists_is_normalized_and_cached(db, respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.get(LASTFM).respond(json={"topartists": {"artist": [
+        {"name": "Johann Sebastian Bach", "@attr": {"rank": "1"}}, {"name": "Frédéric Chopin"}, {}]}})
+
+    expected = ["Johann Sebastian Bach", "Frédéric Chopin"]
+    assert await sources.lastfm_tag_top_artists("classical") == expected
+    assert await sources.lastfm_tag_top_artists("  Classical  ") == expected
+    assert route.call_count == 1
+    p = route.calls.last.request.url.params
+    assert (p["method"], p["tag"], p["limit"], p["api_key"], p["format"]) == (
+        "tag.gettopartists", "classical", "30", "test-key", "json")
+
+
+async def test_lastfm_tag_top_unknown_is_empty_and_cached(db, respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.get(LASTFM).respond(json={"error": 6, "message": "Tag not found"})
+    for _ in range(2):
+        assert await sources.lastfm_tag_top_artists("unknown tag") == []
+    assert route.call_count == 1
+
+
+async def test_lastfm_tag_top_source_down_is_not_cached(db, respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.get(LASTFM).respond(json={"error": 10, "message": "Invalid API key"})
+    for _ in range(2):
+        with pytest.raises(SourceDown, match="Invalid API key"):
+            await sources.lastfm_tag_top_artists("classical")
+    assert route.call_count == 2
+
+
 # --- Deezer -------------------------------------------------------------------------------------------------------
 
 
