@@ -134,6 +134,37 @@ docker compose -f docker-compose.prod.yml exec embedder python -c "import urllib
 
 `loaded: false` while idle is expected. A loaded CPU model reports `device: cpu` and `dim: 512`. The repository has no benchmark result for a particular VPS CPU; measure before promising processing time.
 
+## Android APK releases
+
+Build first from the `android` directory on Windows with `gradlew.bat :app:releaseHomemusicRelease`.
+From the repository root, publish the already-built APK before another Gradle build removes it:
+
+```powershell
+powershell.exe -NoProfile -File .\scripts\release-android.ps1 -Notes 'Release notes'
+```
+
+The script selects the highest version from the APK filenames and reads the signed APK's actual
+version with SDK Build Tools (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the default Windows SDK path).
+It saves the versioned APK, SHA-addressed artifacts, and `latest.json` under `dist/apk/`.
+The standard command publishes a full APK; to generate verified bsdiff patches from older APKs
+in the same output directory, use PowerShell 7 and pass `-DeltaClasspathFile` pointing to the file
+produced by `:app:writeHomeMusicDeltaClasspath` with `-PhmDeltaClasspathFile=<absolute path>`.
+
+Deploy the updated Hub before switching the manifest. On the VPS, create `${MUSIC_ROOT}/.apk/artifacts`
+(default `/srv/homemusic/.apk/artifacts`). Upload the versioned APK and files in `artifacts/` first,
+keeping their names and ensuring the Hub can read them. Do not remove old artifacts while downloads
+may be in flight. Upload `latest.json` as `.apk/latest.json.new` and then rename it in place:
+
+```bash
+mv /srv/homemusic/.apk/latest.json.new /srv/homemusic/.apk/latest.json
+curl -fsS https://hub.example.com/app/latest.json
+curl -fsS -D - -o /dev/null https://hub.example.com/app/latest.apk
+```
+
+No Hub restart is needed for subsequent APK-only releases. Android can update an existing installation
+only if the APK uses the same application ID and signing key. This repository's self-host APK uses
+`app.homemusic.selfhost`; an installation of `app.homemusic` is a different app.
+
 ## Updates and backups
 
 ```bash

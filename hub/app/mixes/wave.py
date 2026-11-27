@@ -84,12 +84,15 @@ HANDED_TTL_S = 3600.0  # a track handed out this long ago is not offered again u
 SOUND_WEIGHT = 1.0  # × (closeness to the session's likes − to its skips)
 QUEUED_BONUS = 0.3  # a track the client has queued already is not swapped for a hair better one
 SESSION_RADIO = "session_radio"
+FILTER_DISCOVERY = "filter_discovery"
+DISCOVERY_ARTIST_MAX = 2
+DISCOVERY_RETRY_S = 30.0  # don't keep the wave pending when sources have nothing new
 ARTIST_SONGS = "artist_songs"
 ARTIST_SONGS_MAX = 60  # the seed artist's library songs put in the pool
 ARTIST_ALBUMS_MAX = 30  # ... read from this many of their albums
 SESSION_WEIGHTS = {"seed": 10.0, SESSION_RADIO: 1.2, ARTIST_SONGS: 1.2}
 TITLES = {"seed": "С чего началась волна", SESSION_RADIO: "Похоже на понравившееся",
-          ARTIST_SONGS: "Песни исполнителя"}
+          ARTIST_SONGS: "Песни исполнителя", FILTER_DISCOVERY: "Подбор по фильтрам"}
 IDLE = timedelta(hours=24)  # a session not asked for this long is over
 KEEP = timedelta(days=7)  # ... and this long: its state is cleared to a summary (`CLEARED_KEYS`), the row stays
 CLEARED_KEYS = ("version", "taste_model", "gens", "started", "started_familiar", "skips", "seeds_used", "downloads")
@@ -284,6 +287,8 @@ class Runtime:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tasks: set[asyncio.Task] = field(default_factory=set)
     refilling: bool = False
+    discovery_after: dict[str, float] = field(default_factory=dict)
+    discovering: bool = False
     filter_relaxed: list[str] = field(default_factory=list)  # current response, reset by each handout
     # a session of another kind (the smart shuffle, app.mixes.smart) keeps its state in its own row, and a track
     # played to its end is not downloaded for it
@@ -483,6 +488,79 @@ def refill_generators(p: Profile, st: State, *, prioritized: list[TasteTrack] | 
     return _refill_gens(p, st, seeds[:REFILL_SEEDS])
 
 
+async def _discovery_library(filters: WaveFilters) -> list[CatalogTrack]:
+    # Match the same normalized labels as prepare(), including an album's library tag.
+    async with session_scope() as s:
+        query = select(Track, Album.genre).outerjoin(Album, Track.album_id == Album.id).where(
+            Track.nd_song_id.is_not(None))
+        if filters.genres:
+            query = query.where(or_(Track.genre.is_not(None), Album.genre.is_not(None)))
+        rows = await s.execute(query)
+        return [library_track(t, album_genre).model_copy(update={"album_artist": t.album_artist})
+                for t, album_genre in rows
+                if not filters.genres or wf.normalize_genres(t.genre, album_genre).intersection(filters.genres)]
+
+
+async def _discovery_deezer(filters: WaveFilters) -> list[CatalogTrack]:
+    if svc.deezer is None:
+        return []
+    # Plain search is only a hint, not a genre assertion. absorb() verifies the resulting metadata.
+    async def search(genre: str) -> list[CatalogTrack]:
+        query = "hip hop" if genre == "hiphop" else genre
+        try:
+            return (await svc.deezer.search(query, kinds=("track",), limit=POOL_LOW)).tracks
+        except Exception as e:
+            log.warning("wave: filter discovery (Deezer, %s) failed: %s", genre, e)
+            return []
+
+    batches = await asyncio.gather(*(search(genre) for genre in filters.genres))
+    return [t for batch in batches for t in batch]
+
+
+def _discovery_gen(rt: Runtime, source: str) -> build.Gen | None:
+    st = rt.state
+    now = time.monotonic()
+    if (not wf.active(st.filters) or len(st.pool) >= POOL_LOW or now < rt.discovery_after.get(source, 0)
+            or (source == "deezer" and (not st.filters.genres or svc.deezer is None))):
+        return None
+    rt.discovery_after[source] = now + DISCOVERY_RETRY_S
+    # Snapshot before awaiting the provider so a background fetch doesn't depend on mutable pool state.
+    existing = {*st.out, *st.pool, *st.pool_relaxed, *st.nofile, *st.skipped_refs, *st.handed}
+    heard = st.heard | st.no_file_fps | st.skipped_fps
+    in_pool: dict[str, int] = {}
+    for c in (*st.pool.values(), *st.out.values()):
+        if FILTER_DISCOVERY in c.gens:
+            in_pool[c.artist] = in_pool.get(c.artist, 0) + 1
+
+    async def fetch() -> list[CatalogTrack]:
+        try:
+            load = _discovery_library if source == "library" else _discovery_deezer
+            tracks = await asyncio.wait_for(load(st.filters), SOURCE_WAIT_S)
+            random.shuffle(tracks)
+            out: list[CatalogTrack] = []
+            seen: set[str] = set()
+            albums: set[tuple[str, str]] = set()
+            for t in tracks:
+                key, fp = artist_key(t.artist), fingerprint(t.artist, t.title)
+                album = ("", t.album_ref) if t.album_ref else (
+                    artist_key(t.album_artist or t.artist), (t.album_title or "").casefold())
+                if (not key or not fp or fp in heard or fp in seen or t.ref in existing
+                        or in_pool.get(key, 0) >= DISCOVERY_ARTIST_MAX or (album[1] and album in albums)):
+                    continue
+                seen.add(fp)
+                in_pool[key] = in_pool.get(key, 0) + 1
+                albums.add(album)
+                out.append(t)
+                if len(out) >= POOL_LOW:
+                    break
+            return out
+        except Exception as e:
+            log.warning("wave: filter discovery (%s) failed: %r", source, e)
+            return []
+
+    return fetch
+
+
 # --- the pool -----------------------------------------------------------------------------------------------------
 
 
@@ -605,6 +683,35 @@ async def _late(sid: str, rt: Runtime, task: asyncio.Task) -> None:
         log.exception("wave %s: a late source failed", sid)
 
 
+def _refill_discovery(sid: str, rt: Runtime) -> None:
+    st = rt.state
+    sources = ("library", "deezer") if st.filters.genres and svc.deezer is not None else ("library",)
+    now = time.monotonic()
+    if (rt.discovering or not wf.active(st.filters) or len(st.pool) >= POOL_LOW
+            or all(now < rt.discovery_after.get(source, 0) for source in sources)):
+        return
+    rt.discovering = True
+
+    async def run() -> None:
+        try:
+            for source in sources:
+                async with rt.lock:
+                    gen = _discovery_gen(rt, source)
+                if gen is not None:
+                    results = await build.run_generators({FILTER_DISCOVERY: gen})
+                    async with rt.lock:
+                        await absorb(rt, results)
+                        await (rt.save or _save)(sid, rt)
+        except Exception:
+            log.warning("wave %s: filter discovery refill failed", sid, exc_info=True)
+        finally:
+            rt.discovering = False
+
+    task = asyncio.create_task(run())
+    rt.tasks.add(task)
+    task.add_done_callback(rt.tasks.discard)
+
+
 def _refill(sid: str, rt: Runtime) -> None:
     """The pool runs low: the radios of the next seeds, in the background."""
     if rt.refilling or rt.profile is None:
@@ -614,8 +721,10 @@ def _refill(sid: str, rt: Runtime) -> None:
     chosen = []
     filtered = wf.active(rt.state.filters)
     seed_pool = _refill_seeds(profile, rt.state) if filtered else []
-    if filtered and not seed_pool:
-        return
+    if filtered:
+        _refill_discovery(sid, rt)
+        if not seed_pool:
+            return
     if v2 and not filtered:
         pool = [t for t in profile.seeds(get_settings().cfg.mixes.seeds * 4) if t.key not in rt.state.seeds_used]
         if not pool:
@@ -805,6 +914,11 @@ def _known_preview(st: State, c: build.Cand) -> bool:
     return c.track.ref in st.nofile or fp_of(c) in st.no_file_fps
 
 
+def _first_filters(c: build.Cand, filters: WaveFilters) -> WaveFilters:
+    # The explicitly selected track is the starting point, not a genre recommendation.
+    return filters.model_copy(update={"genres": []}) if filters.genres and "seed" in c.gens else filters
+
+
 def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: int = BATCH,
          queued: set[str] = frozenset(), first: build.Cand | None = None,
          values: dict[str, float] | None = None, *, prefix: tuple[build.Cand, ...] = (),
@@ -819,7 +933,7 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     cfg = get_settings().cfg.mixes if isinstance(p, V2Profile) else None
     if first is not None and (_known_preview(st, first)
                               or (eligible is not None and not eligible(first))
-                              or not wf.fit(first, st.filters, filter_level, energy=st.energy)):
+                              or not wf.fit(first, _first_filters(first, st.filters), filter_level, energy=st.energy)):
         first = None
     pools = (st.out, st.pool, st.pool_relaxed) if filter_level or st.filters.familiarity else (st.out, st.pool)
     candidates = [c for pool in pools for c in pool.values()
@@ -1295,6 +1409,10 @@ async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
                       deadline: float) -> build.Cand | None:
     """Absorb sources as they answer; prefer a local candidate or verify a catalog pick by the deadline."""
     pending = {asyncio.create_task(build.run_generators({name: gen})) for name, gen in gens}
+    library_task = None
+    if deadline > time.monotonic() and (gen := _discovery_gen(rt, "library")) is not None:
+        library_task = asyncio.create_task(build.run_generators({FILTER_DISCOVERY: gen}))
+        pending.add(library_task)
     first = None
     probe_task: asyncio.Task | None = None
     try:
@@ -1325,6 +1443,8 @@ async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
                 if local:
                     first = local[0]
                     break
+                if library_task in source_done and (gen := _discovery_gen(rt, "deezer")) is not None:
+                    pending.add(asyncio.create_task(build.run_generators({FILTER_DISCOVERY: gen})))
             if probe_task in done:
                 checked = probe_task.result()
                 probe_task = None
@@ -1378,9 +1498,9 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     if seed_track is None and seed_artist is None:
         if isinstance(profile, V2Profile):
             seeds = profile_seeds or []
-        else:
+        elif not (active and profile.empty):
             seeds = profile.seeds(cfg.seeds * 4 if active else cfg.seeds) or await build.cold_seeds(profile, cfg.seeds)
-        if profile.empty or not seeds:
+        if not active and (profile.empty or not seeds):
             raise WaveError(409, "Волне не от чего оттолкнуться: послушайте что-нибудь или выберите исполнителей")
         if active:
             if isinstance(profile, V2Profile):
@@ -1418,7 +1538,7 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
             if active:
                 await wf.prepare([first], filters)
                 await _fetch_energy(rt.state, [first])
-                if not wf.matches(first, filters, energy=rt.state.energy):
+                if not wf.matches(first, _first_filters(first, filters), energy=rt.state.energy):
                     rt.state.put(first)
                     first = None
     gens = list((generators(profile, seed_track, seed_artist, seeds, filters=filters) if active
@@ -1661,7 +1781,10 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
             preferred = None
 
     await fill(0, first)
-    if active and not rt.tasks:
+    # A partial strict discovery batch is preferable to padding it with off-filter tracks.
+    strict_discovery = active and any(FILTER_DISCOVERY in c.gens and wf.matches(c, st.filters, energy=st.energy)
+                                      for c in (*kept, *added))
+    if active and not rt.tasks and not strict_discovery:
         for level in ((1, 2, 3, 4) if st.filters.energy else (1, 3, 4)):
             if len(added) >= n or rt.tasks:
                 break
@@ -1672,7 +1795,8 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
     kept = [c for _, c in queued_ok]
     added = [c for c in added if not _known_preview(st, c)]
     if active:
-        rt.filter_relaxed = wf.relaxed_axes(kept + added, st.filters, energy=st.energy)
+        recommendations = [c for c in kept + added if not (c is first and "seed" in c.gens)]
+        rt.filter_relaxed = wf.relaxed_axes(recommendations, st.filters, energy=st.energy)
         if not kept and not added and not rt.tasks:
             rt.filter_relaxed.append("exhausted")
     rt._wave_probe_elapsed = time.monotonic() - probe_started

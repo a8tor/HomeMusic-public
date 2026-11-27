@@ -250,7 +250,8 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
   if (startRequest) return false;
   cancelFilterRestart();
   const own = !seed;
-  const selected = filters ?? (own && !canPlayWave() ? ownFilters : undefined);
+  const byTrack = seed && !seed.by_artist && (seed.ref || seed.nd_song_id);
+  const selected = filters ?? ((own || byTrack) && !canPlayWave() ? ownFilters : undefined);
   const ctl = new AbortController();
   startRequest = ctl;
   starting = seedKey(seed);
@@ -269,7 +270,7 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
     const picks = picksOf(w);
     const relaxed = w.filter_relaxed ?? [];
     if (!picks.length) {
-      const panelOwnsMessage = own && sameFilters(requestedFilters, ownFilters);
+      const panelOwnsMessage = sameFilters(requestedFilters, ownFilters);
       if (panelOwnsMessage) filterRelaxed = relaxed;
       if (relaxed.includes('exhausted')) {
         if (!panelOwnsMessage) toast('По этим фильтрам треки закончились');
@@ -295,7 +296,7 @@ export async function startWave(seed: WaveSeedIn | null | undefined, origin: Wav
       listenAll(tracks, { shuffle: false, context: s.context });
       session = s;
     }
-    if (own && sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
+    if (sameFilters(requestedFilters, ownFilters)) filterRelaxed = relaxed;
     return true;
   } catch (e) {
     if (!ctl.signal.aborted && !isAbort(e)) {
@@ -348,7 +349,7 @@ async function ask() {
     if (session !== s) return;
     const relaxed = w.filter_relaxed ?? [];
     const exhausted = relaxed.includes('exhausted');
-    const panelOwnsMessage = s.own && sameFilters(s.requestedFilters, ownFilters);
+    const panelOwnsMessage = sameFilters(s.requestedFilters, ownFilters);
     if (panelOwnsMessage) {
       filterRelaxed = relaxed;
       emit();
