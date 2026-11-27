@@ -46,7 +46,12 @@ GENRES: dict[GenreId, str] = {
     "pop": r"\b(?:pop|disco|estrada)\b|\b(?:поп|диско|эстрад)",
     "indie": r"\b(?:indie|shoegaze|dream pop|lo ?fi|folk|acoustic)\b|\b(?:инди|фолк)",
     "jazz": r"\b(?:jazz|blues|soul|funk)\b|\b(?:джаз|блюз|соул|фанк)",
-    "classical": r"\b(?:classical|neoclassical|soundtrack|ost|orchestral|piano)\b|\b(?:классик|саундтрек)",
+    # Keep bare Last.fm tags, but exclude known non-classical compounds.
+    "classical": (r"\b(?:classical|neoclassical|soundtrack|ost|orchestral|orchestras?|piano|"
+                  r"klassik|klassisch(?:e[mnrs]?)?|symphon(?:y|ies)|symphonic (?:music|orchestras?|works?))\b|"
+                  r"\b(?:baroque|chamber)\b(?! pop\b)|\b(?<!space )(?<!soap )operas?\b|"
+                  r"\b(?:классик|классическ|саундтрек|оперн)|\bопера\b|"
+                  r"\b(?:барочн|симфоническ|камерн)\w*\b(?! (?:поп|метал\w*|рок)\b)"),
 }
 _PATTERNS = {genre: re.compile(pattern) for genre, pattern in GENRES.items()}
 

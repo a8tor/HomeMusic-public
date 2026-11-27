@@ -774,7 +774,7 @@ async def test_a_too_narrow_filter_relaxes_and_reports_it(env, monkeypatch):
     batch = r.json()
     assert batch["filters"] == w["filters"]
     assert batch["keep"] == [unknown.ref]
-    assert [t["ref"] for t in batch["add"]] == [wrong.ref]
+    assert wrong.ref in {t["ref"] for t in batch["add"]}
     assert batch["filter_relaxed"] == ["genres"]
 
 

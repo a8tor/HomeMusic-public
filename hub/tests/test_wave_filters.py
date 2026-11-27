@@ -53,6 +53,44 @@ def test_normalize_genres(label, expected):
     assert normalize_genres(label) == expected
 
 
+@pytest.mark.parametrize("label", [
+    "baroque",
+    "opera",
+    "operas",
+    "klassik",
+    "klassische",
+    "chamber",
+    "chamber music",
+    "Chamber_Music",
+    "symphony",
+    "symphonies",
+    "symphonic music",
+    "orchestra",
+    pytest.param("классика", id="ru-klassika"),
+    pytest.param("классическая музыка", id="ru-classical"),
+    pytest.param("симфоническая музыка", id="ru-symphonic"),
+    pytest.param("опера", id="ru-opera"),
+    pytest.param("оперная музыка", id="ru-operatic"),
+    pytest.param("барочная музыка", id="ru-baroque"),
+    pytest.param("камерная музыка", id="ru-chamber"),
+])
+def test_normalize_classical_genres(label):
+    assert normalize_genres(label) == {"classical"}
+
+
+@pytest.mark.parametrize(("label", "expected"), [
+    ("symphonic metal", {"metal"}),
+    ("symphonic rock", {"rock"}),
+    ("chamber pop", {"pop"}),
+    ("baroque pop", {"pop"}),
+    ("space opera", set()),
+    ("soap opera", set()),
+    pytest.param("симфонический метал", {"metal"}, id="ru-symphonic-metal"),
+])
+def test_normalize_classical_genre_collisions(label, expected):
+    assert normalize_genres(label) == expected
+
+
 def test_track_genres_uses_prepared_genres_when_present():
     track = CatalogTrack(ref="nd:1", source="nd", id="1", title="Song", artist="Band", genre="Grunge")
     assert track_genres(Cand(track)) == {"rock"}
