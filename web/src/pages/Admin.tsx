@@ -376,11 +376,11 @@ function CreateInviteSheet({ open, onClose, onCreated }: { open: boolean; onClos
   );
 }
 
-function inviteMessage(inv: InviteOut, hubUrl: string): string {
-  const apk = `${hubUrl.replace(/\/$/, '')}/app/latest.apk`;
+function inviteMessage(inv: InviteOut, hubUrl?: string): string {
+  const apk = `${(hubUrl ?? '').trim().replace(/\/+$/, '')}/app/latest.apk`;
   return [
     `Приглашение в HomeMusic${inv.note ? ` для: ${inv.note}` : ''}.`,
-    `1. Установите приложение: ${apk}`,
+    `1. Установите приложение (APK для Android): ${apk}`,
     '2. На экране входа нажмите «Далее», затем «Регистрация по коду».',
     `3. Введите код ${inv.code} и придумайте имя и пароль.`,
     `Код действует до ${fmtDate(inv.expires_at)}.`,
@@ -390,7 +390,7 @@ function inviteMessage(inv: InviteOut, hubUrl: string): string {
 function InviteSheet({ invite, onClose }: { invite?: InviteOut; onClose: () => void }) {
   const { me } = useSession();
   if (!invite) return null;
-  const text = inviteMessage(invite, me.public_hub_url || window.location.origin);
+  const text = inviteMessage(invite, me.public_hub_url);
   const copy = async (what: string, done: string) => toast((await copyText(what)) ? done : 'Не удалось скопировать', 'success');
   return (
     <Sheet open onClose={onClose} title="Код приглашения">

@@ -25,6 +25,7 @@ hub/app/static/
 .agent-work/
 data/
 /release/
+/dist/apk/
 eval/screenshots/
 eval/results/
 # manual design-review screenshots (only screenshot-test baselines go into git)

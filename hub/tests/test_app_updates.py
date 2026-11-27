@@ -41,6 +41,7 @@ async def test_immutable_artifacts_and_invalid_patch_are_filtered(client, tmp_pa
     (directory / patch_name).write_bytes(patch_bytes)
     patch = {"url": f"/app/artifacts/{patch_name}", "size": len(patch_bytes), "sha256": patch_hash,
              "baseVersionCode": 2, "baseSha256": "a" * 64, "format": "bsdiff40-v1"}
+    (tmp_path / "HomeMusic-1.0.1-3.apk").write_bytes(apk)
     (tmp_path / "latest.json").write_text(json.dumps({"file": "HomeMusic-1.0.1-3.apk", "versionCode": 3, "size": len(apk), "sha256": digest, "full": full,
                                                       "patches": [patch, {"url": "/app/artifacts/../../secret"}]}))
     async with client:
@@ -146,13 +147,54 @@ async def test_artifact_must_match_its_own_name_hash(client, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_latest_uses_the_versioned_file_and_does_not_cache_the_alias(client, tmp_path):
+    async with client:
+        for version, code in [("1.0.1", 100010), ("1.0.2", 100020)]:
+            name = f"app-homemusic-release-{version}.apk"
+            apk = version.encode()
+            (tmp_path / name).write_bytes(apk)
+            (tmp_path / "latest.json").write_text(json.dumps({
+                "file": name, "versionName": version, "versionCode": code,
+                "size": len(apk), "sha256": hashlib.sha256(apk).hexdigest(),
+            }))
+            manifest = await client.get("/app/latest.json")
+            assert manifest.status_code == 200
+            assert manifest.headers["cache-control"] == "no-cache"
+            assert manifest.json()["versionCode"] == code
+            result = await client.get(manifest.json()["url"])
+            assert result.status_code == 200
+            assert result.content == apk
+            assert result.headers["content-disposition"] == f'attachment; filename="{name}"'
+            assert result.headers["cache-control"] == "no-cache"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apk", [None, b"wrong size"], ids=["missing-apk", "wrong-size"])
+async def test_unavailable_release_is_not_advertised(client, tmp_path, apk):
+    name = "app-homemusic-release-1.0.2.apk"
+    (tmp_path / "app-homemusic-release-1.0.1.apk").write_bytes(b"old")
+    (tmp_path / "latest.json").write_text(json.dumps({"file": name, "size": 3}))
+    if apk is not None:
+        (tmp_path / name).write_bytes(apk)
+    async with client:
+        for url in ("/app/latest.json", "/app/latest.apk"):
+            result = await client.get(url)
+            assert result.status_code == 503
+            assert "APK из манифеста" in result.json()["detail"]
+            assert result.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("content", [None, "not json", "[]"], ids=["missing", "garbage", "not-an-object"])
 async def test_missing_or_broken_manifest_is_a_404(client, tmp_path, content):
     if content is not None:
         (tmp_path / "latest.json").write_text(content)
     async with client:
-        assert (await client.get("/app/latest.json")).status_code == 404
-        assert (await client.get("/app/latest.apk")).status_code == 404
+        for url in ("/app/latest.json", "/app/latest.apk"):
+            result = await client.get(url)
+            assert result.status_code == 404
+            assert "манифест отсутствует или повреждён" in result.json()["detail"]
+            assert result.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.asyncio

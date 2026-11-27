@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-  One command for every Android release: pwsh -File .\scripts\release-android.ps1 -Notes 'What is new'
+  Publish a built APK: powershell.exe -NoProfile -File .\scripts\release-android.ps1 -Notes 'What is new'
 
 .DESCRIPTION
-  Assigns the version, runs the unit tests, builds the signed release APK, prepares direct bsdiff patches from
-  several earlier releases, proves that each patch restores the exact APK, publishes the immutable files and
-  switches latest.json last (atomically). Re-running after a failure or after a finished release is safe.
-  -StagePath / -AndroidPath / -HubUrl exist only for rehearsals outside the live release directory.
+  Publishes the highest versioned APK from the Android release output to dist/apk (or -StagePath).
+  Verifies the embedded version and signature, installs immutable files, and switches latest.json last.
+  With PowerShell 7 and -DeltaClasspathFile, also builds and verifies bsdiff patches from archived APKs.
+  -BuildAndPublish preserves the original Windows build-and-publish workflow (PowerShell 7).
 
   -Prebuild (no publication): run it in a task's Android worktree before the merge, e.g.
     pwsh -File .\scripts\release-android.ps1 -Prebuild -AndroidPath <Android worktree>
@@ -20,6 +20,8 @@
 param(
     [string]$Notes,
     [switch]$Prebuild,
+    [switch]$BuildAndPublish,
+    [string]$DeltaClasspathFile,
     [string]$VersionName,
     [string]$StagePath,
     [string]$AndroidPath,
@@ -27,9 +29,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$production = [IO.Path]::GetFullPath('B:\Music\.apk').TrimEnd('\')
-$staging = -not [string]::IsNullOrWhiteSpace($StagePath)
-$destination = if ($staging) { [IO.Path]::GetFullPath($StagePath).TrimEnd('\') } else { $production }
+$production = 'B:\Music\.apk'
+$publishExisting = -not ($Prebuild -or $BuildAndPublish)
+if (-not $publishExisting -and $PSVersionTable.PSVersion.Major -lt 7) { throw 'The legacy Gradle workflow requires PowerShell 7.' }
+if ($publishExisting -and $VersionName) { throw 'VersionName comes from the built APK; do not pass -VersionName.' }
+if ($DeltaClasspathFile -and (-not $publishExisting -or $PSVersionTable.PSVersion.Major -lt 7)) { throw '-DeltaClasspathFile requires PowerShell 7 and a prebuilt APK.' }
+if ($DeltaClasspathFile) { $DeltaClasspathFile = (Resolve-Path -LiteralPath $DeltaClasspathFile).Path }
+$customStage = -not [string]::IsNullOrWhiteSpace($StagePath)
+$staging = $publishExisting -or $customStage
+$destination = if ($customStage) { [IO.Path]::GetFullPath($StagePath).TrimEnd('\') } elseif ($publishExisting) { Join-Path $root 'dist\apk' } else { $production }
 if ($staging -and ($destination -ieq $production -or $destination.StartsWith($production + '\', [StringComparison]::OrdinalIgnoreCase))) { throw 'Staging directory must be outside the live release directory.' }
 if ($staging) {
     $ancestor = $destination
@@ -49,15 +57,22 @@ $HubUrl = $HubUrl.TrimEnd('/')
 $AndroidPath = [IO.Path]::GetFullPath($AndroidPath)
 $Notes = "$Notes".Trim()
 if (-not $Prebuild -and ($Notes.Length -eq 0 -or $Notes.Length -gt 2000)) { throw 'Notes must be 1-2000 characters.' }
-$env:GRADLE_USER_HOME = 'B:\AndroidEmu\gradle-home'
-$env:JAVA_HOME = 'B:\AndroidEmu\gradle-home\jdks\jdk-21.0.12.1+1'
-$env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch '"' }) -join ';'
-$java = Join-Path $env:JAVA_HOME 'bin\java.exe'
-$sdk = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { 'B:\AndroidEmu\Sdk' }
-$tools = Get-ChildItem (Join-Path $sdk 'build-tools') -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+if (-not $publishExisting) {
+    $env:GRADLE_USER_HOME = 'B:\AndroidEmu\gradle-home'
+    $env:JAVA_HOME = 'B:\AndroidEmu\gradle-home\jdks\jdk-21.0.12.1+1'
+    $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch '"' }) -join ';'
+}
+$java = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME 'bin\java.exe' } else { 'java.exe' }
+$sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($publishExisting) { Join-Path $env:LOCALAPPDATA 'Android\Sdk' } else { 'B:\AndroidEmu\Sdk' }
+$tools = Get-ChildItem -LiteralPath (Join-Path $sdk 'build-tools') -Directory | Where-Object {
+    $_.Name -match '^\d+\.\d+\.\d+$' -and (Test-Path (Join-Path $_.FullName 'aapt.exe')) -and (Test-Path (Join-Path $_.FullName 'apksigner.bat'))
+} | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+if (-not $tools) { throw 'Install Android SDK Build Tools with aapt and apksigner, and set ANDROID_HOME.' }
 $aapt = Join-Path $tools.FullName 'aapt.exe'
 $apksigner = Join-Path $tools.FullName 'apksigner.bat'
 $legacyName = '^HomeMusic-(\d+\.\d+\.\d+)-(\d+)\.apk$'
+$versionedName = '^app-homemusic-release-(\d+\.\d+\.\d+)\.apk$'
+$packageId = 'app.homemusic.selfhost'
 $maxApk = 128MB          # client limits (UpdateDelta.kt)
 $maxDeltaApk = 32MB
 $maxPatch = 16MB
@@ -165,15 +180,16 @@ function Info-Raw([string]$Path) {
 }
 # aapt + apksigner verdicts of APKs that are already on disk. An APK is immutable and its verdict depends only on its bytes
 # and the build-tools version, so the verdict is cached by SHA-256: every release otherwise re-verified all earlier APKs.
-$infoCachePath = 'B:\AndroidEmu\release-cache\apk-info.json'
+$infoCachePath = if ($publishExisting) { Join-Path $env:LOCALAPPDATA 'HomeMusic\release-cache\apk-info.json' } else { 'B:\AndroidEmu\release-cache\apk-info.json' }
 $infoCache = @{}
 $infoCacheDirty = $false
 if (Test-Path -LiteralPath $infoCachePath) {
     try {
-        foreach ($entry in (Get-Content -Raw -Encoding utf8 -LiteralPath $infoCachePath | ConvertFrom-Json -AsHashtable).GetEnumerator()) {
+        $cached = Get-Content -Raw -Encoding utf8 -LiteralPath $infoCachePath | ConvertFrom-Json
+        foreach ($entry in $cached.PSObject.Properties) {
             $v = $entry.Value
             if ($v.package -is [string] -and $v.version -is [string] -and $v.cert -match '^[0-9a-f]{64}$' -and $v.code -is [ValueType]) {
-                $infoCache[$entry.Key] = @{ package=$v.package; code=[long]$v.code; version=$v.version; cert=$v.cert }
+                $infoCache[$entry.Name] = @{ package=$v.package; code=[long]$v.code; version=$v.version; cert=$v.cert }
             }
         }
     } catch { Write-Warning 'APK info cache is unreadable and is ignored.'; $infoCache = @{} }
@@ -204,7 +220,7 @@ function Resolve-ReleaseApk([string]$Dir, [long]$Code, [string]$Name) {
     if (-not (Test-Path -LiteralPath $metaPath)) { throw 'Build output metadata missing.' }
     $meta = Get-Content -Raw -Encoding utf8 -LiteralPath $metaPath | ConvertFrom-Json
     $elements = @($meta.elements)
-    if ($meta.applicationId -ne 'app.homemusic' -or $meta.variantName -ne 'homemusicRelease' -or $meta.artifactType.type -ne 'APK') { throw 'Build metadata describes another artifact.' }
+    if ($meta.applicationId -ne $packageId -or $meta.variantName -ne 'homemusicRelease' -or $meta.artifactType.type -ne 'APK') { throw 'Build metadata describes another artifact.' }
     if ($elements.Count -ne 1) { throw 'Expected exactly one release APK in build metadata.' }
     $element = $elements[0]
     if ($element.type -ne 'SINGLE' -or @($element.filters).Count -ne 0) { throw 'Release APK is not universal (ABI or density split).' }
@@ -214,6 +230,14 @@ function Resolve-ReleaseApk([string]$Dir, [long]$Code, [string]$Name) {
     $path = Join-Path $Dir $file
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Release APK named by build metadata is missing: $file" }
     return $path
+}
+function Find-VersionedApk([string]$Dir) {
+    $file = Get-ChildItem -LiteralPath $Dir -File -Filter 'app-homemusic-release-*.apk' |
+        Where-Object { $_.Name -cmatch $versionedName } |
+        Sort-Object { $_.Name -match $versionedName | Out-Null; [version]$Matches[1] } -Descending |
+        Select-Object -First 1
+    if (-not $file) { throw "No versioned APK in $Dir. Build :app:releaseHomemusicRelease before publishing." }
+    return $file
 }
 # Copies a file that a concurrent build might still be writing: the source must not change while it is copied.
 function Copy-Stable([string]$Source, [string]$Target) {
@@ -232,6 +256,7 @@ function Install-Immutable([string]$Source, [string]$Target) {
     $tmp = "$Target.$([guid]::NewGuid().ToString('N')).tmp"
     try {
         [IO.File]::Copy($Source, $tmp, $false)
+        (Get-Item -LiteralPath $tmp).IsReadOnly = $false
         [IO.File]::SetLastWriteTimeUtc($tmp, [DateTime]::UtcNow)
         [IO.File]::Move($tmp, $Target)
         (Get-Item -LiteralPath $Target).IsReadOnly = $true
@@ -256,7 +281,8 @@ function Read-Latest([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     try { $value = Get-Content -Raw -Encoding utf8 -LiteralPath $Path | ConvertFrom-Json } catch { throw 'Invalid latest.json; release stopped.' }
     if ($value.versionCode -isnot [long] -and $value.versionCode -isnot [int]) { throw 'Invalid versionCode in latest.json.' }
-    if ($value.versionCode -lt 1 -or $value.versionName -notmatch '^\d+\.\d+\.\d+$' -or $value.file -notmatch $legacyName) { throw 'Invalid existing release metadata.' }
+    if ($value.versionCode -lt 1 -or $value.versionName -notmatch '^\d+\.\d+\.\d+$' -or
+        ($value.file -cnotmatch $legacyName -and $value.file -cnotmatch $versionedName)) { throw 'Invalid existing release metadata.' }
     return $value
 }
 # The version of the next release. One function for the real release and for -Prebuild, so that they cannot disagree (a
@@ -308,11 +334,11 @@ if ($Prebuild) {
     return
 }
 
-Check-Source
+if (-not $publishExisting) { Check-Source }
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 try { $lock = [IO.File]::Open((Join-Path $destination '.release.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
 catch { throw 'Another release is running for this directory.' }
-$scratchRoot = 'B:\AndroidEmu\tmp'
+$scratchRoot = if ($publishExisting) { [IO.Path]::GetTempPath() } else { 'B:\AndroidEmu\tmp' }
 New-Item -ItemType Directory -Force -Path $scratchRoot | Out-Null
 $temp = Join-Path $scratchRoot ("homemusic-release-" + [guid]::NewGuid().ToString('N'))
 try {
@@ -321,8 +347,9 @@ try {
     $latest = $null
     $latestHash = if (Test-Path -LiteralPath $latestPath) { Hash $latestPath } else { $null }
     if ($latestHash) { $latest = Read-Latest $latestPath }
-    $sourceId = Source-Id
-    if ($latest -and $latest.androidCommit -eq $sourceId) {
+    if (-not $publishExisting -and $latest.file -cmatch $versionedName) { throw 'This directory uses versioned APKs; publish a prebuilt APK instead.' }
+    $sourceId = if (-not $publishExisting) { Source-Id }
+    if (-not $publishExisting -and $latest -and $latest.androidCommit -eq $sourceId) {
         # Same sources as the published release: nothing to build, only prove that the published files are intact.
         Test-Published $latest
         if (-not $staging) { Check-Live $latest.versionCode $latest.sha256 }
@@ -330,47 +357,55 @@ try {
         return
     }
     # Files of an earlier run that failed before latest.json was switched were never offered to anyone: reuse their numbers.
-    if ($latest) {
+    if (-not $publishExisting -and $latest) {
         Get-ChildItem -LiteralPath $destination -File | Where-Object { $_.Name -match $legacyName -and [long]$Matches[2] -gt [long]$latest.versionCode } | ForEach-Object {
             Write-Host "Removing unpublished leftover of a failed run: $($_.Name)"
             Remove-Item -LiteralPath $_.FullName -Force
         }
     }
-    $next = Get-NextVersion $latest
-    $code = $next.code
-    $VersionName = $next.name
     $previousCert = $null
     if ($latest) {
         $old = Join-Path $destination $latest.file
         if (-not (Test-Path -LiteralPath $old)) { throw 'Previous APK missing.' }
         if ($latest.sha256 -and (Hash $old) -ine $latest.sha256) { throw 'Previous APK hash mismatch.' }
-        $oldInfo = Info-Cached $old ($latest.sha256 ? ([string]$latest.sha256).ToLowerInvariant() : (Hash $old))
-        if ($oldInfo.package -ne 'app.homemusic' -or $oldInfo.code -ne $latest.versionCode -or $oldInfo.version -ne $latest.versionName) { throw 'Previous APK metadata mismatch.' }
+        $oldSha = if ($latest.sha256) { ([string]$latest.sha256).ToLowerInvariant() } else { Hash $old }
+        $oldInfo = Info-Cached $old $oldSha
+        if ($oldInfo.package -ne $packageId -or $oldInfo.code -ne $latest.versionCode -or $oldInfo.version -ne $latest.versionName) { throw 'Previous APK metadata mismatch (updates require the same package ID).' }
         $previousCert = $oldInfo.cert
     }
-    $classpathFile = Join-Path $temp 'classpath.txt'
-    # A stale APK from an earlier build must never be mistaken for this one.
     $outputDir = Join-Path $AndroidPath 'app\build\outputs\apk\homemusic\release'
-    if (Test-Path -LiteralPath $outputDir) { Remove-Item -LiteralPath $outputDir -Recurse -Force }
-    # The unit tests are not repeated when a full green run of exactly this commit on a clean tree is on record (build.gradle,
-    # recordHomeMusicTestsPassed). Anything else - a dirty tree, a new commit, a filtered or failed run - runs them here.
-    $gradleTasks = @('assembleHomemusicRelease', ':app:writeHomeMusicDeltaClasspath')
-    $testsSkipped = Test-TestsRecorded
-    if ($testsSkipped) { Write-Host 'Unit tests: skipped, a green full run of this exact commit is on record.' }
-    else { $gradleTasks = @('testHomemusicDebugUnitTest') + $gradleTasks }
-    if (-not (Test-CacheEnabled)) { Write-Warning 'org.gradle.caching=true is missing in gradle.properties: the release cannot reuse a prebuild.' }
-    Warn-EolDrift
-    Push-Location $AndroidPath
-    try { Measure-Stage 'gradle' { Invoke-Checked '.\gradlew.bat' ($gradleTasks + @("-PhmVersionCode=$code", "-PhmVersionName=$VersionName", "-PhmDeltaClasspathFile=$classpathFile")) } } finally { Pop-Location }
-    # R8 and lint alone take about two minutes without the cache, so a long Gradle stage means that the cache missed.
-    $gradleSeconds = $timings['gradle'].seconds
-    if ($testsSkipped -and $gradleSeconds -gt 60) { Write-Warning ("Gradle took {0:N0} s: the build cache was probably missed. Run -Prebuild -AndroidPath <task worktree> before the merge; it must get the same version ({1}) and commit." -f $gradleSeconds, $VersionName) }
-    $apk = Resolve-ReleaseApk $outputDir $code $VersionName
-    $snapshot = Join-Path $temp 'release.apk'
-    Copy-Stable $apk $snapshot          # every check and every patch below uses this immutable copy
-    $apk = $snapshot
+    $classpathFile = $DeltaClasspathFile
+    if ($publishExisting) {
+        $selected = Find-VersionedApk $outputDir
+        $sourceApk = $selected.FullName
+        $downloadName = $selected.Name
+        $null = $downloadName -cmatch $versionedName
+        $VersionName = $Matches[1]
+    } else {
+        $next = Get-NextVersion $latest
+        $code, $VersionName = $next.code, $next.name
+        $classpathFile = Join-Path $temp 'classpath.txt'
+        $gradleTasks = @('assembleHomemusicRelease', ':app:writeHomeMusicDeltaClasspath')
+        if (-not (Test-TestsRecorded)) { $gradleTasks = @('testHomemusicDebugUnitTest') + $gradleTasks }
+        Warn-EolDrift
+        Push-Location $AndroidPath
+        try { Measure-Stage 'gradle' { Invoke-Checked '.\gradlew.bat' ($gradleTasks + @("-PhmVersionCode=$code", "-PhmVersionName=$VersionName", "-PhmDeltaClasspathFile=$classpathFile")) } } finally { Pop-Location }
+        $sourceApk = Resolve-ReleaseApk $outputDir $code $VersionName
+        $downloadName = "HomeMusic-$VersionName-$code.apk"
+    }
+    $apk = Join-Path $temp 'release.apk'
+    Copy-Stable $sourceApk $apk
     $info = Info $apk
-    if ($info.package -ne 'app.homemusic' -or $info.code -ne $code -or $info.version -ne $VersionName -or ($previousCert -and $info.cert -ne $previousCert)) { throw 'Release APK metadata or certificate mismatch.' }
+    if ($publishExisting) { $code = $info.code }
+    if ($info.package -ne $packageId -or $code -lt 1 -or $code -gt 2100000000 -or $info.code -ne $code -or $info.version -cne $VersionName -or ($previousCert -and $info.cert -ne $previousCert)) { throw 'Release APK metadata or certificate mismatch.' }
+    if ($publishExisting -and $latest) {
+        if ($latest.file -ceq $downloadName -and $latest.versionCode -eq $code -and $latest.sha256 -eq (Hash $apk)) {
+            Test-Published $latest
+            Write-Host "Already published: $VersionName ($code) in $destination."
+            return
+        }
+        if ($code -le $latest.versionCode -or [version]$VersionName -le [version]$latest.versionName) { throw 'Release version and versionCode must be newer than latest.json.' }
+    }
     # DEX stored uncompressed (build.gradle) keeps patches several times smaller; a compressed DEX would silently lose that.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($apk)
@@ -386,18 +421,27 @@ try {
     New-Item -ItemType Directory -Force $artifacts | Out-Null
     $fullName = "apk-$sha.apk"
     $patches = @()
-    $classpath = Get-Content -Raw -LiteralPath $classpathFile
-    $candidates = Get-ChildItem -LiteralPath $destination -File | Where-Object { $_.Name -match $legacyName -and [long]$Matches[2] -lt $code } | Sort-Object { [long]($_.BaseName -replace '^.*-', '') } -Descending | Select-Object -First $patchBases
+    $candidates = @()
+    if ($classpathFile) {
+        $classpath = (Get-Content -Raw -LiteralPath $classpathFile).Trim()
+        if (-not $classpath) { throw 'Delta classpath is empty.' }
+        $candidates = Get-ChildItem -LiteralPath $destination -File | Where-Object {
+            ($_.Name -match $legacyName -and [long]$Matches[2] -lt $code) -or
+            ($_.Name -cmatch $versionedName -and [version]$Matches[1] -lt [version]$VersionName)
+        } | Sort-Object { [version]([regex]::Match($_.Name, '\d+\.\d+\.\d+').Value) } -Descending
+    }
     # Phase 1 (serial, cheap): which earlier APKs get a patch.
     $work = @()
     foreach ($candidate in $candidates) {
         if ($candidate.Length -gt $maxDeltaApk -or $size -gt $maxDeltaApk) { Write-Host "Skip $($candidate.Name): above the delta size limit."; continue }
         $baseSha = Hash $candidate.FullName
         $baseInfo = Info-Cached $candidate.FullName $baseSha
-        $fileCode = [long]($candidate.BaseName -replace '^.*-', '')
-        if ($baseInfo.code -ne $fileCode -or ($latest -and $baseInfo.code -gt $latest.versionCode)) { continue }
+        if ($candidate.Name -match $legacyName -and $baseInfo.code -ne [long]$Matches[2]) { continue }
+        if ($baseInfo.code -lt 1 -or $baseInfo.code -ge $code -or ($latest -and $baseInfo.code -gt $latest.versionCode)) { continue }
         if ($baseInfo.package -ne 'app.homemusic' -or $baseInfo.cert -ne $info.cert) { Write-Host "Skip $($candidate.Name): another package or signature."; continue }
+        if ($work.Sha -contains $baseSha) { continue }
         $work += [pscustomobject]@{ Name = $candidate.Name; Path = $candidate.FullName; Sha = $baseSha; Info = $baseInfo }
+        if ($work.Count -ge $patchBases) { break }
     }
     Save-InfoCache
     # Phase 2 (parallel, one worker per base): bsdiff, then the phone's own restore, compared byte for byte with the release.
@@ -431,11 +475,12 @@ try {
         $patches += @{ baseVersionCode=$r.Item.Info.code; baseSha256=$r.Item.Sha; format='bsdiff40-v1'; size=$r.Size; sha256=$r.Sha; url="/app/artifacts/$patchName" }
         Write-Host "Delta from $($r.Item.Info.version) ($($r.Item.Info.code)): $($r.Size) bytes (full $size); roundtrip OK"
     }
-    Check-Source
-    if ((Source-Id) -ne $sourceId) { throw 'Android sources changed during release.' }
+    if (-not $publishExisting) {
+        Check-Source
+        if ((Source-Id) -ne $sourceId) { throw 'Android sources changed during release.' }
+    }
     Install-Immutable $apk (Join-Path $artifacts $fullName)
-    $legacy = "HomeMusic-$VersionName-$code.apk"
-    Install-Immutable $apk (Join-Path $destination $legacy)
+    Install-Immutable $apk (Join-Path $destination $downloadName)
     if ($staging -and $HubUrl -eq 'http://localhost:8080') {
         Write-Host 'Staging: the Hub download check is skipped (no -HubUrl).'
     } else {
@@ -467,7 +512,8 @@ try {
     }
     $currentLatestHash = if (Test-Path -LiteralPath $latestPath) { Hash $latestPath } else { $null }
     if ($latestHash -cne $currentLatestHash) { throw 'latest.json changed during release.' }
-    $manifest = @{ versionCode=$code; versionName=$VersionName; notes=$Notes; file=$legacy; size=$size; sha256=$sha; androidCommit=$sourceId; full=@{ url="/app/artifacts/$fullName"; size=$size; sha256=$sha }; patches=$patches }
+    $manifest = @{ versionCode=$code; versionName=$VersionName; notes=$Notes; url='/app/latest.apk'; file=$downloadName; size=$size; sha256=$sha; full=@{ url="/app/artifacts/$fullName"; size=$size; sha256=$sha }; patches=$patches }
+    if ($sourceId) { $manifest.androidCommit = $sourceId }
     $manifestTemp = Join-Path $destination ('.latest-' + [guid]::NewGuid().ToString('N') + '.tmp')
     $manifestBackup = Join-Path $destination ('.previous-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
@@ -482,7 +528,9 @@ try {
     # Artifacts of older releases stay a week for downloads that began before the switch.
     $keep = @($fullName) + @($patches | ForEach-Object { [IO.Path]::GetFileName($_.url) })
     $cutoff = (Get-Date).AddDays(-7)
-    Get-ChildItem -LiteralPath $artifacts -File | Where-Object { $_.Name -match '^(apk|patch)-[0-9a-f]{64}\.(apk|bsdiff)$' -and $keep -notcontains $_.Name -and $_.LastWriteTime -lt $cutoff } | Remove-Item -Force
+    if (-not $publishExisting) {
+        Get-ChildItem -LiteralPath $artifacts -File | Where-Object { $_.Name -match '^(apk|patch)-[0-9a-f]{64}\.(apk|bsdiff)$' -and $keep -notcontains $_.Name -and $_.LastWriteTime -lt $cutoff } | Remove-Item -Force
+    }
     Write-Host "Release $VersionName ($code): $size bytes, $($patches.Count) patch(es); APK signature and SHA-256 verified. Destination: $destination"
 } finally {
     Write-Timings

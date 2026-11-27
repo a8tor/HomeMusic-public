@@ -9,8 +9,8 @@ import logging
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import HealthOut, SoulseekStatusOut
@@ -113,18 +113,35 @@ def _apk_dir():
 
 
 _ARTIFACT = re.compile(r"^(apk|patch)-([0-9a-f]{64})\.(apk|bsdiff)$")
+_RELEASE_APK = re.compile(r"(?:HomeMusic-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+|app-homemusic-release-[0-9]+\.[0-9]+\.[0-9]+)\.apk")
+_REVALIDATE = {"Cache-Control": "no-cache"}
 
 
 def _read_release() -> dict:
-    from fastapi import HTTPException
-
     try:
         data = json.loads((_apk_dir() / "latest.json").read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("manifest must be an object")
         return data
     except (OSError, ValueError):
-        raise HTTPException(404, "Нет сборки приложения") from None
+        raise HTTPException(404, "Нет сборки приложения: манифест отсутствует или повреждён",
+                            headers={"Cache-Control": "no-store"}) from None
+
+
+def _release_apk(data: dict) -> Path:
+    name = data.get("file")
+    if not isinstance(name, str) or not _RELEASE_APK.fullmatch(name):
+        raise HTTPException(404, "Некорректное имя APK в манифесте", headers={"Cache-Control": "no-store"})
+    path = _apk_dir() / name
+    try:
+        size = data.get("size")
+        if (not path.is_symlink() and path.is_file()
+                and ("size" not in data or (type(size) is int and size > 0 and path.stat().st_size == size))):
+            return path
+    except OSError:
+        pass
+    raise HTTPException(503, "APK из манифеста отсутствует или не соответствует релизу",
+                        headers={"Cache-Control": "no-store"})
 
 
 def _artifact(name: str, size: int | None = None, digest: str | None = None, verify: bool = False) -> Path | None:
@@ -163,8 +180,9 @@ def _valid_entry(entry: object, kind: str) -> bool:
 
 
 @router.get("/app/latest.json")
-async def apk_latest():
+def apk_latest():
     data = _read_release()
+    _release_apk(data)
     data["url"] = "/app/latest.apk"
     data.pop("file", None)
     full = data.get("full")
@@ -182,30 +200,19 @@ async def apk_latest():
                            and isinstance(p.get("baseSha256"), str)
                            and re.fullmatch(r"[0-9a-f]{64}", p["baseSha256"])
                            and _valid_entry(p, "patch")] if isinstance(patches, list) else []
-    return data
+    return JSONResponse(data, headers=_REVALIDATE)
 
 
 @router.get("/app/latest.apk")
-async def apk_file():
-    from fastapi import HTTPException
-    from fastapi.responses import FileResponse
-
-    data = _read_release()
-    name = data.get("file", "")
-    if not isinstance(name, str) or not re.fullmatch(r"HomeMusic-\d+\.\d+\.\d+-\d+\.apk", name):
-        raise HTTPException(404, "Нет сборки приложения")
-    root = _apk_dir().resolve()
-    path = (root / name).resolve()
-    if path.parent != root or not path.is_file():
-        raise HTTPException(404, "Нет сборки приложения")
-    return FileResponse(path, media_type="application/vnd.android.package-archive", filename=path.name)
+def apk_file():
+    path = _release_apk(_read_release())
+    # Stable URL (older clients also disallow redirects); only the SHA-addressed URL is immutable.
+    return FileResponse(path, media_type="application/vnd.android.package-archive", filename=path.name,
+                        headers=_REVALIDATE)
 
 
 @router.get("/app/artifacts/{name}")
 async def apk_artifact(name: str):
-    from fastapi import HTTPException
-    from fastapi.responses import FileResponse
-
     from starlette.concurrency import run_in_threadpool
 
     path = await run_in_threadpool(_artifact, name, verify=True)
