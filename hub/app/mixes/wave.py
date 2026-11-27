@@ -797,10 +797,18 @@ def value(c: build.Cand, st: State, vectors: dict[str, list[float]], pos: list[f
     return v
 
 
+def _guaranteed_full(c: build.Cand) -> bool:
+    return bool(c.nd_song_id or c.library_track_id or c.track.source in ("nd", "file"))
+
+
+def _known_preview(st: State, c: build.Cand) -> bool:
+    return c.track.ref in st.nofile or fp_of(c) in st.no_file_fps
+
+
 def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: int = BATCH,
          queued: set[str] = frozenset(), first: build.Cand | None = None,
          values: dict[str, float] | None = None, *, prefix: tuple[build.Cand, ...] = (),
-         filter_level: int = 0) -> list[build.Cand]:
+         filter_level: int = 0, eligible: Callable[[build.Cand], bool] | None = None) -> list[build.Cand]:
     """The next `n`: the best by `value` keeping the mode's familiar share, an artist at most once in `ARTIST_GAP`
     tracks (counting the played ones; the artist of a wave by an artist — once in `SEED_ARTIST_GAP`); with nothing else left, the gap gives way (never the same artist twice in a
     row). «Не нравится» set since the candidate came in drops it. `queued` — refs the client has ahead already.
@@ -809,11 +817,14 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     pos = _weighted_center(st.positive_weights, vectors) if st.taste_model == "v2" else _center(st.pos, vectors)
     neg = None if st.taste_model == "v2" else _center(st.neg, vectors)
     cfg = get_settings().cfg.mixes if isinstance(p, V2Profile) else None
-    if first is not None and not wf.fit(first, st.filters, filter_level, energy=st.energy):
+    if first is not None and (_known_preview(st, first)
+                              or (eligible is not None and not eligible(first))
+                              or not wf.fit(first, st.filters, filter_level, energy=st.energy)):
         first = None
     pools = (st.out, st.pool, st.pool_relaxed) if filter_level or st.filters.familiarity else (st.out, st.pool)
     candidates = [c for pool in pools for c in pool.values()
-                  if c is not first and c.track.ref not in st.nofile and not _disliked(c, p)
+                  if c is not first and (eligible is None or eligible(c)) and not _known_preview(st, c)
+                  and not _disliked(c, p)
                   and (cfg is None or build.keep(c, p, cfg)) and wf.fit(c, st.filters, filter_level, energy=st.energy)]
     # Catalog and library copies can have different refs for the same song. Never put both into one wave batch,
     # re-offer a song that has already started, or substitute another ref for one still queued by the client.
@@ -863,13 +874,13 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
         gap = set(seq[-(ARTIST_GAP - 1):])
         seed_gap = set(seq[-(SEED_ARTIST_GAP - 1):])
         ok = [c for c in ranked if c.artist not in (seed_gap if c.artist == st.seed_artist else gap)]
-        eligible = ok
+        choices = ok
         if st.filters.familiarity is None:
             total = st.started + len(prefix) + len(out)
             fam = st.started_familiar + sum(bool(c.familiar) for c in (*prefix, *out))
             want_fam = fam + 1 <= share * (total + 1) + 0.5
-            eligible = [c for c in ok if c.familiar == want_fam] or ok
-        window = eligible[:PICK_TOP_N]
+            choices = [c for c in ok if c.familiar == want_fam] or ok
+        window = choices[:PICK_TOP_N]
         if window:
             top = vals[id(window[0])]
             near = [c for c in window if top - vals[id(c)] <= max(0.25, abs(top) * 0.05)]
@@ -1282,99 +1293,52 @@ async def clear_old(s: AsyncSession, now: datetime | None = None) -> int:
 
 async def _start_pool(sid: str, rt: Runtime, gens: list[tuple[str, build.Gen]],
                       deadline: float) -> build.Cand | None:
-    """Absorb sources as they answer; a local candidate wins, otherwise return a catalog pick by deadline."""
-    from app import listen
-
-    tasks = {asyncio.create_task(build.run_generators({name: gen})) for name, gen in gens}
-    pending = tasks
+    """Absorb sources as they answer; prefer a local candidate or verify a catalog pick by the deadline."""
+    pending = {asyncio.create_task(build.run_generators({name: gen})) for name, gen in gens}
     first = None
     probe_task: asyncio.Task | None = None
-    probe_candidate: build.Cand | None = None
-    while pending and time.monotonic() < deadline:
-        wait_set = set(pending)
-        if probe_task is not None:
-            wait_set.add(probe_task)
-        done, _ = await asyncio.wait(wait_set, timeout=max(0.0, deadline - time.monotonic()),
-                                     return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            break
-        if probe_task in done:
-            try:
-                choice = probe_task.result()
-                if choice.kind == "preview":
-                    rt.state.nofile.add(probe_candidate.track.ref)
-                    rt.state.no_file_fps.add(fp_of(probe_candidate))
-                    rt.state.exclusion_refs.add(probe_candidate.track.ref)
-                    rt.state.exclusion_fps.add(fp_of(probe_candidate))
-                    rt.state.pool.pop(probe_candidate.track.ref, None)
-                    await _write_exclusion(rt.user_id, probe_candidate.track.ref, fp_of(probe_candidate),
-                                           "no_file", WAVE_NO_FILE_TTL)
-                else:
-                    first = probe_candidate
-            except Exception:
-                first = probe_candidate  # timeout/provider failure: the client can resolve it on playback
-            probe_task = None
-            probe_candidate = None
-            if first is not None:
-                break
-        source_done = done & pending
-        if source_done:
-            async with rt.lock:
-                await absorb(rt, [r for task in source_done for r in task.result()])
-                pending.difference_update(source_done)
-                candidates = pick(rt.state, rt.profile, rt.mode, rt.vectors, n=BATCH)
-                local = next((c for c in candidates
-                              if c.nd_song_id or c.library_track_id or c.track.source in ("nd", "file")), None)
-                if local is not None:
-                    first = local
-                    await (rt.save or _save)(sid, rt)
+    try:
+        while time.monotonic() < deadline:
+            if probe_task is None:
+                local = pick(rt.state, rt.profile, rt.mode, rt.vectors, n=1, eligible=_guaranteed_full)
+                if local:
+                    first = local[0]
                     break
-                if probe_task is None and candidates:
-                    probe_candidate = next((c for c in candidates
-                                            if c.track.source == "dz" and not c.nd_song_id
-                                            and c.library_track_id is None and c.track.ref not in rt.probe_cooldown),
-                                           None)
-                    if probe_candidate is None:
-                        probe_candidate = candidates[0]
-                    if probe_candidate.track.source == "dz" and not probe_candidate.nd_song_id \
-                            and probe_candidate.library_track_id is None:
-                        async def probe_one(candidate: build.Cand = probe_candidate):
-                            return await asyncio.wait_for(
-                                listen.choose(candidate.track.ref, background=True,
-                                              cancel_resolution_on_cancel=True), FIRST_PROBE_TIMEOUT_S)
-
-                        probe_task = asyncio.create_task(probe_one())
-                    else:
-                        first = probe_candidate
-                await (rt.save or _save)(sid, rt)
-    if probe_task is not None and first is None:
-        if probe_task.done():
-            try:
-                choice = probe_task.result()
-                if choice.kind == "preview":
-                    rt.state.nofile.add(probe_candidate.track.ref)
-                    rt.state.no_file_fps.add(fp_of(probe_candidate))
-                    rt.state.exclusion_refs.add(probe_candidate.track.ref)
-                    rt.state.exclusion_fps.add(fp_of(probe_candidate))
-                    rt.state.pool.pop(probe_candidate.track.ref, None)
-                    await _write_exclusion(rt.user_id, probe_candidate.track.ref, fp_of(probe_candidate),
-                                           "no_file", WAVE_NO_FILE_TTL)
-                else:
-                    first = probe_candidate
-            except Exception:
-                first = probe_candidate
-        else:
+                candidates = pick(rt.state, rt.profile, rt.mode, rt.vectors, n=1,
+                                  eligible=lambda c: _can_probe(rt, c))
+                if candidates:
+                    probe_deadline = min(deadline, time.monotonic() + FIRST_PROBE_TIMEOUT_S)
+                    probe_task = asyncio.create_task(_probe_full(rt, candidates, deadline=probe_deadline))
+            wait_set = pending | ({probe_task} if probe_task is not None else set())
+            if not wait_set:
+                break
+            # The probe enforces its own deadline and records a cooldown if time runs out.
+            timeout = max(0.0, deadline - time.monotonic()) if probe_task is None else None
+            done, _ = await asyncio.wait(wait_set, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            source_done = done & pending
+            if source_done:
+                pending.difference_update(source_done)
+                async with rt.lock:
+                    await absorb(rt, [r for task in source_done for r in task.result()])
+                    await (rt.save or _save)(sid, rt)
+                local = pick(rt.state, rt.profile, rt.mode, rt.vectors, n=1, eligible=_guaranteed_full)
+                if local:
+                    first = local[0]
+                    break
+            if probe_task in done:
+                checked = probe_task.result()
+                probe_task = None
+                if checked:
+                    first = checked[0]
+                    break
+    finally:
+        if probe_task is not None:
             probe_task.cancel()
-            probe_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-            await asyncio.sleep(0)
-            first = probe_candidate
-    for task in pending:
-        late = asyncio.create_task(_late(sid, rt, task))
-        rt.tasks.add(late)
-        late.add_done_callback(rt.tasks.discard)
-    if first is None and rt.state.pool:
-        candidates = pick(rt.state, rt.profile, rt.mode, rt.vectors, n=1)
-        first = candidates[0] if candidates else None
+            await asyncio.gather(probe_task, return_exceptions=True)
+        for task in pending:
+            late = asyncio.create_task(_late(sid, rt, task))
+            rt.tasks.add(late)
+            late.add_done_callback(rt.tasks.discard)
     return first
 
 
@@ -1460,16 +1424,18 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     gens = list((generators(profile, seed_track, seed_artist, seeds, filters=filters) if active
                  else generators(profile, seed_track, seed_artist, seeds)).items())
     stage = time.monotonic()
+    confirmed_first = None
     if first is not None:
         # The seed isn't heard until playback starts. `first` blocks duplicate picks, and once
         # in `out` it also blocks duplicates from the late sources.
         await _start_pool(sid, rt, gens, time.monotonic())
     else:
-        first = await _start_pool(sid, rt, gens, time.monotonic() + START_FIRST_TIMEOUT_S)
+        first = confirmed_first = await _start_pool(sid, rt, gens, time.monotonic() + START_FIRST_TIMEOUT_S)
     timings["_gather/probe"] = time.monotonic() - stage
     async with rt.lock:
         stage = time.monotonic()
-        keep, kept, added = await _hand_out(sid, rt, [], first, first_only=seed_track is None)
+        keep, kept, added = await _hand_out(sid, rt, [], first, first_only=seed_track is None,
+                                          confirmed_first=confirmed_first)
         timings["_hand_out"] = time.monotonic() - stage
         pending = bool(rt.tasks)
     if isinstance(profile, V2Profile) and "exhausted" not in rt.filter_relaxed:
@@ -1553,21 +1519,23 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
                  filters=st.filters, filter_relaxed=filter_relaxed)
 
 
-async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand | None,
-                      vectors: dict[str, list[float]] | None = None,
-                      deadline: float | None = None, *, probe_first: bool = False,
-                      prefix: tuple[build.Cand, ...] = (), n: int = BATCH, filter_level: int = 0) -> list[build.Cand]:
+def _can_probe(rt: Runtime, c: build.Cand) -> bool:
+    return rt.probe_cooldown.get(c.track.ref, 0) <= time.monotonic()
+
+
+async def _probe_full(rt: Runtime, tracks: list[build.Cand], *, deadline: float,
+                      confirmed: build.Cand | None = None) -> list[build.Cand]:
     from app import listen
 
     now = time.monotonic()
-    if deadline is None:
-        deadline = now + PROBE_BATCH_TIMEOUT_S
     semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
     for ref, until in list(rt.probe_cooldown.items()):
         if until <= now:
             rt.probe_cooldown.pop(ref, None)
-    probe = [c for c in tracks if (probe_first or c is not first) and c.track.source == "dz" and not c.nd_song_id
-             and c.library_track_id is None and c.track.ref not in rt.probe_cooldown]
+    st = rt.state
+    tracks = [c for c in tracks if not _known_preview(st, c)]
+    full = {c.track.ref for c in tracks if c is confirmed or _guaranteed_full(c)}
+    probe = [c for c in tracks if c.track.ref not in full and _can_probe(rt, c)]
 
     async def one(c: build.Cand):
         try:
@@ -1589,22 +1557,25 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
             return c, None, e
 
     if not probe or time.monotonic() >= deadline:
-        return tracks
-    async def run_probe(c: build.Cand):
-        return await one(c)
+        return [c for c in tracks if c.track.ref in full]
 
-    tasks = [asyncio.create_task(run_probe(c)) for c in probe]
-    done, pending = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
-    for task in pending:
-        task.cancel()
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    tasks = {asyncio.create_task(one(c)): c for c in probe}
+    done = set()
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        for task in tasks.keys() - done:
+            task.cancel()
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     results = [task.result() for task in done if not task.cancelled() and task.exception() is None]
     absent = set()
-    transient = set()
+    transient = {c.track.ref for c in probe} - {c.track.ref for c, _, _ in results}
     for c, choice, error in results:
         if choice is not None and choice.kind == "preview":
             absent.add(c.track.ref)
-        elif error is not None:
+        elif choice is not None and choice.kind in ("full", "library"):
+            full.add(c.track.ref)
+        else:
             transient.add(c.track.ref)
     if transient:
         until = time.monotonic() + WAVE_TRANSIENT_TTL.total_seconds()
@@ -1618,18 +1589,12 @@ async def _probe_full(rt: Runtime, tracks: list[build.Cand], first: build.Cand |
         rt.state.remove(c.track.ref)
         rt.state.out.pop(c.track.ref, None)
     await _write_exclusions(rt.user_id, rejected, "no_file", WAVE_NO_FILE_TTL)
-    remaining = [c for c in tracks if c.track.ref not in absent]
-    if len(remaining) < n and absent and time.monotonic() < deadline:
-        extras = pick(rt.state, rt.profile, rt.mode, vectors if vectors is not None else rt.vectors,
-                      n=n - len(remaining), prefix=(*prefix, *remaining), filter_level=filter_level)
-        if extras:
-            remaining += await _probe_full(rt, extras, first, vectors, deadline,
-                                           prefix=(*prefix, *remaining), n=n - len(remaining), filter_level=filter_level)
-    return remaining
+    return [c for c in tracks if c.track.ref in full and not _known_preview(st, c)]
 
 
 async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand | None = None,
-                    *, first_only: bool = False) -> tuple[list[str], list[build.Cand], list[build.Cand]]:
+                    *, first_only: bool = False,
+                    confirmed_first: build.Cand | None = None) -> tuple[list[str], list[build.Cand], list[build.Cand]]:
     """Keep valid queued tracks in client order, then pick and prepare only the missing tracks."""
     from app import listen
 
@@ -1676,24 +1641,36 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
         except TimeoutError:
             log.warning("wave: taste vectors timed out; continuing without taste weights")
             vectors = {}
-    prefix = tuple(kept)
-    added = pick(st, rt.profile, rt.mode, vectors, n=n, first=first, values=values, prefix=prefix) if n > 0 else []
     probe_started = time.monotonic()
-    if added and not first_only:
-        added = await _probe_full(rt, added, first, vectors, probe_started + PROBE_BATCH_TIMEOUT_S,
-                                  prefix=prefix, n=n)
+    deadline = probe_started + (FIRST_PROBE_TIMEOUT_S if first_only else PROBE_BATCH_TIMEOUT_S)
+    added: list[build.Cand] = []
+    attempted: set[str] = set()
+
+    def eligible(c: build.Cand) -> bool:
+        return c.track.ref not in attempted and (c is confirmed_first or _guaranteed_full(c)
+                                                  or (time.monotonic() < deadline and _can_probe(rt, c)))
+
+    async def fill(level: int, preferred: build.Cand | None = None) -> None:
+        while len(added) < n:
+            extras = pick(st, rt.profile, rt.mode, vectors, n=n - len(added), first=preferred, values=values,
+                          prefix=(*kept, *added), filter_level=level, eligible=eligible)
+            if not extras:
+                break
+            attempted.update(c.track.ref for c in extras)
+            added.extend(await _probe_full(rt, extras, deadline=deadline, confirmed=confirmed_first))
+            preferred = None
+
+    await fill(0, first)
     if active and not rt.tasks:
         for level in ((1, 2, 3, 4) if st.filters.energy else (1, 3, 4)):
-            missing = n - len(added)
-            if missing <= 0 or rt.tasks:
+            if len(added) >= n or rt.tasks:
                 break
-            selected = (*prefix, *added)
-            extras = pick(st, rt.profile, rt.mode, vectors, n=missing, values=values, prefix=selected,
-                          filter_level=level)
-            if extras and not first_only:
-                extras = await _probe_full(rt, extras, None, vectors, probe_started + PROBE_BATCH_TIMEOUT_S,
-                                           prefix=selected, n=missing, filter_level=level)
-            added.extend(extras)
+            await fill(level)
+    # A confirmed preview (including one previously reported by a client) cannot survive the handout.
+    queued_ok = [(ref, c) for ref, c in zip(keep, kept) if not _known_preview(st, c)]
+    keep = [ref for ref, _ in queued_ok]
+    kept = [c for _, c in queued_ok]
+    added = [c for c in added if not _known_preview(st, c)]
     if active:
         rt.filter_relaxed = wf.relaxed_axes(kept + added, st.filters, energy=st.energy)
         if not kept and not added and not rt.tasks:

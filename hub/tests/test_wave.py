@@ -345,7 +345,10 @@ async def test_wave_probe_deadline_falls_back_for_hanging_choices(env, monkeypat
     assert response.status_code == 200
     assert elapsed < 1.0
     assert "dz:5100" not in refs
-    assert refs  # timed-out probes remain eligible for handout
+    assert not refs
+    assert cancelled.is_set()
+    rt = wave._rt[response.json()["session_id"]]
+    assert rt.probe_cooldown.keys() & rt.state.pool.keys()  # retry later, not handed out or removed
 
 
 async def test_start_hands_out_library_track_while_catalog_source_hangs(env, monkeypatch) -> None:
@@ -390,8 +393,6 @@ async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypa
 
     await history(env["admin"])
     fake_sources(monkeypatch, [tr(5000 + i) for i in range(8)])
-    original = listen.choose
-
     async def choose(ref, **kwargs):
         if ref == "dz:5000":
             return listen.Choice(ref, "preview", "Artist", "Title")
@@ -404,6 +405,83 @@ async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypa
     result = (await env["client"].post("/api/wave/start", json={})).json()
     assert "dz:5000" not in [t["ref"] for t in result["tracks"]]
     assert len(result["tracks"]) >= 1
+
+
+async def test_a_relaxed_deezer_candidate_is_probed_before_handout(env, monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from app import listen
+
+    await history(env["admin"])
+    track = tr(8101)
+    fake_sources(monkeypatch, [track])
+    choose = AsyncMock(return_value=listen.Choice(track.ref, "preview", track.artist, track.title))
+    monkeypatch.setattr(listen, "choose", choose)
+    response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru"}})
+    assert response.status_code == 200, response.text
+    assert response.json()["tracks"] == []
+    assert response.json()["filter_relaxed"] == ["exhausted"]
+    choose.assert_awaited_once_with(track.ref, background=True, cancel_resolution_on_cancel=True)
+
+
+async def test_a_library_candidate_skips_the_probe(env, monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from app import listen
+
+    track = cand(5100)
+    track.nd_song_id = "nd5100"
+    rt = wave.Runtime(user_id=env["admin"], mode="normal", state=state(track), profile=profile())
+    choose = AsyncMock(side_effect=AssertionError("library track was probed"))
+    monkeypatch.setattr(listen, "choose", choose)
+    assert await wave._probe_full(rt, [track], deadline=wave.time.monotonic() + 1) == [track]
+    choose.assert_not_awaited()
+
+
+async def test_a_preview_never_reaches_the_client(env, monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from app import listen
+
+    preview, unverified, local = cand(1), cand(2), cand(3)
+    local.nd_song_id = "nd3"
+    st = state(preview, unverified, local)
+    st.nofile.add(preview.track.ref)
+    st.out[preview.track.ref] = preview
+    rt = wave.Runtime(user_id=env["admin"], mode="normal", state=st, profile=profile())
+    choose = AsyncMock(side_effect=AssertionError("deadline exhausted"))
+    monkeypatch.setattr(listen, "choose", choose)
+    monkeypatch.setattr(wave, "FIRST_PROBE_TIMEOUT_S", 0)
+    monkeypatch.setattr(wave, "_save", AsyncMock())
+    monkeypatch.setattr(wave, "save_items", AsyncMock())
+    assert await wave._probe_full(rt, [preview, unverified, local], deadline=0) == [local]
+    keep, kept, added = await wave._hand_out("test", rt, [preview.track.ref], preview, first_only=True)
+    assert keep == kept == []
+    assert added == [local]
+    choose.assert_not_awaited()
+
+
+async def test_a_timeout_does_not_write_a_no_file_exclusion(env, monkeypatch) -> None:
+    import asyncio
+
+    from app import listen
+    from app.db import session_scope
+    from app.models import WaveExclusion
+
+    track = cand(5100)
+    rt = wave.Runtime(user_id=env["admin"], mode="normal", state=state(track), profile=profile())
+
+    async def choose(ref, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(listen, "choose", choose)
+    now = wave.time.monotonic()
+    assert await wave._probe_full(rt, [track], deadline=now + 0.05) == []
+    assert rt.probe_cooldown[track.track.ref] >= now + 300
+    assert track.track.ref in rt.state.pool and track.track.ref not in rt.state.nofile
+    async with session_scope() as s:
+        assert await s.scalar(select(WaveExclusion).where(WaveExclusion.user_id == rt.user_id,
+                                                         WaveExclusion.reason == "no_file")) is None
 
 
 async def test_no_file_drops_the_track_from_the_session_and_survives_a_restart(env, monkeypatch) -> None:
@@ -647,7 +725,13 @@ async def env(hub_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def fake_sources(monkeypatch: pytest.MonkeyPatch, tracks: list[CatalogTrack],
                  radio: list[CatalogTrack] = ()) -> dict[str, Any]:
-    """The pool's generators give `tracks`; the radio of a liked track gives `radio`."""
+    """Supply catalog tracks and a full source for their synthetic IDs unless the test overrides it."""
+    from app import listen
+
+    async def choose(ref, **kwargs):
+        return listen.Choice(ref, "full", "Artist", "Title")
+
+    monkeypatch.setattr(listen, "choose", choose)
     seen: dict[str, Any] = {"seed": [], "radio": []}
 
     def gens(p, seed, seed_artist, seeds, **kwargs):
