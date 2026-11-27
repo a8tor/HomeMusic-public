@@ -65,6 +65,7 @@ class ItemOut(BaseModel):
     attempts: int
     has_vector: bool
     seconds: float | None
+    energy: float | None
     updated_at: float
 
 
@@ -82,10 +83,12 @@ class SimilarityIn(BaseModel):
 class NearOut(BaseModel):
     key: str
     sim: float
+    energy: float | None
 
 
 class ScoredOut(BaseModel):
     key: str
+    energy: float | None
     pos: float | None
     neg: float | None
     score: float
@@ -119,11 +122,16 @@ class VectorsOut(BaseModel):
     model: str
     dim: int | None
     vectors: dict[str, list[float]]
+    energy: dict[str, float | None]
     missing: list[str]
 
 
 KeyV2 = Annotated[str, Field(min_length=1, max_length=300)]
 Coordinate = Annotated[float, Field(ge=-1, le=1, allow_inf_nan=False)]
+
+
+class EnergyIn(BaseModel):
+    keys: list[KeyV2] = Field(max_length=200)
 
 
 class PositiveV2(BaseModel):
@@ -158,6 +166,7 @@ class DiagnosticsV2(BaseModel):
 class ProfileOutV2(SpaceOutV2):
     facets: list[FacetV2]
     negatives: list[str]
+    energy: dict[str, float | None]
     missing: list[str]
     diagnostics: DiagnosticsV2
 
@@ -171,6 +180,7 @@ class SimilarityInV2(BaseModel):
 
 class ScoredV2(BaseModel):
     key: str
+    energy: float | None
     pos: float
     neg: float
     score: float
@@ -198,6 +208,7 @@ class ShadowInV2(BaseModel):
 class ShadowOutV2(SpaceOutV2):
     v1: dict[str, float]
     v2: dict[str, float]
+    energy: dict[str, float | None]
     missing_v1: list[str]
     missing_v2: list[str]
     missing_baseline: list[str]
@@ -214,6 +225,7 @@ class VectorsInV2(BaseModel):
 
 class VectorsOutV2(SpaceOutV2):
     vectors: dict[str, list[float]]
+    energy: dict[str, float | None]
     missing: list[str]
     diagnostics: DiagnosticsV2
 
@@ -241,6 +253,7 @@ class ProjectOutV2(SpaceOutV2):
     basis: str
     explained: list[float]
     points: dict[str, list[float]]
+    energy: dict[str, float | None]
     facets: dict[str, list[float]]
     facet_cos: dict[str, list[float]]
     missing: list[str]
@@ -334,8 +347,13 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         return ItemOut(
             key=it.key, status=it.status, error=it.error, attempts=it.attempts,
             has_vector=it.status == "done" and it.model == st.engine.name, seconds=it.seconds,
+            energy=it.energy if it.status == "done" and it.model == st.engine.name else None,
             updated_at=it.updated_at,
         )
+
+    @app.post("/energy", response_model=dict[str, float | None], dependencies=[Depends(auth)])
+    async def energy(body: EnergyIn, st=Depends(state)):
+        return st.store.energies(body.keys, st.engine.name)
 
     @app.post("/similarity", response_model=SimilarityOut, dependencies=[Depends(auth)])
     async def similarity(body: SimilarityIn, st=Depends(state)):
@@ -348,13 +366,14 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         profile = {k: (vecs[k], w) for k, w in weights.items() if k in vecs and w != 0}
         cands = {k: vecs[k] for k in dict.fromkeys(body.candidates) if k in vecs}
         results = await asyncio.to_thread(score, cands, profile, top=body.top)
+        energy = st.store.energies(list(vecs), name)
         return SimilarityOut(
             model=name,
             results=[
                 ScoredOut(
-                    key=r.key, pos=r.pos, neg=r.neg, score=r.score,
-                    nearest=[NearOut(key=n.key, sim=n.sim) for n in r.nearest],
-                    nearest_neg=NearOut(key=r.nearest_neg.key, sim=r.nearest_neg.sim) if r.nearest_neg else None,
+                    key=r.key, pos=r.pos, neg=r.neg, score=r.score, energy=energy.get(r.key),
+                    nearest=[NearOut(key=n.key, sim=n.sim, energy=energy.get(n.key)) for n in r.nearest],
+                    nearest_neg=NearOut(key=n.key, sim=n.sim, energy=energy.get(n.key)) if (n := r.nearest_neg) else None,
                 )
                 for r in results
             ],
@@ -374,7 +393,8 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
             np.asarray(q, np.float32), limit=body.limit, prefix=body.prefix,
             keys=set(body.keys) if body.keys is not None else None,
         )
-        return TextOut(model=e.name, results=[NearOut(key=n.key, sim=n.sim) for n in found])
+        energy = st.store.energies([n.key for n in found], e.name)
+        return TextOut(model=e.name, results=[NearOut(key=n.key, sim=n.sim, energy=energy[n.key]) for n in found])
 
     @app.post("/vectors", response_model=VectorsOut, dependencies=[Depends(auth)])
     async def vectors(body: VectorsIn, st=Depends(state)):
@@ -382,6 +402,7 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         dim = len(next(iter(vecs.values()))) if vecs else None
         return VectorsOut(
             model=st.engine.name, dim=dim, vectors={k: v.tolist() for k, v in vecs.items()},
+            energy=st.store.energies(list(vecs), st.engine.name),
             missing=[k for k in dict.fromkeys(body.keys) if k not in vecs],
         )
 
@@ -409,6 +430,7 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         wanted = list(dict.fromkeys([*weights, *body.negatives]))
         found = await asyncio.to_thread(facets, space.vectors, weights)
         return ProfileOutV2(**metadata_v2(space, wanted),
+                            energy=st.store.energies([k for k in wanted if k in space.vectors], space.model),
                             facets=[FacetV2(**vars(f)) for f in found],
                             negatives=list(dict.fromkeys(k for k in body.negatives if k in space.vectors)))
 
@@ -421,7 +443,8 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         cands = {k: space.vectors[k] for k in dict.fromkeys(body.candidates) if k in space.vectors}
         negs = {k: space.vectors[k] for k in body.negatives if k in space.vectors}
         results = await asyncio.to_thread(lambda: list(similarity_v2(cands, [f.center for f in body.facets], negs)))
-        return SimilarityOutV2(**metadata_v2(space, wanted), results=results)
+        energy = st.store.energies([r["key"] for r in results], space.model)
+        return SimilarityOutV2(**metadata_v2(space, wanted), results=[dict(r, energy=energy[r["key"]]) for r in results])
 
     @app.post("/v2/shadow", response_model=ShadowOutV2, dependencies=[Depends(auth)])
     async def shadow_v2(body: ShadowInV2, st=Depends(state)):
@@ -463,6 +486,7 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
             # Bound the temporary response; refuse vectors rather than returning a partial coordinate set.
             include_vectors = body.include_vectors and (space.dim or 0) * len(candidates) <= 512000
             return ShadowOutV2(model=space.model, space_id=space.space_id, dim=space.dim, v1=v1, v2=v2,
+                               energy=st.store.energies(list(valid_raw), space.model),
                                missing_v1=[k for k in candidates if k not in v1],
                                missing_v2=[k for k in candidates if k not in v2],
                                missing_baseline=[k for k in weights if k not in raw],
@@ -478,6 +502,7 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
         space = await space_v2(st, body.space_id)
         wanted = list(dict.fromkeys(body.keys))
         return VectorsOutV2(**metadata_v2(space, wanted),
+                            energy=st.store.energies([k for k in wanted if k in space.vectors], space.model),
                             vectors={k: space.vectors[k].tolist() for k in wanted if k in space.vectors})
 
     @app.post("/v2/project", response_model=ProjectOutV2, dependencies=[Depends(auth)])
@@ -494,9 +519,10 @@ def create_app(settings: Settings | None = None, factory: Callable[[Settings], M
                 axes = fit_axes({k: space.vectors[k] for k in dict.fromkeys(body.fit_keys) if k in space.vectors})
             found = {k: space.vectors[k] for k in wanted if k in space.vectors}
             centers = {f.id: np.asarray(f.center, dtype=np.float64) for f in body.facets}
+            points = project(axes, found)
             return ProjectOutV2(
                 **metadata_v2(space, wanted), basis=body.basis, explained=list(axes.explained),
-                points=project(axes, found), facets=project(axes, centers),
+                points=points, energy=st.store.energies(list(points), space.model), facets=project(axes, centers),
                 facet_cos=facet_cosines(found, [f.center for f in body.facets]))
 
         return await asyncio.to_thread(calculate)

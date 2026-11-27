@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS items (
     dim INTEGER,
     vector BLOB,
     seconds REAL,                  -- length of the embedded fragment
+    energy REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -38,6 +39,7 @@ class Item:
     attempts: int
     model: str | None
     seconds: float | None
+    energy: float | None
     updated_at: float
 
 
@@ -56,6 +58,15 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(SCHEMA)
+        # Serialize the check and ALTER with other processes (including the CLI).
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            if not any(row[1] == "energy" for row in self._db.execute("PRAGMA table_info(items)")):
+                self._db.execute("ALTER TABLE items ADD COLUMN energy REAL")
+            self._db.commit()
+        except Exception:
+            self._db.close()
+            raise
         self._lock = threading.Lock()
         self.now = now
         # bumps on every new vector: the in-memory index for /text rebuilds when it changes
@@ -115,12 +126,12 @@ class Store:
         with self._lock:
             self._db.executemany("UPDATE items SET status='queued' WHERE key=? AND status='running'", [(k,) for k in keys])
 
-    def finish(self, key: str, vector: np.ndarray, model: str, seconds: float) -> None:
+    def finish(self, key: str, vector: np.ndarray, model: str, seconds: float, energy: float | None = None) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE items SET status='done', error=NULL, model=?, dim=?, vector=?, seconds=?, updated_at=?"
+                "UPDATE items SET status='done', error=NULL, model=?, dim=?, vector=?, seconds=?, energy=?, updated_at=?"
                 " WHERE key=? AND status='running'",
-                (model, int(vector.shape[0]), to_blob(vector), seconds, self.now(), key),
+                (model, int(vector.shape[0]), to_blob(vector), seconds, energy, self.now(), key),
             )
             self.version += 1
 
@@ -144,10 +155,42 @@ class Store:
 
     def get(self, key: str) -> Item | None:
         row = self._db.execute(
-            "SELECT key, kind, source, status, error, attempts, model, seconds, updated_at FROM items WHERE key=?",
+            "SELECT key, kind, source, status, error, attempts, model, seconds, energy, updated_at FROM items WHERE key=?",
             (key,),
         ).fetchone()
         return Item(*row) if row else None
+
+    def energies(self, keys: list[str], model: str) -> dict[str, float | None]:
+        out: dict[str, float | None] = dict.fromkeys(keys)
+        keys = list(out)
+        with self._lock:
+            for i in range(0, len(keys), 500):
+                chunk = keys[i : i + 500]
+                q = ",".join("?" * len(chunk))
+                out.update(self._db.execute(
+                    f"SELECT key, energy FROM items WHERE status='done' AND model=? AND key IN ({q})", (model, *chunk)
+                ))
+        return out
+
+    def missing_energy_vectors(self, model: str, dim: int, limit: int, after: str | None = None):
+        query = (
+            "SELECT key, vector FROM items WHERE status='done' AND model=? AND energy IS NULL"
+            " AND dim=? AND length(vector)=4*dim"
+        )
+        params = (model, dim)
+        if after is not None:
+            query += " AND key>?"
+            params += (after,)
+        with self._lock:
+            return self._db.execute(query + " ORDER BY key LIMIT ?", (*params, limit)).fetchall()
+
+    def fill_energy(self, model: str, rows: list[tuple[float, str, bytes]]) -> int:
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            return self._db.executemany(
+                "UPDATE items SET energy=? WHERE key=? AND vector=? AND model=? AND status='done' AND energy IS NULL",
+                [(energy, key, blob, model) for energy, key, blob in rows],
+            ).rowcount
 
     def vectors(self, keys: list[str], model: str) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}

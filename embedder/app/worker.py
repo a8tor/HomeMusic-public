@@ -13,6 +13,7 @@ import numpy as np
 from . import audio
 from .config import Settings
 from .db import Item, Store
+from .energy import build_energy_anchor, project_energy
 from .models import GpuBusy, Model
 
 log = logging.getLogger("embedder.worker")
@@ -33,6 +34,14 @@ class Engine:
         self._lock = asyncio.Lock()
         # serializes model calls: the worker's batches and /text share one model
         self.busy = asyncio.Lock()
+        self._energy_lock = asyncio.Lock()
+        self._energy_anchor: np.ndarray | None = None
+
+    async def energy_anchor(self) -> np.ndarray:
+        async with self._energy_lock:
+            if self._energy_anchor is None:
+                self._energy_anchor = await self.run(lambda m: build_energy_anchor(m.embed_text))
+            return self._energy_anchor
 
     async def ensure(self) -> Model:
         self.last_used = time.monotonic()
@@ -138,8 +147,15 @@ class Worker:
                 self._fail(it.key, f"model: {type(e).__name__}: {e}", retry=True)
             return
         dt = time.monotonic() - t
+        try:
+            anchor = await self.engine.energy_anchor()
+        except Exception:
+            # Keep the audio index usable even if the text tower is unavailable. The CLI can fill these later.
+            log.exception("energy anchor unavailable")
+            anchor = None
         for it, w, v in zip(p.items, p.wavs, vecs, strict=True):
-            self.store.finish(it.key, v, self.engine.name, len(w) / self.sr)
+            projection = project_energy(v, anchor) if anchor is not None else None
+            self.store.finish(it.key, v, self.engine.name, len(w) / self.sr, projection.score if projection else None)
         self.stats.songs += len(p.items)
         self.stats.seconds_gpu += dt
         self.stats.last_rate = len(p.items) / dt if dt > 0 else None

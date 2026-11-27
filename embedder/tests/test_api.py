@@ -64,7 +64,10 @@ async def test_library_and_preview_are_embedded_and_compared(client, previews):
     assert res["dz:450"]["neg"] is None and res["dz:450"]["score"] == res["dz:450"]["pos"]
     assert res["dz:450"]["nearest"][0]["key"] in ("nd:a440", "nd:a440q")
     # a profile key is not its own nearest neighbour
-    assert res["nd:a440"]["nearest"] == [{"key": "nd:a440q", "sim": pytest.approx(res["nd:a440"]["nearest"][0]["sim"])}]
+    expected_energy = (await status(client, "nd:a440q"))["energy"]
+    assert res["nd:a440"]["nearest"] == [{
+        "key": "nd:a440q", "sim": pytest.approx(res["nd:a440"]["nearest"][0]["sim"]), "energy": expected_energy,
+    }]
 
 
 async def test_negative_weights_lower_the_score(client, previews):
