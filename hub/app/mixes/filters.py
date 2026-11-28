@@ -151,8 +151,23 @@ async def _cached_values(s, keys: set[str]) -> dict:
             if row.fetched_at + timedelta(seconds=row.ttl_s) >= now}
 
 
+_RUSSIAN_ARTIST_TAG = re.compile(
+    r"^(?:russian(?: speaking| language| (?:classical|rock|pop|metal|jazz|folk|indie|rap|hip hop|electronic))?"
+    r"|русск(?:ий|ая|ое)(?: (?:рок|классика|поп|рэп|музыка))?|русскоязычн\w*)$"
+)
+
+
+def _artist_ru(tags: list[str]) -> bool:
+    return any(_RUSSIAN_ARTIST_TAG.fullmatch(" ".join(re.findall(
+        r"[^\W_]+", unicodedata.normalize("NFKC", tag).casefold()))) for tag in tags)
+
+
 async def _prepare_lang(cands: list[build.Cand]) -> None:
     keys = {c.artist for c in cands if c.artist and not _direct_ru(c)}
+    if not keys:
+        for c in cands:
+            c.wave_lang = "ru" if _direct_ru(c) else "foreign"
+        return
     prefix = "mix:lang:"
     async with session_scope() as s:
         cached = await _cached_values(s, {prefix + key for key in keys})
@@ -178,11 +193,14 @@ def _album_id(c: build.Cand) -> str | None:
     return ref[3:] if ref.startswith("dz:") and len(ref) > 3 else None
 
 
-async def _prepare_genres(cands: list[build.Cand]) -> None:
-    album_ids = {aid for c in cands if (aid := _album_id(c))}
-    if not cands:
-        return
-    library_ids = {c.library_track_id for c in cands if c.library_track_id is not None}
+async def _prepare_metadata(cands: list[build.Cand], f: WaveFilters) -> None:
+    album_ids = {aid for c in cands if f.genres and (aid := _album_id(c))}
+    library_ids = {c.library_track_id for c in cands if f.genres and c.library_track_id is not None}
+    genre_groups: dict[str, list[build.Cand]] = defaultdict(list)
+    lang_groups: dict[str, list[build.Cand]] = defaultdict(list)
+    names: dict[str, str] = {}
+    use_lastfm = sources.lastfm_configured()
+    prefix = "mix:artist_genre:"
     async with session_scope() as s:
         cached_albums = await _cached_values(s, {f"dz:album:{aid}" for aid in album_ids})
         library_genres = {}
@@ -190,19 +208,26 @@ async def _prepare_genres(cands: list[build.Cand]) -> None:
             rows = await s.execute(select(Track.id, Track.genre, Album.genre).outerjoin(
                 Album, Track.album_id == Album.id).where(Track.id.in_(library_ids)))
             library_genres = {tid: (track, album) for tid, track, album in rows}
-        groups: dict[str, list[build.Cand]] = defaultdict(list)
         for c in cands:
-            album = cached_albums.get(f"dz:album:{_album_id(c)}") or {}
-            labels = (*library_genres.get(c.library_track_id, ()), album.get("genre"))
-            if not c.track.genre and (genre := next((x for x in labels if x), None)):
-                c.track = c.track.model_copy(update={"genre": genre})
-            c.wave_genres = normalize_genres(c.track.genre, *labels)
-            if c.artist and not c.wave_genres:
-                groups[c.artist].append(c)
-        prefix = "mix:artist_genre:"
-        cached = await _cached_values(s, {prefix + key for key in groups})
-    if not groups:
-        return
+            key = c.artist
+            if f.lang and detect_lang(c) != "ru" and key and use_lastfm:
+                lang_groups[key].append(c)
+                names.setdefault(key, c.track.artist)
+            elif f.lang and detect_lang(c) != f.lang:
+                continue  # Direct/local Russian evidence cannot be undone by artist tags.
+            if f.genres:
+                album = cached_albums.get(f"dz:album:{_album_id(c)}") or {}
+                labels = (*library_genres.get(c.library_track_id, ()), album.get("genre"))
+                if not c.track.genre and (genre := next((x for x in labels if x), None)):
+                    c.track = c.track.model_copy(update={"genre": genre})
+                c.wave_genres = normalize_genres(c.track.genre, *labels)
+                if key and not c.wave_genres:
+                    genre_groups[key].append(c)
+                    names.setdefault(key, c.track.artist)
+        cached = await _cached_values(s, {prefix + key for key in genre_groups})
+        tag_keys = {key: sources.lastfm_artist_tags_cache_key(names[key]) for key in names
+                    if use_lastfm and (key in lang_groups or prefix + key not in cached)}
+        raw_tags = await _cached_values(s, set(tag_keys.values()))
     semaphore = asyncio.Semaphore(8)
     found: dict[str, list[str]] = {}
     fetched_albums: dict[str, asyncio.Task] = {}
@@ -212,47 +237,65 @@ async def _prepare_genres(cands: list[build.Cand]) -> None:
             return entry.get("genre")
         return (await svc.deezer.get_album(aid)).genre
 
-    async def enrich(key: str, group: list[build.Cand]) -> None:
-        async with semaphore:
-            genre = None
-            tags: list[str] = []
-            if sources.lastfm_configured():
-                try:
-                    tags = await sources.lastfm_artist_tags(group[0].track.artist, limit=5)
-                except Exception as e:
-                    log.debug("wave: Last.fm tags for %s: %r", key, e)
-            if not normalize_genres(*tags):
-                # API fallback: at most one representative Deezer album per artist.
-                ids = [aid for c in group if (aid := _album_id(c))]
-                if svc.deezer is not None and ids:
-                    aid = ids[0]
-                    if aid not in fetched_albums:
-                        fetched_albums[aid] = asyncio.create_task(album_genre(aid))
-                    try:
-                        genre = await fetched_albums[aid]
-                    except Exception as e:
-                        log.debug("wave: Deezer album %s: %r", aid, e)
-            labels = [genre] if genre else tags
-            if normalize_genres(*labels):
-                cached[prefix + key] = labels
-                found[prefix + key] = labels
+    def apply_tags(key: str, tags: list[str]) -> None:
+        if key in lang_groups and _artist_ru(tags):
+            for c in lang_groups[key]:
+                c.wave_lang = "ru"
+        genre_key = prefix + key
+        if key in genre_groups and genre_key not in cached and normalize_genres(*tags[:5]):
+            cached[genre_key] = found[genre_key] = tags[:5]
 
-    missing = [(key, group) for key, group in groups.items() if prefix + key not in cached]
-    if missing:
+    async def fetch_tags(key: str) -> None:
+        async with semaphore:
+            try:
+                tags = await sources.lastfm_artist_tags(names[key], limit=20)
+            except Exception as e:
+                log.debug("wave: Last.fm tags for %s: %r", key, e)
+            else:
+                apply_tags(key, tags)  # Apply each answer without waiting for the other artists.
+
+    async def enrich(key: str) -> None:
+        if key in tag_keys and tag_keys[key] not in raw_tags:
+            await fetch_tags(key)
+        if key not in genre_groups or prefix + key in cached or svc.deezer is None:
+            return
+        aid = next((aid for c in genre_groups[key]
+                    if (not f.lang or detect_lang(c) == f.lang) and (aid := _album_id(c))), None)
+        if aid is None:
+            return
+        async with semaphore:
+            if aid not in fetched_albums:
+                fetched_albums[aid] = asyncio.create_task(album_genre(aid))
+            try:
+                genre = await fetched_albums[aid]
+            except Exception as e:
+                log.debug("wave: Deezer album %s: %r", aid, e)
+            else:
+                if normalize_genres(genre):
+                    cached[prefix + key] = found[prefix + key] = [genre]
+
+    for key, tag_key in tag_keys.items():
+        if tag_key in raw_tags:
+            apply_tags(key, raw_tags[tag_key] or [])
+    if names:
+        # Artists with a known requested genre are the best use of the language lookup budget.
+        ordered = sorted(names, key=lambda key: not any(
+            track_genres(c).intersection(f.genres) for c in lang_groups.get(key, ())))
         try:
-            await asyncio.wait_for(asyncio.gather(*(enrich(key, group) for key, group in missing)), ENRICH_TIMEOUT)
+            await asyncio.wait_for(asyncio.gather(*(enrich(key) for key in ordered)), ENRICH_TIMEOUT)
         except TimeoutError:
-            log.debug("wave: genre enrichment reached its time budget")
+            log.debug("wave: artist enrichment reached its time budget")
         await cache_set_many(found, GENRE_TTL)
-    for key, group in groups.items():
-        labels = cached.get(prefix + key) or []
-        genres = normalize_genres(*labels)
+    for key, group in genre_groups.items():
+        genres = normalize_genres(*(cached.get(prefix + key) or []))
         for c in group:
             c.wave_genres = genres
 
 
 async def prepare(cands: list[build.Cand], f: WaveFilters) -> None:
-    if cands and f.lang:
+    if not cands or not (f.lang or f.genres):
+        return
+    if f.lang:
         await _prepare_lang(cands)
-    if cands and f.genres:
-        await _prepare_genres([c for c in cands if not f.lang or detect_lang(c) == f.lang])
+    if f.genres or sources.lastfm_configured():
+        await _prepare_metadata(cands, f)

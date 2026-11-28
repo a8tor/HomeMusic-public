@@ -199,14 +199,18 @@ async def lastfm_similar_artists(artist: str, limit: int = 20) -> list[str]:
     return await cached(f"mix:lfm_artist_sim:{_key(artist)}", TTL_S, produce) or []
 
 
+def lastfm_artist_tags_cache_key(artist: str) -> str:
+    return f"mix:lfm_artist_tags:{_key(artist)}"
+
+
 async def lastfm_artist_tags(artist: str, limit: int = 5) -> list[str]:
-    """The artist's top tags (genres, moods): what a mix name is made of."""
+    """The artist's top tags; cache the useful prefix independently of the caller's limit."""
 
     async def produce() -> list[str]:
         body = await _lastfm("artist.getTopTags", artist=artist)
-        return [t["name"] for t in _as_list((body.get("toptags") or {}).get("tag"))[:limit] if t.get("name")]
+        return [t["name"] for t in _as_list((body.get("toptags") or {}).get("tag"))[:20] if t.get("name")]
 
-    return await cached(f"mix:lfm_artist_tags:{_key(artist)}", TTL_S, produce) or []
+    return (await cached(lastfm_artist_tags_cache_key(artist), TTL_S, produce) or [])[:limit]
 
 
 async def lastfm_tag_top_artists(tag: str, limit: int = 30) -> list[str]:

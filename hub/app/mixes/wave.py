@@ -677,8 +677,11 @@ async def absorb(rt: Runtime, results: list[build.GenResult]) -> int:
     await build.link_library(fresh)
     cfg = get_settings().cfg.mixes
     kept = [c for c in fresh.values() if not (rt.blocked and rt.blocked(c)) and build.keep(c, p, cfg)]
-    await _fetch_energy(st, kept)
-    await wf.prepare(kept, st.filters)
+    if st.filters.energy and (st.filters.genres or st.filters.lang):
+        await asyncio.gather(_fetch_energy(st, kept), wf.prepare(kept, st.filters))
+    else:
+        await _fetch_energy(st, kept)
+        await wf.prepare(kept, st.filters)
     if not isinstance(p, V2Profile):
         try:
             await asyncio.wait_for(_sound(p, kept), TASTE_TIMEOUT_S)
@@ -1606,8 +1609,7 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
             first.familiar = build.keep(first, profile, cfg) and first.familiar
             first.score = build.score(first, weights(), profile)
             if active:
-                await wf.prepare([first], filters)
-                await _fetch_energy(rt.state, [first])
+                await asyncio.gather(wf.prepare([first], filters), _fetch_energy(rt.state, [first]))
                 if not wf.matches(first, _first_filters(first, filters), energy=rt.state.energy):
                     rt.state.put(first)
                     first = None

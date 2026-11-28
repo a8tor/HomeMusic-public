@@ -8,10 +8,11 @@ import pytest
 from app.api.schemas import WaveFilters
 from app.catalog.deezer import BASE_URL, DeezerClient
 from app.catalog.models import CatalogArtist, CatalogTrack, SearchResults
+from app.catalog.cache import cache_set
 from app.config import get_settings
 from app.db import session_scope
 from app.matching.normalize import fingerprint
-from app.mixes import wave
+from app.mixes import filters as wf, wave
 from app.mixes.build import Cand
 from app.mixes.filters import deezer_genre_ids, detect_lang, fit, matches, normalize_genres, relaxed_axes, track_genres
 from app.models import Album, Track
@@ -45,6 +46,59 @@ def test_detect_lang(metadata, cached, expected):
     track = CatalogTrack(**({"ref": "dz:1", "source": "dz", "id": "1", "title": "Song", "artist": "Band"}
                             | metadata))
     assert detect_lang(Cand(track, wave_lang=cached)) == expected
+
+
+@pytest.mark.parametrize(("tag", "expected"), [
+    ("russian", "ru"), ("Russian-Classical", "ru"), ("russian speaking", "ru"),
+    ("not russian", "foreign"), ("russian cover", "foreign"), ("seen live", "foreign"),
+])
+async def test_artist_tag_infers_language_from_cached_metadata(env, monkeypatch, tag, expected):
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: True)
+    remote = AsyncMock(side_effect=AssertionError("warm cache must not call Last.fm"))
+    monkeypatch.setattr(wave.sources, "lastfm_artist_tags", remote)
+    artist = "P. I. Tchaikovsky"
+    await cache_set(wave.sources.lastfm_artist_tags_cache_key(artist), ["classical", tag], 60)
+    for lang in ("ru", "foreign"):
+        candidate = Cand(tr(8310, artist=artist).model_copy(update={"title": "Swan Lake"}), familiar=False)
+        filters = WaveFilters(genres=["classical"], lang=lang, familiarity="new", energy="low")
+        await wf.prepare([candidate], filters)
+        assert detect_lang(candidate) == expected
+        assert matches(candidate, filters, energy={candidate.key: 0.35}) is (lang == expected)
+    remote.assert_not_awaited()
+
+
+async def test_artist_enrichment_keeps_fast_result_when_another_times_out(env, monkeypatch):
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: True)
+    monkeypatch.setattr(wf, "ENRICH_TIMEOUT", 0.2)
+    calls = []
+    slow_started = asyncio.Event()
+
+    async def provider(method, *, artist):
+        calls.append(artist)
+        if artist == "Slow Artist":
+            slow_started.set()
+            await asyncio.Event().wait()
+        await slow_started.wait()  # Both artists have to be fetched concurrently.
+        return {"toptags": {"tag": [{"name": tag} for tag in (
+            "classical", "piano", "orchestral", "chamber", "baroque", "russian")]}}
+
+    monkeypatch.setattr(wave.sources, "_lastfm", provider)
+    filters = WaveFilters(genres=["classical"], lang="ru")
+    def candidate(n, artist):
+        return Cand(tr(n, artist=artist).model_copy(update={"title": f"Track {n}"}))
+
+    first = candidate(8311, "Fast Artist")
+    second = candidate(8312, "Fast Artist")
+    slow = candidate(8313, "Slow Artist")
+    await wf.prepare([first, second, slow], filters)
+    assert sorted(calls) == ["Fast Artist", "Slow Artist"]
+    assert matches(first, filters) and matches(second, filters)
+    assert not matches(slow, filters)
+    assert await wave.sources.lastfm_artist_tags("Fast Artist", limit=1) == ["classical"]
+    repeated = candidate(8314, "Fast Artist")
+    await wf.prepare([repeated], filters)
+    assert matches(repeated, filters)
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(("label", "expected"), [
