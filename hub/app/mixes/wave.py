@@ -291,8 +291,10 @@ class Runtime:
     tasks: set[asyncio.Task] = field(default_factory=set)
     refilling: bool = False  # also used by SmartRuntime
     refill_task: asyncio.Task | None = None
+    refill_waiting: bool = False  # a scheduled refill counts as pending, but /next must not wait on its cooldown
     refill_after: float = 0.0  # monotonic cooldown after a radio pass with no strict gains
     discovery_after: dict[str, float] = field(default_factory=dict)
+    discovery_retried: set[str] = field(default_factory=set)  # one repeat per source without a playable handout
     discovering: bool = False
     # a session of another kind (the smart shuffle, app.mixes.smart) keeps its state in its own row, and a track
     # played to its end is not downloaded for it
@@ -603,6 +605,8 @@ def _discovery_loaders(filters: WaveFilters) -> dict[str, Callable[[WaveFilters]
             loaders.update(lastfm=_discovery_lastfm, deezer=_discovery_deezer, chart=_discovery_chart)
         else:
             loaders.update(chart=_discovery_chart, lastfm=_discovery_lastfm, deezer=_discovery_deezer)
+        if not sources.lastfm_configured():
+            del loaders["lastfm"]
     return loaders
 
 
@@ -610,8 +614,11 @@ def _discovery_gen(rt: Runtime, source: str, load: Callable[[WaveFilters], Await
                    *, target: int = POOL_LOW) -> build.Gen | None:
     st = rt.state
     now = time.monotonic()
-    if not wf.active(st.filters) or len(st.pool) >= target or now < rt.discovery_after.get(source, 0):
+    if (not wf.active(st.filters) or len(st.pool) >= target or source in rt.discovery_retried
+            or now < rt.discovery_after.get(source, 0)):
         return None
+    if source in rt.discovery_after:
+        rt.discovery_retried.add(source)
     rt.discovery_after[source] = now + DISCOVERY_RETRY_S
     # Snapshot before awaiting the provider so a background fetch doesn't depend on mutable pool state.
     existing = {*st.out, *st.pool, *st.pool_relaxed, *st.nofile, *st.skipped_refs, *st.handed}
@@ -623,7 +630,7 @@ def _discovery_gen(rt: Runtime, source: str, load: Callable[[WaveFilters], Await
 
     async def fetch() -> list[CatalogTrack]:
         try:
-            tracks = await asyncio.wait_for(load(st.filters), SOURCE_WAIT_S)
+            tracks = list(await asyncio.wait_for(load(st.filters), SOURCE_WAIT_S))
             random.shuffle(tracks)
             out: list[CatalogTrack] = []
             seen: set[str] = set()
@@ -795,8 +802,8 @@ async def _refill_discovery(sid: str, rt: Runtime, loaders: dict[str, Callable])
             log.warning("wave %s: filter discovery refill (%s) failed", sid, source, exc_info=True)
 
 
-def _refill(sid: str, rt: Runtime) -> None:
-    """Warm the strict pool while passes make progress, without polling exhausted sources."""
+def _refill(sid: str, rt: Runtime, *, recover: bool = False) -> None:
+    """Warm the pool; an empty filtered /next may also schedule cooling sources."""
     st = rt.state
     if (rt.discovering or (rt.refill_task is not None and not rt.refill_task.done())
             or rt.profile is None or len(st.pool) >= POOL_HIGH):
@@ -806,12 +813,22 @@ def _refill(sid: str, rt: Runtime) -> None:
     filtered = wf.active(st.filters)
     now = time.monotonic()
     loaders = {source: load for source, load in _discovery_loaders(st.filters).items()
-               if now >= rt.discovery_after.get(source, 0)} if filtered else {}
-    if not loaders and (now < rt.refill_after or profile.empty):
+               if source not in rt.discovery_retried} if filtered else {}
+    admissions = [rt.discovery_after.get(source, 0) for source in loaders]
+    if not profile.empty and (not filtered or _refill_seeds(profile, st)):
+        admissions.append(rt.refill_after)
+    if not admissions:
         return
+    wake_at = min(admissions)
+    if wake_at > now and not (filtered and recover):
+        return
+    rt.refill_waiting = wake_at > now
 
     async def run() -> None:
         try:
+            while (delay := wake_at - time.monotonic()) > 0:
+                await asyncio.sleep(delay)
+            rt.refill_waiting = False
             log.info("wave %s: refill start strict=%d target=%d", sid, len(st.pool), POOL_HIGH)
             await _refill_discovery(sid, rt, loaders)
             while len(st.pool) < POOL_HIGH and time.monotonic() >= rt.refill_after:
@@ -847,6 +864,7 @@ def _refill(sid: str, rt: Runtime) -> None:
             rt.refill_after = time.monotonic() + DISCOVERY_RETRY_S
             log.warning("wave %s: refill failed", sid, exc_info=True)
         finally:
+            rt.refill_waiting = False
             log.info("wave %s: refill end strict=%d target=%d", sid, len(st.pool), POOL_HIGH)
 
     task = rt.refill_task = asyncio.create_task(run())
@@ -1690,8 +1708,9 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
     total_started = time.monotonic()
     timings: dict[str, float] = {}
     rt = await _runtime(sid, user)
-    if not rt.state.pool and rt.tasks:  # nothing to pick from yet: the sources still answer (outside the lock)
-        await asyncio.wait(set(rt.tasks), timeout=min(get_settings().wave_wait_s, SOURCE_WAIT_S))
+    working = {task for task in rt.tasks if not (rt.refill_waiting and task is rt.refill_task)}
+    if not rt.state.pool and working:  # sources still answering, not a timer waiting for admission
+        await asyncio.wait(working, timeout=min(get_settings().wave_wait_s, SOURCE_WAIT_S))
     if not rt.state.pool and not rt.tasks and rt.profile is None and not wf.active(rt.state.filters):
         async with session_scope() as s:
             row = await s.get(WaveSession, sid)
@@ -1734,7 +1753,10 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
         await _save(sid, rt, force=bool(played))
         timings["_save"] += time.monotonic() - save_started
         if len(st.pool) < POOL_HIGH:
-            _refill(sid, rt)
+            if not tracks and wf.active(st.filters):
+                _refill(sid, rt, recover=True)
+            else:
+                _refill(sid, rt)
         pending = _has_pending(rt) or (not tracks and not wf.active(st.filters))
         filter_relaxed = _filter_status(st.filters, tracks, pending)
     timings["total"] = time.monotonic() - total_started
@@ -1916,6 +1938,8 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
     st.out = new_out
     for c in added:
         st.handed[c.track.ref] = now
+    if added and active:
+        rt.discovery_retried.clear()
     listen.pin(rt.user_id, [*keep, *(c.track.ref for c in added)])
     if added:
         await _write_exclusions(rt.user_id, added, "shown", WAVE_SHOWN_TTL)

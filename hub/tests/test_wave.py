@@ -415,7 +415,7 @@ async def test_an_off_filter_deezer_candidate_is_not_probed(env, monkeypatch) ->
     await history(env["admin"])
     track = tr(8101)
     fake_sources(monkeypatch, [track])
-    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt, **kwargs: None)
     choose = AsyncMock(return_value=listen.Choice(track.ref, "preview", track.artist, track.title))
     monkeypatch.setattr(listen, "choose", choose)
     response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru"}})
@@ -765,7 +765,7 @@ async def test_legacy_relaxed_queue_is_rechecked_after_restart(env, monkeypatch)
     wrong = tr(8103).model_copy(update={"genre": "Jazz"})
     monkeypatch.setattr(wave.svc.deezer, "track", seed)
     fake_sources(monkeypatch, [strict, wrong, unknown])
-    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt, **kwargs: None)
     client = env["client"]
     r = await client.post("/api/wave/start", json={"seed": {"ref": seed.ref}, "filters": {"genres": ["rock"]}})
     assert r.status_code == 200, r.text
@@ -800,7 +800,7 @@ def energy_embedder(monkeypatch):
     monkeypatch.setattr(wave.embedder, "configured", lambda: True)
     monkeypatch.setattr(wave.embedder.EmbedderClient, "energies", spy)
     monkeypatch.setattr(wave, "_sound", AsyncMock())
-    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt, **kwargs: None)
     monkeypatch.setattr(wave, "_discovery_library", AsyncMock(return_value=[]))
     return spy
 
@@ -888,7 +888,7 @@ async def test_lang_is_never_relaxed(env, monkeypatch):
     rt = wave._rt[w["session_id"]]
     assert ru.ref in rt.state.pool_relaxed
     # Make source exhaustion deterministic independently of real profile seed radios.
-    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt, **kwargs: None)
     await wave.settle(w["session_id"])
     r = await client.post(f'/api/wave/{w["session_id"]}/next', json={"filters": {"lang": "ru"}})
     assert r.status_code == 200, r.text

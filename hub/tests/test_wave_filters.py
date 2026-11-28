@@ -17,7 +17,7 @@ from app.mixes.build import Cand
 from app.mixes.filters import deezer_genre_ids, detect_lang, fit, matches, normalize_genres, relaxed_axes, track_genres
 from app.models import Album, Track
 from app.services import svc
-from tests.test_wave import env as wave_env, fake_sources, history, tr
+from tests.test_wave import env as wave_env, ev, fake_sources, history, tr
 
 
 @pytest.fixture
@@ -195,7 +195,7 @@ async def test_track_wave_genre_filter(env, monkeypatch, filters, genre, expecte
     recommendation = tr(8301).model_copy(update={"genre": genre})
     fake_sources(monkeypatch, [recommendation])
     monkeypatch.setattr(svc.deezer, "search", AsyncMock(return_value=SearchResults()))
-    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt, **kwargs: None)
     client = env["client"]
 
     response = await client.post("/api/wave/start", json={"seed": {"ref": seed.ref}, "filters": filters})
@@ -565,6 +565,63 @@ async def test_refill_respects_retry_pause(monkeypatch):
     assert rt.refill_task is not first
     await rt.refill_task
     assert loader.await_count == 2
+
+
+@pytest.mark.parametrize("result", ["strict", "unchanged", "empty"])
+async def test_filtered_next_retries_cooling_source(env, monkeypatch, result):
+    current = tr(9400, "Георгий Свиридов").model_copy(update={"title": "Метель", "genre": "Classical"})
+    strict = tr(9401, "Сергей Прокофьев").model_copy(update={"genre": "Classical"})
+    pop = tr(9402, "Поп-исполнитель").model_copy(update={"genre": "Pop"})
+    foreign = tr(9403, "Foreign Soloist").model_copy(update={"title": "Sonata", "genre": "Classical"})
+    initial = [current, pop, foreign]
+    retried = {"strict": [*initial, strict], "unchanged": initial, "empty": []}[result]
+    calls = []
+
+    async def load(filters):
+        calls.append(wave.time.monotonic())
+        return initial if len(calls) == 1 else retried
+
+    fake_sources(monkeypatch, [])
+    monkeypatch.setattr(wave, "_discovery_loaders", lambda filters: {"test": load})
+    client = env["client"]
+    response = await asyncio.wait_for(client.post("/api/wave/start", json={
+        "filters": {"genres": ["classical"], "lang": "ru"},
+    }), timeout=2)
+    assert response.status_code == 200, response.text
+    start = response.json()
+    assert [t["ref"] for t in start["tracks"]] == [current.ref]
+    sid = start["session_id"]
+    await asyncio.wait_for(wave.settle(sid), timeout=1)
+    rt = wave._rt[sid]
+    admission = rt.discovery_after["test"] = wave.time.monotonic() + 0.8
+
+    async def next_empty_queue(*played):
+        response = await asyncio.wait_for(client.post(f"/api/wave/{sid}/next", json={
+            "queued": [], "played": list(played),
+        }), timeout=0.5)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    for played in ([ev("start", current.ref)], []):  # The second poll must not wait on the registered timer.
+        batch = await next_empty_queue(*played)
+        assert batch["pending"] is True and batch["filter_relaxed"] == []
+        assert batch["tracks"] == batch["keep"] == batch["add"] == []
+        assert len(calls) == 1
+    await asyncio.wait_for(wave.settle(sid), timeout=2)
+    assert len(calls) == 2 and calls[1] >= admission
+
+    batch = await next_empty_queue()
+    assert batch["keep"] == []
+    if result == "strict":
+        assert [t["ref"] for t in batch["tracks"]] == [t["ref"] for t in batch["add"]] == [strict.ref]
+        assert batch["filter_relaxed"] == []
+        assert rt.discovery_retried == set()
+    else:
+        rt.discovery_after["test"] = 0  # even after cooldown, polls must not restart a spent source
+        batch = await next_empty_queue()
+        assert batch["tracks"] == batch["keep"] == batch["add"] == []
+        assert batch["pending"] is False and batch["filter_relaxed"] == ["exhausted"]
+        assert len(calls) == 2
 
 
 async def test_background_refill_does_not_block_the_answer(warm_wave, monkeypatch):
