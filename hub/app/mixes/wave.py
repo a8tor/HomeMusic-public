@@ -35,14 +35,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import WaveFilters
 from app.catalog.models import CatalogTrack, split_ref
 from app.config import get_settings
-from app.db import session_scope
+from app.db import session_scope, sqlite_busy
 from app.jobs.queue import enqueue, notify
 from app.library.owned import ACTIVE_STATUSES
 from app.matching.normalize import fingerprint
@@ -62,6 +63,8 @@ BATCH = 5
 HISTORY_MAX = 50
 STATE_HISTORY_MAX = 300
 SAVE_DEBOUNCE_S = 1.5
+SAVE_BUSY_BACKOFF_S = (0.1, 0.5, 1.5)
+EVENT_BUSY_BACKOFF_S = 0.1
 PROFILE_TIMEOUT_S = 5.0
 WAVE_SHOWN_TTL = timedelta(hours=12)
 WAVE_SKIP_TTL = timedelta(days=3)
@@ -301,6 +304,7 @@ class Runtime:
     save: Callable[[str, Runtime], Awaitable[None]] | None = None
     last_saved: float = 0.0
     save_pending: bool = False
+    save_retry_task: asyncio.Task | None = None
     last_state_kb: int = 0
     download_finished: bool = True
     blocked: Callable[[build.Cand], bool] | None = None  # candidates the session never takes (its own songs...)
@@ -341,22 +345,70 @@ async def _write_exclusions(user_id: int, tracks: list[build.Cand], reason: str,
         log.exception("wave exclusion write failed: user=%s reason=%s", user_id, reason)
 
 
-async def _save(sid: str, rt: Runtime, *, force: bool = False) -> None:
-    now_mono = time.monotonic()
-    if not force and rt.last_saved and now_mono - rt.last_saved < SAVE_DEBOUNCE_S:
-        rt.save_pending = True
-        return
+async def _write_state(sid: str, rt: Runtime) -> None:
     started = time.monotonic()
     dumped = rt.state.dump()
     size = len(json.dumps(dumped, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     async with session_scope() as s:
-        row = await s.get(WaveSession, sid)
-        if row is not None:
-            row.state_json, row.updated_at = dumped, utcnow()
+        await s.execute(update(WaveSession).where(WaveSession.id == sid, WaveSession.cleared_at.is_(None))
+                        .values(state_json=dumped, updated_at=utcnow()))
     rt.last_saved = time.monotonic()
     rt.save_pending = False
     rt.last_state_kb = size // 1024
     log.debug("wave %s: _save=%.3fs state=%dKB (bytes=%d)", sid, time.monotonic() - started, size // 1024, size)
+
+
+async def _retry_save(sid: str, rt: Runtime) -> None:
+    try:
+        for delay in SAVE_BUSY_BACKOFF_S:
+            await asyncio.sleep(delay)
+            async with rt.lock:
+                if not rt.save_pending:
+                    return
+                try:
+                    # Snapshot under the same lock as /next: never overwrite newer state with an old retry.
+                    await _write_state(sid, rt)
+                except OperationalError as e:
+                    if not sqlite_busy(e):
+                        raise
+                else:
+                    return
+        log.warning("wave %s: SQLite still busy; state remains dirty for the next save", sid)
+    finally:
+        rt.save_retry_task = None
+
+
+def _report_save_failure(task: asyncio.Task) -> None:
+    if not task.cancelled() and (error := task.exception()) is not None:
+        log.error("wave background state write failed", exc_info=error)
+
+
+async def _save(sid: str, rt: Runtime, *, force: bool = False) -> None:
+    # Callers hold rt.lock. A pending recovery will persist the newest state, including these changes.
+    if rt.save_retry_task is not None or (not force and rt.last_saved
+                                          and time.monotonic() - rt.last_saved < SAVE_DEBOUNCE_S):
+        rt.save_pending = True
+        return
+    try:
+        await _write_state(sid, rt)
+    except OperationalError as e:
+        if not sqlite_busy(e):
+            raise
+        rt.save_pending = True
+        log.warning("wave %s: SQLite busy; scheduling state save retry", sid)
+        rt.save_retry_task = asyncio.create_task(_retry_save(sid, rt))
+        rt.save_retry_task.add_done_callback(_report_save_failure)
+
+
+async def _count_next(sid: str) -> None:
+    try:
+        async with session_scope() as s:
+            await s.execute(update(WaveSession).where(WaveSession.id == sid)
+                            .values(next_calls=func.coalesce(WaveSession.next_calls, 0) + 1))
+    except OperationalError as e:
+        if not sqlite_busy(e):
+            raise
+        log.warning("wave %s: SQLite busy; skipping next_calls analytics", sid)
 
 
 async def _runtime(sid: str, user: User) -> Runtime:
@@ -1503,6 +1555,8 @@ async def clear_old(s: AsyncSession, now: datetime | None = None) -> int:
         row.state_json = {"cleared": True, **{k: old[k] for k in CLEARED_KEYS if k in old}}
         row.cleared_at = now
         if (rt := _rt.pop(row.id, None)) is not None:
+            if rt.save_retry_task is not None:
+                rt.save_retry_task.cancel()
             for t in rt.tasks:
                 t.cancel()
     return len(rows)
@@ -1682,7 +1736,8 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
         rt.tasks.add(task)
         task.add_done_callback(rt.tasks.discard)
     save_started = time.monotonic()
-    await _save(sid, rt, force=True)
+    async with rt.lock:
+        await _save(sid, rt, force=True)
     timings["_save"] = time.monotonic() - save_started
     if len(rt.state.pool) < POOL_HIGH:
         _refill(sid, rt)
@@ -1704,6 +1759,31 @@ def _filter_status(filters: WaveFilters, tracks: list[build.Cand], pending: bool
     return ["exhausted"] if wf.active(filters) and not tracks and not pending else []
 
 
+async def _next_inputs(sid: str, rt: Runtime, played: list[Any]):
+    # Only retry the DB-only intake, before learning, queue mutations or scheduling downloads.
+    for attempt in range(2):
+        try:
+            async with session_scope() as s:
+                if played:
+                    # Take the writer slot before record() reads existing events for deduplication.
+                    await s.execute(text("BEGIN IMMEDIATE"))
+                recorded, events = await record(s, sid, rt.user_id, played)
+                if rt.state.taste_model == "v2":
+                    events = list((await s.execute(select(PlayEvent).where(PlayEvent.user_id == rt.user_id,
+                        PlayEvent.context == f"wave:{sid}", PlayEvent.ts <= utcnow())
+                        .order_by(PlayEvent.ts, PlayEvent.id))).scalars())
+                seed_json = (await s.execute(select(WaveSession.seed_json).where(WaveSession.id == sid))).scalar_one_or_none()
+            return recorded, events, seed_json
+        except OperationalError as e:
+            if not sqlite_busy(e):
+                raise
+            if attempt:
+                # Do not acknowledge events that did not commit; clients can resubmit their event IDs.
+                log.warning("wave %s: SQLite busy; play events not acknowledged", sid)
+                raise WaveError(503, "База занята: повторите запрос волны") from e
+            await asyncio.sleep(EVENT_BUSY_BACKOFF_S)
+
+
 async def next_batch(user: User, sid: str, played: list[Any], queued: list[str]) -> Batch:
     total_started = time.monotonic()
     timings: dict[str, float] = {}
@@ -1719,16 +1799,8 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
                 if seed_track is not None:
                     rt.state.pool[seed_track.ref] = build.Cand(track=seed_track, gens={"seed": 0})
     async with rt.lock:
-        async with session_scope() as s:
-            recorded, events = await record(s, sid, user.id, played)
-            if rt.state.taste_model == "v2":
-                events = list((await s.execute(select(PlayEvent).where(PlayEvent.user_id == user.id,
-                    PlayEvent.context == f"wave:{sid}", PlayEvent.ts <= utcnow())
-                    .order_by(PlayEvent.ts, PlayEvent.id))).scalars())
-            row = await s.get(WaveSession, sid)
-            seed_json = row.seed_json if row else None
-            if row is not None:
-                row.next_calls = (row.next_calls or 0) + 1
+        recorded, events, seed_json = await _next_inputs(sid, rt, played)
+        await _count_next(sid)
         await _profile(rt, user, timings=timings)  # after events and external state changes
         stage = time.monotonic()
         await learn(sid, rt, events)
@@ -2035,10 +2107,16 @@ async def settle(sid: str) -> None:
 
 async def reset() -> None:
     """Forget the sessions in memory and stop their tasks (shutdown, tests): they load from the database again."""
+    retries = []
     for rt in _rt.values():
+        if rt.save_retry_task is not None:
+            rt.save_retry_task.cancel()
+            retries.append(rt.save_retry_task)
         for t in rt.tasks:
             t.cancel()
     _rt.clear()
+    if retries:
+        await asyncio.gather(*retries, return_exceptions=True)
 
 
 def generator_title(name: str) -> str:

@@ -5,14 +5,21 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from sqlite3 import SQLITE_BUSY
 
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+
+
+def sqlite_busy(exc: OperationalError) -> bool:
+    """Match SQLite BUSY (including extended codes such as BUSY_SNAPSHOT), not other DB errors."""
+    return (getattr(exc.orig, "sqlite_errorcode", 0) & 0xff) == SQLITE_BUSY
 
 
 def _set_pragmas(dbapi_conn, _record) -> None:

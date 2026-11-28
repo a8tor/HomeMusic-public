@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import DownloadItemOut
@@ -548,10 +548,10 @@ async def import_downloaded(item_id: int, user_id: int, q: TrackQuery, meta: dic
 
 
 async def after_import(user_id: int, linked: bool) -> None:
-    async with session_scope() as s:
-        if linked:
-            await process_playlist_adds(s)
-        else:
+    if linked:
+        await process_playlist_adds()
+    else:
+        async with session_scope() as s:
             await enqueue_scan(s)
     notify()
 
@@ -559,8 +559,7 @@ async def after_import(user_id: int, linked: bool) -> None:
 @on_final_failure("download_item")
 async def _download_failed(job: Job, exc: Exception) -> None:
     await update_item(int(job.payload_json["item_id"]), status="failed", error=f"{exc}"[:500])
-    async with session_scope() as s:
-        await process_playlist_adds(s)
+    await process_playlist_adds()
 
 
 # --- scan + link + playlists ---------------------------------------------------------------------
@@ -608,10 +607,10 @@ async def handle_scan(job: Job) -> None:
         await star_liked(s, done_items)
         await imports_done(s, done_items)
         await mixes_done(s, done_items)
-        await process_playlist_adds(s)
         still = (
             await s.execute(select(func.count()).select_from(Track).where(Track.nd_song_id.is_(None)))
         ).scalar_one()
+    await process_playlist_adds()
     if not still:
         return
     # Navidrome may need another pass (file just landed while the scan was running) — a few, not forever: each pass is
@@ -767,33 +766,48 @@ def insert_playlist_songs(current: list[str], entries: list[tuple[str | None, st
     return songs
 
 
+_playlist_adds_lock = asyncio.Lock()
+
+
 async def playlist_adds_loop() -> None:
     """Recover pending additions on startup and retry Navidrome failures without another download or scan."""
     while True:
         try:
-            async with session_scope() as s:
-                await process_playlist_adds(s)
+            await process_playlist_adds()
         except Exception:
             log.exception("pending playlist additions failed")
         await asyncio.sleep(30)
 
 
-async def process_playlist_adds(s: AsyncSession) -> None:
+async def process_playlist_adds() -> None:
+    """Serialize the snapshot, Navidrome edits and commits within the single Hub process."""
+    async with _playlist_adds_lock:
+        await _process_playlist_adds()
+
+
+async def _mark_playlist_applied(entries: list[tuple[PendingPlaylistAdd, str]]) -> None:
+    async with session_scope() as s:
+        for add, song in entries:
+            await s.execute(update(PendingPlaylistAdd).where(PendingPlaylistAdd.id == add.id,
+                            PendingPlaylistAdd.download_item_id == add.download_item_id).values(applied_song_id=song))
+    for add, song in entries:
+        add.applied_song_id = song  # detached snapshot; only update after commit
+
+
+async def _process_playlist_adds() -> None:
     """Wait for active downloads, pass manual review, and insert a reviewed song back into its requested place."""
     from app.auth import user_navidrome
 
-    # Serialize readers through the transaction commit, including concurrent scan/download completions.
-    # An asyncio lock released here would let the next caller see uncommitted additions and add them twice.
-    await s.execute(update(PendingPlaylistAdd).where(PendingPlaylistAdd.id == -1).values(position=0))
-    rows = (
-        await s.execute(
-            select(PendingPlaylistAdd, DownloadItem, Track)
-            .join(DownloadItem, DownloadItem.id == PendingPlaylistAdd.download_item_id)
-            .outerjoin(Track, Track.id == DownloadItem.track_id)
-            .order_by(PendingPlaylistAdd.playlist_id, DownloadItem.batch_id,
-                      PendingPlaylistAdd.position, PendingPlaylistAdd.id)
-        )
-    ).all()
+    async with session_scope() as s:
+        rows = (
+            await s.execute(
+                select(PendingPlaylistAdd, DownloadItem, Track)
+                .join(DownloadItem, DownloadItem.id == PendingPlaylistAdd.download_item_id)
+                .outerjoin(Track, Track.id == DownloadItem.track_id)
+                .order_by(PendingPlaylistAdd.playlist_id, DownloadItem.batch_id,
+                          PendingPlaylistAdd.position, PendingPlaylistAdd.id)
+            )
+        ).all()
     groups: dict[tuple[int, str], list[tuple[PendingPlaylistAdd, DownloadItem, Track | None]]] = {}
     for add, item, track in rows:
         groups.setdefault((add.user_id, add.playlist_id), []).append((add, item, track))
@@ -811,36 +825,49 @@ async def process_playlist_adds(s: AsyncSession) -> None:
             break  # active downloads still finish in order
         new = [(add, song) for add, song in ready if not add.applied_song_id]
         if new:
-            user = await s.get(User, user_id)
+            async with session_scope() as s:
+                user = await s.get(User, user_id)
             if user is None:
                 continue
             nd = user_navidrome(user)
             try:
                 if any(add.applied_song_id for add, _ in ready):
-                    current = [e["id"] for e in (await nd.get_playlist(playlist_id)).get("entry", [])]
-                    songs = insert_playlist_songs(current, [(a.applied_song_id, song) for a, song in ready])
-                    await nd.replace_playlist_songs(playlist_id, songs)
+                    try:
+                        current = [e["id"] for e in (await nd.get_playlist(playlist_id)).get("entry", [])]
+                        songs = insert_playlist_songs(current, [(a.applied_song_id, song) for a, song in ready])
+                        await nd.replace_playlist_songs(playlist_id, songs)
+                    except Exception as e:
+                        log.warning("playlist %s add failed: %r", playlist_id, e)
+                        continue
+                    await _mark_playlist_applied(new)
                 else:
+                    failed = False
                     for k in range(0, len(new), 300):
-                        await nd.update_playlist(playlist_id, add=[song for _, song in new[k:k + 300]])
-                        # Flush each successful chunk so a later chunk's failure cannot duplicate it on retry.
-                        for add, song in new[k:k + 300]:
-                            add.applied_song_id = song
-                        await s.flush()
-            except Exception as e:
-                log.warning("playlist %s add failed: %r", playlist_id, e)
-                continue
+                        chunk = new[k:k + 300]
+                        try:
+                            await nd.update_playlist(playlist_id, add=[song for _, song in chunk])
+                        except Exception as e:
+                            log.warning("playlist %s add failed: %r", playlist_id, e)
+                            failed = True
+                            break
+                        # Commit before the next remote call, with no writer held during HTTP.
+                        await _mark_playlist_applied(chunk)
+                    if failed:
+                        continue  # preserve successfully committed anchors on a later chunk failure
             finally:
                 await nd.aclose()
-            for add, song in new:
-                add.applied_song_id = song
         blocked = False
+        remove = []
         for add, item, _ in entries:
             if item.status in ("failed", "cancelled") or (add.applied_song_id and not blocked):
-                await s.delete(add)
+                remove.append(add)
             elif not add.applied_song_id:
                 blocked = True
-    await s.flush()
+        if remove:
+            async with session_scope() as s:
+                for add in remove:
+                    await s.execute(delete(PendingPlaylistAdd).where(PendingPlaylistAdd.id == add.id,
+                                    PendingPlaylistAdd.download_item_id == add.download_item_id))
 
 
 # --- batch expansion ------------------------------------------------------------------------------

@@ -8,6 +8,7 @@ test_mix_sources.py); Navidrome is the mock of test_mixes.py.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,7 +16,8 @@ from typing import Any
 
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import event as sa_event, select, text
+from sqlalchemy.exc import OperationalError
 
 from app.api.schemas import WaveFilters
 from app.catalog.models import CatalogTrack
@@ -1533,3 +1535,101 @@ async def test_launch_fields_of_the_wave_events_are_stored(env, monkeypatch) -> 
     async with session_scope() as s:
         row = (await s.execute(select(PlayEvent).where(PlayEvent.event_id == e["event_id"]))).scalar_one()
     assert (row.context, row.launch_id, row.launch_origin) == (f"wave:{sid}", f"wave:{sid}", "wave")
+
+
+@pytest.fixture
+async def contention_wave(env, monkeypatch):
+    from app import db
+
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(5000 + i) for i in range(10)])
+    r = await env["client"].post("/api/wave/start", json={})
+    assert r.status_code == 200, r.text
+    w = r.json()
+    await wave.settle(w["session_id"])
+
+    @sa_event.listens_for(db.engine().sync_engine, "checkout")
+    def short_timeout(conn, *_):
+        cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout=25")
+        cur.close()
+
+    monkeypatch.setattr(wave, "EVENT_BUSY_BACKOFF_S", 0.01)
+    monkeypatch.setattr(wave, "SAVE_BUSY_BACKOFF_S", (0.01, 0.01))
+    return w["session_id"], ev("start", w["tracks"][0]["ref"])
+
+
+async def test_busy_event_intake_is_not_acknowledged_and_resubmits_once(env, contention_wave):
+    from app.db import session_scope
+    from app.models import PlayEvent
+
+    sid, e = contention_wave
+    client = env["client"]
+    path = f"/api/wave/{sid}/next"
+    async with session_scope() as writer:
+        await writer.execute(text("BEGIN IMMEDIATE"))
+        r = await asyncio.wait_for(client.post(path, json={"played": [e]}), 2)
+        assert r.status_code == 503, r.text
+        assert (await writer.execute(select(PlayEvent).where(PlayEvent.event_id == e["event_id"]))).first() is None
+        assert (await wave_row(sid)).next_calls == 0
+    for key in ("accepted", "duplicates"):
+        r = await client.post(path, json={"played": [e]})
+        assert r.status_code == 200 and r.json()["recorded"][key] == 1, r.text
+    assert (await wave_row(sid)).next_calls == 2
+
+
+async def test_busy_analytics_and_state_do_not_replay_next(env, contention_wave, monkeypatch):
+    from app import db
+    from app.models import PlayEvent
+
+    sid, e = contention_wave
+    rt = wave._rt[sid]
+    learned = []
+    learn = wave.learn
+
+    async def learn_once(*args):
+        learned.append(sid)
+        await learn(*args)
+
+    monkeypatch.setattr(wave, "learn", learn_once)
+    # Occupy the writer after intake has committed, before analytics and handout state writes.
+    async with db.sessionmaker()() as writer:
+        count_next = wave._count_next
+
+        async def contested_count(sid):
+            await writer.execute(text("BEGIN IMMEDIATE"))
+            await count_next(sid)
+
+        monkeypatch.setattr(wave, "_count_next", contested_count)
+        r = await asyncio.wait_for(env["client"].post(f"/api/wave/{sid}/next", json={"played": [e]}), 2)
+        assert r.status_code == 200 and r.json()["recorded"]["accepted"] == 1, r.text
+        assert learned == [sid] and rt.save_pending
+        assert (await writer.execute(select(PlayEvent).where(PlayEvent.event_id == e["event_id"]))).scalar_one()
+        assert (await wave_row(sid)).next_calls == 0
+        # The queued retry must persist the latest state, not the snapshot that hit BUSY.
+        async with rt.lock:
+            rt.state.seen.add("latest-state")
+            await writer.rollback()
+    if retry := rt.save_retry_task:
+        await asyncio.wait_for(retry, 2)
+    row = await wave_row(sid)
+    assert not rt.save_pending and set(row.state_json["seen"]) >= {e["event_id"], "latest-state"}
+
+
+async def test_atomic_next_counter_and_nonbusy_state_error(contention_wave, monkeypatch):
+    from app import db
+
+    sid, _ = contention_wave
+    await asyncio.wait_for(asyncio.gather(*(wave._count_next(sid) for _ in range(4))), 2)
+    assert (await wave_row(sid)).next_calls == 4
+    rt = wave._rt[sid]
+
+    async def broken(*_):
+        async with db.session_scope() as s:
+            await s.execute(text("UPDATE missing_table SET value=0"))
+
+    monkeypatch.setattr(wave, "_write_state", broken)
+    async with rt.lock:
+        with pytest.raises(OperationalError, match="no such table"):
+            await wave._save(sid, rt, force=True)
+    assert rt.save_retry_task is None

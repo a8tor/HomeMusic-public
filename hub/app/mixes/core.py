@@ -396,21 +396,24 @@ async def remove_unheard(mix_ids: list[int]) -> int:
     starred, listed = keep
     removed = 0
     async with session_scope() as s:
-        items = list((await s.execute(select(MixItem).where(
+        item_ids = list((await s.execute(select(MixItem.id).where(
             MixItem.mix_id.in_(mix_ids), MixItem.downloaded_for_mix.is_(True)))).scalars())
-        for it in items:
-            if (it.features_json or {}).get("cleanup"):
+    for item_id in item_ids:
+        # Commit each decision before waiting for the library lock or filesystem on the next item.
+        async with session_scope() as s:
+            it = await s.get(MixItem, item_id)
+            if it is None or (it.features_json or {}).get("cleanup"):
                 continue
             dl = await s.get(DownloadItem, it.download_item_id) if it.download_item_id else None
             if dl is not None and dl.status in ACTIVE_STATUSES:
                 continue  # still downloading: decided at the next closing
-            if not it.track_id and dl is not None and dl.status == "done":
-                it.track_id = dl.track_id
-            track = await s.get(Track, it.track_id) if it.track_id else None
+            track_id = it.track_id or (dl.track_id if dl is not None and dl.status == "done" else None)
+            track = await s.get(Track, track_id) if track_id else None
             if track is None:
                 verdict = "nothing"  # did not download, or deleted already
             elif why := await kept_reasons(s, it, track, starred, listed):
                 log.info("mix cleanup: keep %s — %s (%s)", track.artist, track.title, ", ".join(why))
+                it.track_id = track.id
                 if why == ["mix"]:
                     continue  # another mix holds it for now: decided when that one closes
                 verdict = "kept: " + ", ".join(why)
@@ -419,11 +422,11 @@ async def remove_unheard(mix_ids: list[int]) -> int:
                 await editor.trash_track(s, track)
                 verdict = "trashed"
                 removed += 1
+                # Keep the scan durable even if a later item fails.
+                await enqueue_scan(s)
             it.features_json = {**(it.features_json or {}), "cleanup": verdict}
-        if removed:
-            await enqueue_scan(s)
-    if removed:
-        notify()
+        if verdict == "trashed":
+            notify()
     return removed
 
 

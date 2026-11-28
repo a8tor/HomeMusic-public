@@ -6,7 +6,7 @@ import uuid
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import event, select, text
 
 from app import db
 from app.jobs.downloads import process_playlist_adds
@@ -15,7 +15,10 @@ from app.security import encrypt
 
 
 @pytest.fixture
-async def playlist_env(hub_env):
+async def playlist_env(hub_env, monkeypatch):
+    from app.jobs import downloads
+
+    monkeypatch.setattr(downloads, "_playlist_adds_lock", asyncio.Lock())
     db.init_engine()
     async with db.session_scope() as s:
         user = User(nd_username="qa", nd_password_enc=encrypt("qa-password"))
@@ -80,8 +83,7 @@ async def finish(s, item):
 
 
 async def sync():
-    async with db.session_scope() as s:
-        await process_playlist_adds(s)
+    await process_playlist_adds()
 
 
 async def pending():
@@ -153,6 +155,65 @@ async def test_concurrent_completions_do_not_duplicate_playlist_songs(playlist_e
     await asyncio.gather(sync(), sync())
     assert state["songs"] == ["existing", *(f"song{i}" for i in ids[1:])]
     assert state["writes"] == 1
+
+
+async def test_playlist_network_wait_does_not_block_another_writer(playlist_env, monkeypatch):
+    from app.library.navidrome import NavidromeClient
+
+    user_id, state = playlist_env
+    ids = await seed(user_id, ["done"])
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = NavidromeClient.update_playlist
+
+    async def delayed(self, *args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(NavidromeClient, "update_playlist", delayed)
+
+    @event.listens_for(db.engine().sync_engine, "checkout")
+    def short_timeout(conn, *_):
+        cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout=25")
+        cur.close()
+
+    first = asyncio.create_task(sync())
+    second = asyncio.create_task(sync())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        async with db.session_scope() as s:
+            await s.execute(text("UPDATE users SET nd_username=nd_username WHERE id=:id"), {"id": user_id})
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 2)
+    assert state["songs"] == ["existing", f"song{ids[0]}"]
+    assert state["writes"] == 1
+    assert await pending() == []
+
+
+async def test_successful_chunk_is_committed_before_the_next_request(playlist_env, monkeypatch):
+    from app.library.navidrome import NavidromeClient
+
+    user_id, state = playlist_env
+    ids = await seed(user_id, ["done"] * 301)
+    original = NavidromeClient.update_playlist
+
+    async def fail_second(self, *args, **kwargs):
+        if state["writes"] == 1:
+            anchors = {p.download_item_id: p.applied_song_id for p in await pending()}
+            assert anchors[ids[299]] == f"song{ids[299]}"
+            assert anchors[ids[300]] is None
+            raise httpx.ConnectError("second chunk failed")
+        await original(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(NavidromeClient, "update_playlist", fail_second)
+        await sync()
+    assert state["songs"] == ["existing", *(f"song{i}" for i in ids[:300])]
+    await sync()
+    assert state["songs"] == ["existing", *(f"song{i}" for i in ids)]
+    assert await pending() == []
 
 
 @pytest.mark.parametrize("current,entries,expected", [
