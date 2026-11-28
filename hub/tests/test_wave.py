@@ -407,7 +407,7 @@ async def test_preview_only_candidates_are_filtered_before_handout(env, monkeypa
     assert len(result["tracks"]) >= 1
 
 
-async def test_a_relaxed_deezer_candidate_is_probed_before_handout(env, monkeypatch) -> None:
+async def test_an_off_filter_deezer_candidate_is_not_probed(env, monkeypatch) -> None:
     from unittest.mock import AsyncMock
 
     from app import listen
@@ -415,13 +415,14 @@ async def test_a_relaxed_deezer_candidate_is_probed_before_handout(env, monkeypa
     await history(env["admin"])
     track = tr(8101)
     fake_sources(monkeypatch, [track])
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
     choose = AsyncMock(return_value=listen.Choice(track.ref, "preview", track.artist, track.title))
     monkeypatch.setattr(listen, "choose", choose)
     response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru"}})
     assert response.status_code == 200, response.text
     assert response.json()["tracks"] == []
     assert response.json()["filter_relaxed"] == ["exhausted"]
-    choose.assert_awaited_once_with(track.ref, background=True, cancel_resolution_on_cancel=True)
+    choose.assert_not_awaited()
 
 
 async def test_a_library_candidate_skips_the_probe(env, monkeypatch) -> None:
@@ -757,25 +758,38 @@ def ev(kind: str, ref: str, position: float | None = None) -> dict[str, Any]:
             "position_s": position, "duration_s": 200, "client": "pwa"}
 
 
-async def test_a_too_narrow_filter_relaxes_and_reports_it(env, monkeypatch):
-    await history(env["admin"])
-    unknown = tr(8101)
-    wrong = tr(8102).model_copy(update={"genre": "Jazz"})
-    fake_sources(monkeypatch, [wrong, unknown])
+async def test_legacy_relaxed_queue_is_rechecked_after_restart(env, monkeypatch):
+    seed = tr(8100, "Seed Artist").model_copy(update={"genre": "Jazz"})
+    strict = tr(8101).model_copy(update={"genre": "Rock"})
+    unknown = tr(8102)
+    wrong = tr(8103).model_copy(update={"genre": "Jazz"})
+    monkeypatch.setattr(wave.svc.deezer, "track", seed)
+    fake_sources(monkeypatch, [strict, wrong, unknown])
+    monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
     client = env["client"]
-    r = await client.post("/api/wave/start", json={"filters": {"genres": ["rock"], "lang": "ru"}})
+    r = await client.post("/api/wave/start", json={"seed": {"ref": seed.ref}, "filters": {"genres": ["rock"]}})
     assert r.status_code == 200, r.text
     w = r.json()
-    assert [t["ref"] for t in w["tracks"]] == [unknown.ref]
-    assert w["filter_relaxed"] == ["genres"]
-    await wave.settle(w["session_id"])
-    r = await client.post(f'/api/wave/{w["session_id"]}/next', json={"queued": [unknown.ref]})
+    sid = w["session_id"]
+    assert [t["ref"] for t in w["tracks"]] == [seed.ref]
+    assert w["filter_relaxed"] == []
+    await wave.settle(sid)
+    rt = wave._rt[sid]
+    # Reproduce a persisted queue handed out by the old, relaxing implementation.
+    for track in (strict, unknown, wrong):
+        rt.state.out[track.ref] = build.Cand(track, gens={"ytm_radio": 0})
+        rt.state.handed[track.ref] = wave.time.time()
+    await wave._save(sid, rt, force=True)
+    await wave.reset()
+
+    r = await client.post(f"/api/wave/{sid}/next", json={"queued": [seed.ref, unknown.ref, strict.ref, wrong.ref]})
     assert r.status_code == 200, r.text
     batch = r.json()
     assert batch["filters"] == w["filters"]
-    assert batch["keep"] == [unknown.ref]
-    assert wrong.ref in {t["ref"] for t in batch["add"]}
-    assert batch["filter_relaxed"] == ["genres"]
+    assert batch["keep"] == [seed.ref, strict.ref]
+    assert batch["add"] == [] and batch["filter_relaxed"] == []
+    assert [t["ref"] for t in batch["tracks"]] == batch["keep"]
+    assert set(wave._rt[sid].state.out) == {seed.ref, strict.ref}
 
 
 @pytest.fixture
@@ -787,6 +801,7 @@ def energy_embedder(monkeypatch):
     monkeypatch.setattr(wave.embedder.EmbedderClient, "energies", spy)
     monkeypatch.setattr(wave, "_sound", AsyncMock())
     monkeypatch.setattr(wave, "_refill", lambda sid, rt: None)
+    monkeypatch.setattr(wave, "_discovery_library", AsyncMock(return_value=[]))
     return spy
 
 
@@ -838,21 +853,21 @@ async def test_unknown_energy_is_not_fetched_twice(env, energy_embedder):
 async def test_a_dead_embedder_does_not_break_the_wave(env, monkeypatch, energy_embedder, caplog):
     energy_embedder.side_effect = wave.embedder.EmbedderDown("offline")
     out = await _start_energy_wave(env, monkeypatch, "high", [None])
-    assert [t["ref"] for t in out["tracks"]] == ["dz:8200"]
-    assert out["filter_relaxed"] == ["energy"]
+    assert out["tracks"] == [] and out["pending"] is False
+    assert out["filter_relaxed"] == ["exhausted"]
     assert "energy lookup failed" in caplog.text
 
 
-async def test_energy_relaxation_is_reported(env, monkeypatch, energy_embedder):
+async def test_neutral_and_unknown_energy_never_fill_a_calm_wave(env, monkeypatch, energy_embedder):
     energy_embedder.return_value = {"dz:8200": 0.5, "dz:8201": None}
     out = await _start_energy_wave(env, monkeypatch, "low", energy_embedder.return_value)
     sid = out["session_id"]
     await wave.settle(sid)
-    queued = [t["ref"] for t in out["tracks"]]
-    r = await env["client"].post(f"/api/wave/{sid}/next", json={"queued": queued})
+    assert out["tracks"] == [] and out["pending"] is False
+    r = await env["client"].post(f"/api/wave/{sid}/next", json={})
     assert r.status_code == 200, r.text
-    assert {t["ref"] for t in r.json()["tracks"]} == {"dz:8200", "dz:8201"}
-    assert r.json()["filter_relaxed"] == ["energy"]
+    assert r.json()["tracks"] == [] and r.json()["pending"] is False
+    assert r.json()["filter_relaxed"] == ["exhausted"]
     assert not wave._rt[sid].state.pool
 
 

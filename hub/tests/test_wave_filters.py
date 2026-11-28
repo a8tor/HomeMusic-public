@@ -185,7 +185,7 @@ def test_unknown_genre_is_not_strict():
 
 @pytest.mark.parametrize(("filters", "genre", "expected_refs", "relaxed"), [
     pytest.param({"genres": ["classical"]}, "Classical", ["dz:8301"], [], id="strict-recommendation"),
-    pytest.param({"genres": ["classical"]}, None, ["dz:8301"], ["genres"], id="genre-relaxed"),
+    pytest.param({"genres": ["classical"]}, None, [], ["exhausted"], id="unknown-genre-excluded"),
     pytest.param({}, None, ["dz:8301"], [], id="empty-filters"),
     pytest.param({"genres": ["classical"], "lang": "foreign"}, None, [], ["exhausted"], id="language-never-relaxed"),
 ])
@@ -302,8 +302,8 @@ async def test_discovery_failure_does_not_break_the_wave(env, monkeypatch, caplo
     response = await env["client"].post("/api/wave/start", json={"filters": {"genres": ["classical"]}})
     assert response.status_code == 200, response.text
     start = response.json()
-    assert [t["ref"] for t in start["tracks"]] == [rock.ref]
-    assert start["filter_relaxed"] == ["genres"]
+    assert start["tracks"] == [] and start["pending"] is False
+    assert start["filter_relaxed"] == ["exhausted"]
     assert any(r.levelname == "WARNING" and "filter discovery" in r.message and "offline" in r.message
                for r in caplog.records)
     await wave.settle(start["session_id"])
@@ -414,6 +414,53 @@ async def test_lastfm_discovery_caps_unique_artists_across_genres(env, monkeypat
     assert len(queried) == len(set(queried)) == wave.DISCOVERY_LASTFM_ARTISTS
     assert all(any(name.startswith(tag) for name in queried) for tag in ("classical", "jazz"))
     assert [c.args[0] for c in top.await_args_list] == ["72"] * wave.DISCOVERY_LASTFM_ARTISTS
+
+
+async def test_ru_discovery_prefers_targeted_sources_and_checks_their_results(env, monkeypatch):
+    fake_sources(monkeypatch, [])
+    filters = {"lang": "ru", "genres": ["classical", "hiphop"]}
+    classical = tr(8951, "P. I. Tchaikovsky").model_copy(update={"title": "Swan Lake"})
+    foreign = tr(8952, "Foreign Soloist").model_copy(update={"title": "Sonata", "genre": "Classical"})
+    rock = tr(8953, "Группа").model_copy(update={"genre": "Rock"})
+    hiphop = tr(8954, "Русский автор").model_copy(update={"genre": "Hip Hop"})
+    monkeypatch.setattr(wave.sources, "lastfm_configured", lambda: True)
+    names = AsyncMock(side_effect=lambda tag: [classical.artist] if tag == "russian classical" else [])
+    monkeypatch.setattr(wave.sources, "lastfm_tag_top_artists", names)
+    monkeypatch.setattr(wave.sources, "lastfm_artist_tags", AsyncMock(side_effect=lambda name, **kw:
+                        ["russian classical"] if name == classical.artist else []))
+    top = AsyncMock(return_value=[classical, foreign, rock])
+    monkeypatch.setattr(svc.deezer, "get_artist_top", top, raising=False)
+
+    def search(query, *, kinds, limit):
+        if kinds == ("artist",):
+            assert query == classical.artist
+            return SearchResults(artists=[CatalogArtist(ref="dz:75", source="dz", id="75", name=query)])
+        return SearchResults(tracks=[hiphop, foreign, rock] if query == "русский рэп" else [])
+
+    lookup = AsyncMock(side_effect=search)
+    monkeypatch.setattr(svc.deezer, "search", lookup)
+    svc.deezer.get_genres.return_value = [{"id": 21, "name": "Classical"}]
+    svc.deezer.genre_chart_tracks.return_value = [foreign]
+
+    client = env["client"]
+    response = await client.post("/api/wave/start", json={"filters": filters})
+    assert response.status_code == 200, response.text
+    start = response.json()
+    assert [t["ref"] for t in start["tracks"]] == [classical.ref]
+    sid = start["session_id"]
+    await wave.settle(sid)
+    response = await client.post(f"/api/wave/{sid}/next", json={"queued": [classical.ref]})
+    assert response.status_code == 200, response.text
+    batch = response.json()
+    assert batch["keep"] == [classical.ref]
+    assert [t["ref"] for t in batch["add"]] == [hiphop.ref]
+    assert batch["filter_relaxed"] == []
+    assert [c.args[0] for c in names.await_args_list] == ["russian classical", "russian hip hop"]
+    queries = [c for c in lookup.await_args_list if c.kwargs["kinds"] == ("track",)]
+    assert [c.args[0] for c in queries] == [
+        "russian classical", "русская классическая музыка", "russian hip hop", "русский рэп"]
+    assert sum(c.kwargs["limit"] for c in queries) == 2 * wave.POOL_LOW
+    await wave.settle(sid)
 
 
 async def test_discovery_continues_after_start_deadline(env, monkeypatch):

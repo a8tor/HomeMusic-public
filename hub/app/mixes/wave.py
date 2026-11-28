@@ -294,7 +294,6 @@ class Runtime:
     refill_after: float = 0.0  # monotonic cooldown after a radio pass with no strict gains
     discovery_after: dict[str, float] = field(default_factory=dict)
     discovering: bool = False
-    filter_relaxed: list[str] = field(default_factory=list)  # current response, reset by each handout
     # a session of another kind (the smart shuffle, app.mixes.smart) keeps its state in its own row, and a track
     # played to its end is not downloaded for it
     save: Callable[[str, Runtime], Awaitable[None]] | None = None
@@ -506,19 +505,33 @@ async def _discovery_library(filters: WaveFilters) -> list[CatalogTrack]:
                 if not filters.genres or wf.normalize_genres(t.genre, album_genre).intersection(filters.genres)]
 
 
+_RU_DEEZER_GENRES = {
+    "rock": "русский рок", "metal": "русский метал", "electronic": "русская электронная музыка",
+    "hiphop": "русский рэп", "pop": "русская поп-музыка", "indie": "русская инди-музыка",
+    "jazz": "русский джаз", "classical": "русская классическая музыка",
+}
+
+
 async def _discovery_deezer(filters: WaveFilters) -> list[CatalogTrack]:
-    if svc.deezer is None:
+    client = svc.deezer
+    if client is None:
         return []
-    # Plain search is only a hint, not a genre assertion. absorb() verifies the resulting metadata.
-    async def search(genre: str) -> list[CatalogTrack]:
-        query = "hip hop" if genre == "hiphop" else genre
+    # Plain search is only a hint, not a language or genre assertion. absorb() verifies the metadata.
+    async def search(query: str, limit: int) -> list[CatalogTrack]:
         try:
-            return (await svc.deezer.search(query, kinds=("track",), limit=POOL_LOW)).tracks
+            return (await client.search(query, kinds=("track",), limit=limit)).tracks[:limit]
         except Exception as e:
-            log.warning("wave: filter discovery (Deezer, %s) failed: %s", genre, e)
+            log.warning("wave: filter discovery (Deezer, %s) failed: %s", query, e)
             return []
 
-    batches = await asyncio.gather(*(search(genre) for genre in filters.genres))
+    queries = []
+    for genre in dict.fromkeys(filters.genres):
+        tag = wf.LASTFM_GENRE_TAGS[genre]
+        if filters.lang == "ru":
+            queries.extend(((f"russian {tag}", POOL_LOW // 2), (_RU_DEEZER_GENRES[genre], POOL_LOW - POOL_LOW // 2)))
+        else:
+            queries.append((tag, POOL_LOW))
+    batches = await asyncio.gather(*(search(query, limit) for query, limit in queries))
     return [t for batch in batches for t in batch]
 
 
@@ -563,9 +576,14 @@ async def _discovery_lastfm(filters: WaveFilters) -> list[CatalogTrack]:
             log.warning("wave: filter discovery (Last.fm artist %s via Deezer) failed: %r", name, e)
         return []
 
-    batches = await asyncio.gather(*(names(wf.LASTFM_GENRE_TAGS[g]) for g in filters.genres))
+    tags = list(dict.fromkeys(wf.LASTFM_GENRE_TAGS[g] for g in filters.genres))
+    # Use the intersection rather than spending artist lookups on a worldwide top list.
+    # The broad Deezer chart remains a separate fallback after both targeted sources.
+    if filters.lang == "ru":
+        tags = [f"russian {tag}" for tag in tags]
+    batches = await asyncio.gather(*(names(tag) for tag in tags))
     artists: dict[str, str] = {}
-    # Walk the ranks across tags so the first tag cannot take the whole request budget.
+    # Walk the ranks across tags so the first tag cannot take the whole artist budget.
     for rank in range(max(map(len, batches), default=0)):
         for batch in batches:
             if rank < len(batch) and (key := artist_key(batch[rank])):
@@ -577,9 +595,14 @@ async def _discovery_lastfm(filters: WaveFilters) -> list[CatalogTrack]:
 
 
 def _discovery_loaders(filters: WaveFilters) -> dict[str, Callable[[WaveFilters], Awaitable[list[CatalogTrack]]]]:
+    if not wf.active(filters):
+        return {}
     loaders = {"library": _discovery_library}
     if filters.genres and svc.deezer is not None:
-        loaders.update(chart=_discovery_chart, lastfm=_discovery_lastfm, deezer=_discovery_deezer)
+        if filters.lang == "ru":
+            loaders.update(lastfm=_discovery_lastfm, deezer=_discovery_deezer, chart=_discovery_chart)
+        else:
+            loaders.update(chart=_discovery_chart, lastfm=_discovery_lastfm, deezer=_discovery_deezer)
     return loaders
 
 
@@ -984,7 +1007,7 @@ def _first_filters(c: build.Cand, filters: WaveFilters) -> WaveFilters:
 def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: int = BATCH,
          queued: set[str] = frozenset(), first: build.Cand | None = None,
          values: dict[str, float] | None = None, *, prefix: tuple[build.Cand, ...] = (),
-         filter_level: int = 0, eligible: Callable[[build.Cand], bool] | None = None) -> list[build.Cand]:
+         eligible: Callable[[build.Cand], bool] | None = None) -> list[build.Cand]:
     """The next `n`: the best by `value` keeping the mode's familiar share, an artist at most once in `ARTIST_GAP`
     tracks (counting the played ones; the artist of a wave by an artist — once in `SEED_ARTIST_GAP`); with nothing else left, the gap gives way (never the same artist twice in a
     row). «Не нравится» set since the candidate came in drops it. `queued` — refs the client has ahead already.
@@ -995,13 +1018,13 @@ def pick(st: State, p: Profile, mode: str, vectors: dict[str, list[float]], n: i
     cfg = get_settings().cfg.mixes if isinstance(p, V2Profile) else None
     if first is not None and (_known_preview(st, first)
                               or (eligible is not None and not eligible(first))
-                              or not wf.fit(first, _first_filters(first, st.filters), filter_level, energy=st.energy)):
+                              or not wf.matches(first, _first_filters(first, st.filters), energy=st.energy)):
         first = None
-    pools = (st.out, st.pool, st.pool_relaxed) if filter_level or st.filters.familiarity else (st.out, st.pool)
+    pools = (st.out, st.pool)
     candidates = [c for pool in pools for c in pool.values()
                   if c is not first and (eligible is None or eligible(c)) and not _known_preview(st, c)
                   and not _disliked(c, p)
-                  and (cfg is None or build.keep(c, p, cfg)) and wf.fit(c, st.filters, filter_level, energy=st.energy)]
+                  and (cfg is None or build.keep(c, p, cfg)) and wf.matches(c, st.filters, energy=st.energy)]
     # Catalog and library copies can have different refs for the same song. Never put both into one wave batch,
     # re-offer a song that has already started, or substitute another ref for one still queued by the client.
     seen = st.heard | {fp_of(c) for c in prefix}
@@ -1629,8 +1652,7 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
         keep, kept, added = await _hand_out(sid, rt, [], first, first_only=seed_track is None,
                                           confirmed_first=confirmed_first)
         timings["_hand_out"] = time.monotonic() - stage
-        pending = bool(rt.tasks)
-    if isinstance(profile, V2Profile) and "exhausted" not in rt.filter_relaxed:
+    if isinstance(profile, V2Profile) and (added or _has_pending(rt) or not active):
         from app.mixes.taste_select import prepare
 
         async def prepare_profile() -> None:
@@ -1641,19 +1663,27 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
         task = asyncio.create_task(prepare_profile())
         rt.tasks.add(task)
         task.add_done_callback(rt.tasks.discard)
-        pending = True
     save_started = time.monotonic()
     await _save(sid, rt, force=True)
     timings["_save"] = time.monotonic() - save_started
     if len(rt.state.pool) < POOL_HIGH:
         _refill(sid, rt)
-    pending = pending or bool(rt.tasks)
+    pending = _has_pending(rt) or (not active and not added)
     timings["total"] = time.monotonic() - total_started
     log.info("wave %s: start total=%.2fs build_profile=%.2f _gather/probe=%.2f _hand_out=%.2f _save=%.2f "
              "state=%dKB", sid, timings["total"], timings["build_profile"], timings["_gather/probe"],
              timings["_hand_out"], timings["_save"], getattr(rt, "last_state_kb", 0))
-    return Batch(sid, title_of(seed_json), mode, seed_json, kept + added, keep, added,
-                 pending or (not active and not added), filters=filters, filter_relaxed=rt.filter_relaxed)
+    return Batch(sid, title_of(seed_json), mode, seed_json, kept + added, keep, added, pending,
+                 filters=filters, filter_relaxed=_filter_status(filters, kept + added, pending))
+
+
+def _has_pending(rt: Runtime) -> bool:
+    return any(not task.done() for task in rt.tasks)
+
+
+def _filter_status(filters: WaveFilters, tracks: list[build.Cand], pending: bool) -> list[str]:
+    # Keep the existing wire field; it no longer reports axes, only an empty settled result.
+    return ["exhausted"] if wf.active(filters) and not tracks and not pending else []
 
 
 async def next_batch(user: User, sid: str, played: list[Any], queued: list[str]) -> Batch:
@@ -1705,8 +1735,8 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
         timings["_save"] += time.monotonic() - save_started
         if len(st.pool) < POOL_HIGH:
             _refill(sid, rt)
-        pending = bool(rt.tasks) or (not tracks and not wf.active(st.filters))
-        filter_relaxed = rt.filter_relaxed
+        pending = _has_pending(rt) or (not tracks and not wf.active(st.filters))
+        filter_relaxed = _filter_status(st.filters, tracks, pending)
     timings["total"] = time.monotonic() - total_started
     log.info("wave %s: next total=%.2fs _profile=%.2f _vectors=%.2f _gather=%.2f _probe=%.2f _hand_out=%.2f "
              "_save=%.2f state=%dKB", sid, timings["total"], timings.get("_profile", 0.0),
@@ -1798,7 +1828,6 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
     assert rt.profile is not None
     st = rt.state
     active = wf.active(st.filters)
-    rt.filter_relaxed = []
     if isinstance(rt.profile, V2Profile):
         cfg = get_settings().cfg.mixes
         for ref, c in list(st.pool.items()):
@@ -1818,7 +1847,7 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
         if (fp in seen or _disliked(c, rt.profile) or ref in st.nofile or c.track.ref in st.nofile
                 or fp in st.no_file_fps or ref in st.skipped_refs or _skipped(st, c, fp)
                 or (cfg is not None and not build.keep(c, rt.profile, cfg))
-                or (st.filters.lang and wf.detect_lang(c) != st.filters.lang)):
+                or not wf.matches(c, _first_filters(c, st.filters), energy=st.energy)):
             continue
         seen.add(fp)
         keep.append(ref)
@@ -1847,41 +1876,31 @@ async def _hand_out(sid: str, rt: Runtime, queued: list[str], first: build.Cand 
         return c.track.ref not in attempted and (c is confirmed_first or _guaranteed_full(c)
                                                   or (time.monotonic() < deadline and _can_probe(rt, c)))
 
-    async def fill(level: int, preferred: build.Cand | None = None) -> None:
-        while len(added) < n:
-            extras = pick(st, rt.profile, rt.mode, vectors, n=n - len(added), first=preferred, values=values,
-                          prefix=(*kept, *added), filter_level=level, eligible=eligible)
-            if not extras:
-                break
-            attempted.update(c.track.ref for c in extras)
-            added.extend(await _probe_full(rt, extras, deadline=deadline, confirmed=confirmed_first))
-            preferred = None
-
-    await fill(0, first)
-    # A partial strict discovery batch is preferable to padding it with off-filter tracks.
-    strict_discovery = active and any(FILTER_DISCOVERY in c.gens and wf.matches(c, st.filters, energy=st.energy)
-                                      for c in (*kept, *added))
-    if active and not rt.tasks and not strict_discovery:
-        for level in ((1, 2, 3, 4) if st.filters.energy else (1, 3, 4)):
-            if len(added) >= n or rt.tasks:
-                break
-            await fill(level)
+    preferred = first
+    while len(added) < n:
+        extras = pick(st, rt.profile, rt.mode, vectors, n=n - len(added), first=preferred, values=values,
+                      prefix=(*kept, *added), eligible=eligible)
+        if not extras:
+            break
+        attempted.update(c.track.ref for c in extras)
+        added.extend(await _probe_full(rt, extras, deadline=deadline, confirmed=confirmed_first))
+        preferred = None
     # A confirmed preview (including one previously reported by a client) cannot survive the handout.
     queued_ok = [(ref, c) for ref, c in zip(keep, kept) if not _known_preview(st, c)]
     keep = [ref for ref, _ in queued_ok]
     kept = [c for _, c in queued_ok]
     added = [c for c in added if not _known_preview(st, c)]
-    if active:
-        recommendations = [c for c in kept + added if not (c is first and "seed" in c.gens)]
-        rt.filter_relaxed = wf.relaxed_axes(recommendations, st.filters, energy=st.energy)
-        if not kept and not added and not rt.tasks:
-            rt.filter_relaxed.append("exhausted")
     rt._wave_probe_elapsed = time.monotonic() - probe_started
     if not kept and not added and (first is None or active):
-        # Nothing fresh is left: rather than repeating what the client just flipped past, refill and let it ask
-        # again (`pending` in the answer; the client waits `RETRY_MS`). Its queue stays as it is: clearing `out`
-        # would leave the next `queued` naming tracks this session no longer knows.
-        if not active:
+        # Older clients may omit `queued`, but still send playback events for the last window.
+        # Retain that context only for tracks allowed in the queue (including the explicit seed).
+        if active:
+            for ref, c in list(st.out.items()):
+                if not wf.matches(c, _first_filters(c, st.filters), energy=st.energy):
+                    del st.out[ref]
+                    st.put(c)
+            st.trim_reserve()
+        else:
             _refill(sid, rt)
         save_started = time.monotonic()
         await _save(sid, rt)
