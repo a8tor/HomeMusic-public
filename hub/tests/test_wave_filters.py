@@ -390,3 +390,121 @@ async def test_discovery_continues_after_start_deadline(env, monkeypatch):
     assert classical.ref in wave._rt[sid].state.pool
     svc.deezer.genre_chart_tracks.assert_awaited_once()
     search.assert_awaited_once()
+
+
+@pytest.fixture
+async def warm_wave(env, monkeypatch):
+    await history(env["admin"])
+    fake_sources(monkeypatch, [tr(9000 + i) for i in range(wave.POOL_HIGH)])
+    return env["client"]
+
+
+async def test_pool_is_warmed_after_handout(warm_wave, monkeypatch):
+    sizes = []
+
+    def generators(profile, state):
+        sizes.append(len(state.pool))
+
+        async def radio():
+            return [tr(9100 + len(sizes) * 10 + i) for i in range(wave.POOL_HIGH - sizes[-1])]
+
+        return {"ytm_radio": radio}
+
+    monkeypatch.setattr(wave, "refill_generators", generators)
+    response = await warm_wave.post("/api/wave/start", json={})
+    assert response.status_code == 200, response.text
+    sid = response.json()["session_id"]
+    await wave.settle(sid)
+    assert sizes == [wave.POOL_HIGH - 1]
+    assert len(wave._rt[sid].state.pool) == wave.POOL_HIGH
+
+    response = await warm_wave.post(f"/api/wave/{sid}/next", json={})
+    assert response.status_code == 200, response.text
+    assert len(response.json()["tracks"]) == wave.BATCH
+    await wave.settle(sid)
+    # The old pre-handout threshold would not fire for either of these pool sizes.
+    assert len(sizes) == 2 and wave.POOL_LOW <= sizes[1] < wave.POOL_HIGH
+    assert len(wave._rt[sid].state.pool) == wave.POOL_HIGH
+
+
+async def test_refill_is_not_scheduled_twice(monkeypatch):
+    rt = wave.Runtime(1, "balanced", wave.State(), profile=wave.Profile(user_id=1, now=wave.utcnow()))
+    loader = AsyncMock(return_value=[])
+    rt.state.filters = WaveFilters(genres=["rock"])
+    monkeypatch.setattr(wave, "_discovery_loaders", lambda filters: {"library": loader})
+    monkeypatch.setattr(wave, "_save", AsyncMock())
+    wave._refill("test", rt)
+    task = rt.refill_task
+    assert task is not None
+    wave._refill("test", rt)
+    assert rt.refill_task is task and rt.tasks == {task}
+    await task
+    loader.assert_awaited_once()
+
+
+async def test_refill_respects_retry_pause(monkeypatch):
+    from types import SimpleNamespace
+
+    now = 100.0
+    monkeypatch.setattr(wave, "time", SimpleNamespace(monotonic=lambda: now))
+    rt = wave.Runtime(1, "balanced", wave.State(filters=WaveFilters(genres=["rock"])),
+                      profile=wave.Profile(user_id=1, now=wave.utcnow()))
+    loader = AsyncMock(return_value=[])
+    monkeypatch.setattr(wave, "_discovery_loaders", lambda filters: {"library": loader})
+    monkeypatch.setattr(wave, "_save", AsyncMock())
+    wave._refill("test", rt)
+    first = rt.refill_task
+    await first
+    now += wave.DISCOVERY_RETRY_S - 0.1
+    wave._refill("test", rt)
+    assert rt.refill_task is first
+    loader.assert_awaited_once()
+    now = rt.discovery_after["library"]
+    wave._refill("test", rt)
+    assert rt.refill_task is not first
+    await rt.refill_task
+    assert loader.await_count == 2
+
+
+async def test_background_refill_does_not_block_the_answer(warm_wave, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_radio():
+        entered.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(wave, "refill_generators", lambda profile, state: {"ytm_radio": slow_radio})
+    sid = None
+    try:
+        response = await asyncio.wait_for(warm_wave.post("/api/wave/start", json={}), timeout=3)
+        assert response.status_code == 200, response.text
+        start = response.json()
+        sid = start["session_id"]
+        assert start["tracks"] and start["pending"]
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task = wave._rt[sid].refill_task
+        response = await asyncio.wait_for(warm_wave.post(f"/api/wave/{sid}/next", json={}), timeout=3)
+        assert response.status_code == 200, response.text
+        assert response.json()["tracks"] and response.json()["pending"]
+        assert task in wave._rt[sid].tasks and not task.done()
+    finally:
+        release.set()
+        if sid is not None:
+            await wave.settle(sid)
+
+
+async def test_failing_refill_does_not_break_the_wave(warm_wave, monkeypatch, caplog):
+    def broken(profile, state):
+        raise RuntimeError("refill offline")
+
+    monkeypatch.setattr(wave, "refill_generators", broken)
+    response = await warm_wave.post("/api/wave/start", json={})
+    assert response.status_code == 200, response.text
+    sid = response.json()["session_id"]
+    await wave.settle(sid)
+    assert any(r.levelname == "WARNING" and "refill failed" in r.message and r.exc_info
+               and str(r.exc_info[1]) == "refill offline" for r in caplog.records)
+    response = await warm_wave.post(f"/api/wave/{sid}/next", json={})
+    assert response.status_code == 200, response.text
+    assert response.json()["tracks"]

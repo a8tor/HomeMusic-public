@@ -76,7 +76,8 @@ SOURCE_WAIT_S = 5.0
 TASTE_TIMEOUT_S = 5.0
 ARTIST_GAP = 8  # an artist at most once in this many tracks
 SEED_ARTIST_GAP = 3  # ... the artist a wave started from: at most once in this many
-POOL_LOW = 25  # fewer candidates left: the pool is refilled in the background
+POOL_LOW = 25  # recovery threshold before handout; also the per-source discovery limit
+POOL_HIGH = 40  # warm the strict pool after handout, with three batches of headroom over POOL_LOW
 RELAXED_MAX = 300
 SIGNALS_MAX = 10  # the session's latest likes / skips its sound centers are made of
 SKIP_ARTIST_PENALTY = 0.6  # per early skip of the artist in this session
@@ -288,7 +289,9 @@ class Runtime:
     asked: dict[str, float] = field(default_factory=dict)  # key -> when it was asked (monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tasks: set[asyncio.Task] = field(default_factory=set)
-    refilling: bool = False
+    refilling: bool = False  # also used by SmartRuntime
+    refill_task: asyncio.Task | None = None
+    refill_after: float = 0.0  # monotonic cooldown after a radio pass with no strict gains
     discovery_after: dict[str, float] = field(default_factory=dict)
     discovering: bool = False
     filter_relaxed: list[str] = field(default_factory=list)  # current response, reset by each handout
@@ -580,11 +583,11 @@ def _discovery_loaders(filters: WaveFilters) -> dict[str, Callable[[WaveFilters]
     return loaders
 
 
-def _discovery_gen(rt: Runtime, source: str, load: Callable[[WaveFilters], Awaitable[list[CatalogTrack]]]
-                   ) -> build.Gen | None:
+def _discovery_gen(rt: Runtime, source: str, load: Callable[[WaveFilters], Awaitable[list[CatalogTrack]]],
+                   *, target: int = POOL_LOW) -> build.Gen | None:
     st = rt.state
     now = time.monotonic()
-    if not wf.active(st.filters) or len(st.pool) >= POOL_LOW or now < rt.discovery_after.get(source, 0):
+    if not wf.active(st.filters) or len(st.pool) >= target or now < rt.discovery_after.get(source, 0):
         return None
     rt.discovery_after[source] = now + DISCOVERY_RETRY_S
     # Snapshot before awaiting the provider so a background fetch doesn't depend on mutable pool state.
@@ -737,106 +740,92 @@ async def _late(sid: str, rt: Runtime, task: asyncio.Task, *, discovery: bool = 
         async with rt.lock:
             added = await absorb(rt, results)
             await (rt.save or _save)(sid, rt)
-            if discovery:
-                rt.discovering = False
-                _refill_discovery(sid, rt)
         log.info("wave %s: %s joined later (+%s)", sid, [r.name for r in results], added)
     except asyncio.CancelledError:
         task.cancel()
-        if discovery:
-            rt.discovering = False
         raise
     except Exception:
-        log.exception("wave %s: a late source failed", sid)
+        log.warning("wave %s: a late source failed", sid, exc_info=True)
+    finally:
         if discovery:
             rt.discovering = False
-            _refill_discovery(sid, rt)
+    if discovery:
+        _refill(sid, rt)
 
 
-def _refill_discovery(sid: str, rt: Runtime) -> None:
-    st = rt.state
-    loaders = _discovery_loaders(st.filters)
-    now = time.monotonic()
-    if (rt.discovering or not wf.active(st.filters) or len(st.pool) >= POOL_LOW
-            or all(now < rt.discovery_after.get(source, 0) for source in loaders)):
-        return
-    rt.discovering = True
-
-    async def run() -> None:
+async def _refill_discovery(sid: str, rt: Runtime, loaders: dict[str, Callable]) -> None:
+    for source, load in loaders.items():
         try:
-            for source, load in loaders.items():
+            async with rt.lock:
+                gen = _discovery_gen(rt, source, load, target=POOL_HIGH)
+            if gen is not None:
+                results = await build.run_generators({FILTER_DISCOVERY: gen})
                 async with rt.lock:
-                    gen = _discovery_gen(rt, source, load)
-                if gen is not None:
-                    results = await build.run_generators({FILTER_DISCOVERY: gen})
-                    async with rt.lock:
-                        await absorb(rt, results)
-                        await (rt.save or _save)(sid, rt)
+                    before = len(rt.state.pool)
+                    await absorb(rt, results)
+                    await (rt.save or _save)(sid, rt)
+                    log.info("wave %s: refill discovery/%s strict=%d->%d", sid, source, before, len(rt.state.pool))
         except Exception:
-            log.warning("wave %s: filter discovery refill failed", sid, exc_info=True)
-        finally:
-            rt.discovering = False
-
-    task = asyncio.create_task(run())
-    rt.tasks.add(task)
-    task.add_done_callback(rt.tasks.discard)
+            log.warning("wave %s: filter discovery refill (%s) failed", sid, source, exc_info=True)
 
 
 def _refill(sid: str, rt: Runtime) -> None:
-    """The pool runs low: the radios of the next seeds, in the background."""
-    if rt.refilling or rt.profile is None:
+    """Warm the strict pool while passes make progress, without polling exhausted sources."""
+    st = rt.state
+    if (rt.discovering or (rt.refill_task is not None and not rt.refill_task.done())
+            or rt.profile is None or len(st.pool) >= POOL_HIGH):
         return
-    v2 = isinstance(rt.profile, V2Profile)
     profile = rt.profile
-    chosen = []
-    filtered = wf.active(rt.state.filters)
-    seed_pool = _refill_seeds(profile, rt.state) if filtered else []
-    if filtered:
-        _refill_discovery(sid, rt)
-        if not seed_pool:
-            return
-    if v2 and not filtered:
-        pool = [t for t in profile.seeds(get_settings().cfg.mixes.seeds * 4) if t.key not in rt.state.seeds_used]
-        if not pool:
-            rt.state.seeds_used.clear()
-            pool = profile.seeds(get_settings().cfg.mixes.seeds * 4)
-        chosen = pool[:REFILL_SEEDS]
-        rt.state.seeds_used.extend(t.key for t in chosen)
-    gens = {} if v2 or filtered else refill_generators(rt.profile, rt.state)
-    if not gens and not (v2 or filtered):
+    v2 = isinstance(profile, V2Profile)
+    filtered = wf.active(st.filters)
+    now = time.monotonic()
+    loaders = {source: load for source, load in _discovery_loaders(st.filters).items()
+               if now >= rt.discovery_after.get(source, 0)} if filtered else {}
+    if not loaders and (now < rt.refill_after or profile.empty):
         return
-    rt.refilling = True
 
     async def run() -> None:
         try:
-            current = gens
-            if filtered:
-                ordered = await _prioritize_seeds(profile, seed_pool, rt.state.filters)
-                chosen_now = ordered[:REFILL_SEEDS]
-                if not v2:
-                    current = refill_generators(profile, rt.state, prioritized=chosen_now)
-                else:
-                    rt.state.seeds_used.extend(t.key for t in chosen_now)
-            else:
-                chosen_now = chosen
-            if v2:
-                from app.mixes.taste_select import enrich_selected
-                chosen_now = await enrich_selected(profile, chosen_now)
-            if v2:
-                all_gens = build.generators(profile, chosen_now) if chosen_now else {}
-                current = {k: all_gens[k] for k in ("ytm_radio", "lastfm_similar") if k in all_gens}
-            results = await build.run_generators(current)
-            async with rt.lock:
-                await absorb(rt, results)
-                await (rt.save or _save)(sid, rt)
-        except Exception:
-            log.exception("wave %s: refill failed", sid)
-        finally:
-            rt.refilling = False
+            log.info("wave %s: refill start strict=%d target=%d", sid, len(st.pool), POOL_HIGH)
+            await _refill_discovery(sid, rt, loaders)
+            while len(st.pool) < POOL_HIGH and time.monotonic() >= rt.refill_after:
+                if v2 or filtered:
+                    seed_pool = _refill_seeds(profile, st)
+                    if filtered:
+                        seed_pool = await _prioritize_seeds(profile, seed_pool, st.filters)
+                    chosen = seed_pool[:REFILL_SEEDS]
+                    if v2:
+                        from app.mixes.taste_select import enrich_selected
 
-    t = asyncio.create_task(run())
-    rt.tasks.add(t)
-    t.add_done_callback(rt.tasks.discard)
+                        st.seeds_used.extend(t.key for t in chosen)
+                        enriched = await enrich_selected(profile, chosen) if chosen else []
+                        all_gens = build.generators(profile, enriched) if enriched else {}
+                        gens = {k: all_gens[k] for k in ("ytm_radio", "lastfm_similar") if k in all_gens}
+                    else:
+                        gens = refill_generators(profile, st, prioritized=chosen)
+                else:
+                    gens = refill_generators(profile, st)
+                if not gens or len(st.pool) >= POOL_HIGH:
+                    break
+                results = await build.run_generators(gens)
+                async with rt.lock:
+                    before = len(st.pool)
+                    await absorb(rt, results)
+                    after = len(st.pool)
+                    await (rt.save or _save)(sid, rt)
+                log.info("wave %s: refill radios strict=%d->%d", sid, before, after)
+                if after <= before:
+                    rt.refill_after = time.monotonic() + DISCOVERY_RETRY_S
+                    break
+        except Exception:
+            rt.refill_after = time.monotonic() + DISCOVERY_RETRY_S
+            log.warning("wave %s: refill failed", sid, exc_info=True)
+        finally:
+            log.info("wave %s: refill end strict=%d target=%d", sid, len(st.pool), POOL_HIGH)
+
+    task = rt.refill_task = asyncio.create_task(run())
+    rt.tasks.add(task)
+    task.add_done_callback(rt.tasks.discard)
 
 
 # --- picking --------------------------------------------------------------------------------------------------------
@@ -1654,6 +1643,9 @@ async def start(user: User, seed: dict[str, Any] | None, mode: str | None, *, or
     save_started = time.monotonic()
     await _save(sid, rt, force=True)
     timings["_save"] = time.monotonic() - save_started
+    if len(rt.state.pool) < POOL_HIGH:
+        _refill(sid, rt)
+    pending = pending or bool(rt.tasks)
     timings["total"] = time.monotonic() - total_started
     log.info("wave %s: start total=%.2fs build_profile=%.2f _gather/probe=%.2f _hand_out=%.2f _save=%.2f "
              "state=%dKB", sid, timings["total"], timings["build_profile"], timings["_gather/probe"],
@@ -1709,6 +1701,8 @@ async def next_batch(user: User, sid: str, played: list[Any], queued: list[str])
         save_started = time.monotonic()
         await _save(sid, rt, force=bool(played))
         timings["_save"] += time.monotonic() - save_started
+        if len(st.pool) < POOL_HIGH:
+            _refill(sid, rt)
         pending = bool(rt.tasks) or (not tracks and not wf.active(st.filters))
         filter_relaxed = rt.filter_relaxed
     timings["total"] = time.monotonic() - total_started
